@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Deterministic 3D final-dimension cat tests for the GM45 detection-head path."""
+
+from __future__ import annotations
+
+import argparse
+
+import torch
+
+from drivers import matrixman as gm45
+
+
+def report_cat(name: str, inputs, y, expected: torch.Tensor) -> torch.Tensor:
+    y_cpu = y.cpu()
+    error = (y_cpu - expected).abs().max().item()
+    print(name)
+    for index, tensor in enumerate(inputs):
+        print(f"  input {index}: shape={list(tensor.shape)} texture=#{tensor._owner.texture} offset={tensor._storage_offset}")
+    print(f"  output shape: {list(y.shape)} texture=#{y._owner.texture} offset={y._storage_offset}")
+    print(f"  max_abs_error: {error:.6g}")
+    print(f"  allclose: {torch.allclose(y_cpu, expected, atol=1e-6, rtol=0)}")
+    print("  GPU->CPU readback: only explicit y.cpu() validation")
+    return y_cpu
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--trace", action="store_true", help="print gm45 dispatch/kernel trace")
+    args = parser.parse_args()
+
+    gm45.set_trace(args.trace)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(20260829)
+
+    a_cpu = torch.tensor([[[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]]], dtype=torch.float32)
+    b_cpu = torch.tensor([[[4.0, 5.0], [40.0, 50.0]]], dtype=torch.float32)
+    a = gm45.to_gm45(a_cpu)
+    b = gm45.to_gm45(b_cpu)
+    tiny = torch.cat([a, b], dim=-1)
+    tiny_expected = torch.cat([a_cpu, b_cpu], dim=-1)
+    tiny_cpu = report_cat("Tiny row-wise 3D final-dim cat", [a, b], tiny, tiny_expected)
+    print("  tiny output:")
+    print(tiny_cpu)
+
+    x0_cpu = torch.randn((1, 64, 64), dtype=torch.float32, generator=generator)
+    x1_cpu = torch.randn((1, 64, 16), dtype=torch.float32, generator=generator)
+    x2_cpu = torch.randn((1, 64, 4), dtype=torch.float32, generator=generator)
+    x0 = gm45.to_gm45(x0_cpu)
+    x1 = gm45.to_gm45(x1_cpu)
+    x2 = gm45.to_gm45(x2_cpu)
+    y = torch.cat([x0, x1, x2], dim=-1)
+    expected = torch.cat([x0_cpu, x1_cpu, x2_cpu], dim=-1)
+    report_cat("Traced YOLO detection-head 3D final-dim cat", [x0, x1, x2], y, expected)
+
+    split_cpu = torch.randn((1, 128, 8), dtype=torch.float32, generator=generator)
+    split_source = gm45.to_gm45(split_cpu)
+    right = gm45.Gm45Tensor._from_owner(split_source._owner, (1, 64, 8), 64 * 8)
+    tail_cpu = torch.randn((1, 64, 4), dtype=torch.float32, generator=generator)
+    tail = gm45.to_gm45(tail_cpu)
+    split_y = torch.cat([right, tail], dim=-1)
+    split_expected = torch.cat([split_cpu[:, 64:128, :], tail_cpu], dim=-1)
+    report_cat("Contiguous nonzero-offset 3D final-dim cat", [right, tail], split_y, split_expected)
+
+
+if __name__ == "__main__":
+    main()

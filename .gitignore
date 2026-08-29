@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Models / large files
+*.pt
+*.pth
+*.onnx
+
+# Videos
+*.mp4
+*.avi
+*.mkv
+
+# Generated/debug output
+output/
+outputs/
+runs/
+*.log
+
+# OS
+.DS_Store
