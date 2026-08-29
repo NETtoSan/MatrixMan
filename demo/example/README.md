@@ -1,9 +1,10 @@
 # MatrixMan Examples
 
-MatrixMan provides a PyTorch-compatible execution path for GPUs that may not
-have a supported native PyTorch compute backend, using the GPU's graphics and
-GLSL capabilities. Compatibility depends on the installed OpenGL/GLSL driver
-and its floating-point texture and framebuffer support.
+MatrixMan provides an experimental PyTorch execution path for GPUs that may
+not have a usable native PyTorch compute backend, using graphics and GLSL
+capabilities. It is currently verified on Intel GM45 under Linux/Mesa;
+compatibility with other GPUs is untested and depends on the installed
+OpenGL/GLSL driver and its floating-point texture and framebuffer support.
 
 Run the small tensor example:
 
@@ -11,10 +12,10 @@ Run the small tensor example:
 python3 demo/example/pytorch_example.py
 ```
 
-Run the minimal VisDrone YOLO example with an image:
+Run the minimal Ultralytics YOLO example with a local model and image:
 
 ```bash
-python3 demo/example/yolo_example.py path/to/image.jpg --imgsz 320
+python3 demo/example/yolo_example.py model.pt path/to/image.jpg --imgsz 320
 ```
 
 `matrixman.to_gm45(tensor)` uploads a float32 CPU tensor to MatrixMan. Supported

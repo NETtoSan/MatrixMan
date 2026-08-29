@@ -1,8 +1,9 @@
 # MatrixMan
 
-MatrixMan is an experimental PyTorch `PrivateUse1` backend for Intel GM45.
-It dispatches the supported tensor operations to OpenGL 2.1 / GLSL 1.20
-fragment shaders and stores float32 tensors in packed `RGBA32F` textures.
+MatrixMan is an experimental PyTorch `PrivateUse1` backend, currently
+validated on Intel GM45. It dispatches supported tensor operations to OpenGL
+2.1 / GLSL 1.20 fragment shaders and stores float32 tensors in packed
+`RGBA32F` textures. Other GPUs remain unverified.
 
 The package is organized as:
 

@@ -31,7 +31,6 @@ experiment before implementing OpaqueTensorImpl/custom storage in C++.
 from __future__ import annotations
 
 import ctypes
-import functools
 import os
 from collections import Counter, defaultdict
 import math
@@ -45,6 +44,28 @@ import torch
 
 from . import gpumatrix as gm
 from . import gpu_stress
+from .ops import convolution as _convolution
+
+# Private compatibility aliases for the existing diagnostics.  The
+# implementation itself lives in ops.convolution; these names do not create a
+# second convolution path.
+CONV_PHYSICAL_TILE_LIMIT = _convolution.CONV_PHYSICAL_TILE_LIMIT
+_conv_program = _convolution._conv_program
+_conv_shader_source = _convolution._conv_shader_source
+_conv_tile_shader_source = _convolution._conv_tile_shader_source
+_tile_copy_shader_source = _convolution._tile_copy_shader_source
+_new_physical_packed_owner = _convolution._new_physical_packed_owner
+_render_convolution_tiled = _convolution._render_convolution_tiled
+_tile_diagnostic_snapshots = _convolution._tile_diagnostic_snapshots
+from .storage import (
+    StorageLayout as _StorageLayout,
+    contiguous_strides as _contiguous_strides,
+    matrix_red_rgba as _matrix_red_rgba,
+    max_storage_index as _max_storage_index,
+    numel as _numel,
+    pack_linear_rgba as _pack_linear_rgba,
+    packed_atlas_size as _packed_atlas_size,
+)
 
 
 PRIVATEUSE_DEVICE = torch.device("privateuseone:0")
@@ -154,14 +175,16 @@ def _env_flag(name: str) -> bool:
 
 
 _trace_enabled = _env_flag("MATRIXMAN_DEBUG")
-_profile_enabled = _env_flag("MATRIXMAN_PROFILE")
-_profile_detail = _env_flag("MATRIXMAN_PROFILE_DETAIL")
-_profile_started = time.perf_counter()
-_profile_ops: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "total": 0.0, "max": 0.0})
-_profile_counters: dict[str, float] = defaultdict(float)
-_profile_parameters: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "bytes": 0, "repeated": 0})
-_profile_parameter_keys: set[tuple[str, int]] = set()
-_profile_conv: dict[str, float] = defaultdict(float)
+from .profiling import (
+    counters as _profile_counters,
+    conv as _profile_conv,
+    dispatch_timer as _profile_dispatch,
+    enabled as _profile_enabled,
+    parameter_keys as _profile_parameter_keys,
+    parameters as _profile_parameters,
+    report as profile_report,
+    reset as profile_reset,
+)
 _unsupported_counts: Counter[str] = Counter()
 _unsupported_examples: dict[str, list[dict]] = defaultdict(list)
 _aten_privateuse1_lib = None
@@ -198,106 +221,6 @@ def _shape_text(shape) -> str:
 
 def profile_enabled() -> bool:
     return _profile_enabled
-
-
-def profile_reset() -> None:
-    global _profile_started
-    _profile_started = time.perf_counter()
-    _profile_ops.clear()
-    _profile_counters.clear()
-    _profile_parameters.clear()
-    _profile_parameter_keys.clear()
-    _profile_conv.clear()
-
-
-def _profile_gl_begin(mode):
-    if not _profile_enabled:
-        return _profile_gl_begin.original(mode)
-    _profile_counters["draw_calls"] += 1
-    return _profile_gl_begin.original(mode)
-
-
-def _profile_gl_finish():
-    if not _profile_enabled:
-        return _profile_gl_finish.original()
-    started = time.perf_counter()
-    result = _profile_gl_finish.original()
-    _profile_counters["glFinish_calls"] += 1
-    _profile_counters["glFinish_seconds"] += time.perf_counter() - started
-    return result
-
-
-_profile_gl_begin.original = gm.glBegin
-_profile_gl_finish.original = gm.glFinish
-if _profile_enabled:
-    gm.glBegin = _profile_gl_begin
-    gm.glFinish = _profile_gl_finish
-
-
-def _profile_dispatch(fn):
-    @functools.wraps(fn)
-    def wrapped(cls, func, types, args=(), kwargs=None):
-        if not _profile_enabled:
-            return fn(cls, func, types, args, kwargs)
-        name = str(func).removeprefix("aten.")
-        started = time.perf_counter()
-        try:
-            return fn(cls, func, types, args, kwargs)
-        finally:
-            elapsed = time.perf_counter() - started
-            record = _profile_ops[name]
-            record["calls"] += 1
-            record["total"] += elapsed
-            record["max"] = max(record["max"], elapsed)
-            if _profile_detail:
-                print(f"[MatrixMan profile] {name}: {elapsed:.6f}s")
-    return wrapped
-
-
-def profile_report() -> None:
-    if not _profile_enabled:
-        return
-    elapsed = time.perf_counter() - _profile_started
-    print("\nMatrixMan profile")
-    print("-----------------")
-    print(f"total backend time: {elapsed:.3f}s")
-    for name in ("convolution.default", "native_batch_norm.default", "silu_.default", "add.Tensor", "mul.Tensor", "div.Tensor", "sigmoid.default", "mm.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default"):
-        record = _profile_ops.get(name)
-        if record:
-            print(f"{name}: calls={int(record['calls'])} total={record['total']:.3f}s average={record['total']/record['calls']:.3f}s max={record['max']:.3f}s")
-    print("OpenGL:")
-    print(f"  draw calls: {int(_profile_counters['draw_calls'])}")
-    print(f"  tiled convolution draw calls: {int(_profile_counters['tiled_draw_calls'])}")
-    print(f"  consolidation draw calls: {int(_profile_counters['consolidation_draw_calls'])}")
-    print(f"  glFinish: {int(_profile_counters['glFinish_calls'])} ({_profile_counters['glFinish_seconds']:.3f}s)")
-    print("  glFlush: 0 (not exposed by the legacy helper)")
-    print(f"  texture allocations: {int(_profile_counters['texture_allocations'])}")
-    print(f"  texture uploads: {int(_profile_counters['texture_uploads'])} ({int(_profile_counters['texture_upload_bytes'])} bytes, {_profile_counters['texture_upload_seconds']:.3f}s)")
-    print("parameter uploads:")
-    print(f"  count: {int(_profile_counters['parameter_uploads'])}")
-    print(f"  bytes: {int(_profile_counters['parameter_upload_bytes'])}")
-    print(f"  repeated: {int(_profile_counters['repeated_parameter_uploads'])}")
-    print("readback:")
-    print(f"  calls: {int(_profile_counters['readback_calls'])} bytes: {int(_profile_counters['readback_bytes'])}")
-    print(f"  sync/wait: {_profile_counters['readback_sync_seconds']:.3f}s")
-    print(f"  transfer: {_profile_counters['readback_transfer_seconds']:.3f}s")
-    print(f"  conversion/tensor creation: {_profile_counters['readback_conversion_seconds']:.3f}s")
-    print(f"  total: {_profile_counters['readback_total_seconds']:.3f}s")
-    if _profile_conv:
-        print("Conv2D breakdown (aggregate):")
-        for key in ("prepare", "parameter_upload", "shader_setup", "tile_render", "sync", "consolidation"):
-            print(f"  {key}: {_profile_conv[key]:.3f}s")
-        print(
-            f"  tiled calls: {int(_profile_counters['tiled_conv_calls'])} "
-            f"tiles: {int(_profile_counters['tiled_conv_tiles'])} "
-            f"max physical tile: {int(_profile_counters['tiled_conv_max_tile_width'])}x"
-            f"{int(_profile_counters['tiled_conv_max_tile_height'])}"
-        )
-    slow = sorted(_profile_ops.items(), key=lambda item: item[1]["total"], reverse=True)[:3]
-    if slow:
-        print("Top slow operations:")
-        for index, (name, record) in enumerate(slow, 1):
-            print(f"  {index}. {name}: {record['total']:.3f}s ({int(record['calls'])} calls)")
 
 
 def _glsl_float(value: float) -> str:
@@ -357,14 +280,6 @@ def unsupported_report() -> dict[str, dict]:
         name: {"calls": count, "examples": _unsupported_examples.get(name, [])}
         for name, count in sorted(_unsupported_counts.items())
     }
-
-
-@dataclass
-class _StorageLayout:
-    kind: str
-    texture_width: int
-    texture_height: int
-    numel: int
 
 
 class _TextureOwner:
@@ -529,63 +444,6 @@ def _program(kind: str, n: int) -> tuple[int, int, int]:
         )
     left_loc, right_loc = uniforms[n]
     return programs[n], left_loc, right_loc
-
-
-def _conv_program(params: tuple) -> tuple[int, int, int, int]:
-    rt = _runtime_required()
-    if params not in rt.conv_programs:
-        _trace(f"gm45.compile -> convolution GLSL fragment shader params={params}")
-        program = gm.make_program(_conv_shader_source(params))
-        rt.conv_programs[params] = program
-        rt.conv_uniforms[params] = (
-            gm.glGetUniformLocation(program, b"input_tex"),
-            gm.glGetUniformLocation(program, b"weight_tex"),
-            gm.glGetUniformLocation(program, b"bias_tex"),
-        )
-    input_loc, weight_loc, bias_loc = rt.conv_uniforms[params]
-    return rt.conv_programs[params], input_loc, weight_loc, bias_loc
-
-
-CONV_PHYSICAL_TILE_LIMIT = 256
-_tile_diagnostic_snapshots: list[dict] = []
-_GL_SCISSOR_TEST = 0x0C11
-gm.gl.glScissor.restype = None
-gm.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-gm.gl.glEnable.restype = None
-gm.gl.glEnable.argtypes = [ctypes.c_uint]
-gm.gl.glDisable.restype = None
-gm.gl.glDisable.argtypes = [ctypes.c_uint]
-gm.gl.glCopyTexSubImage2D.restype = None
-gm.gl.glCopyTexSubImage2D.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-
-
-def _conv_tile_shader_source(params: tuple, tile_x: int, tile_y: int) -> bytes:
-    source = _conv_shader_source(params).decode("ascii")
-    out_tex_w = params[-1]
-    old = f"int base = (tex_y * {out_tex_w} + tex_x) * 4;"
-    new = f"int base = ((tex_y + {tile_y}) * {out_tex_w} + tex_x + {tile_x}) * 4;"
-    if old not in source:
-        raise RuntimeError("gm45 tiled convolution could not locate output address expression")
-    return source.replace(old, new).encode("ascii")
-
-
-def _tile_copy_shader_source(tile_width: int, tile_height: int, origin_x: int, origin_y: int) -> bytes:
-    return f"""
-#version 120
-uniform sampler2D tile_tex;
-void main() {{
-    int x = int(floor(gl_FragCoord.x)) - {origin_x};
-    int y = int(floor(gl_FragCoord.y)) - {origin_y};
-    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
-              vec2(float({tile_width}), float({tile_height}));
-    gl_FragColor = texture2D(tile_tex, uv);
-}}
-""".encode("ascii")
-
-
-def _new_physical_packed_owner(width: int, height: int) -> _TextureOwner:
-    texture = _create_rgba32f_texture(width, height)
-    return _TextureOwner(texture, _StorageLayout("packed_rgba", width, height, width * height * 4))
 
 
 def _batchnorm_program(params: tuple) -> tuple[int, int, int, int, int, int]:
@@ -2270,168 +2128,6 @@ void main()
     return source.encode("ascii")
 
 
-def _conv_shader_source(params: tuple) -> bytes:
-    (
-        in_c,
-        in_h,
-        in_w,
-        out_c,
-        out_h,
-        out_w,
-        kernel_h,
-        kernel_w,
-        stride_h,
-        stride_w,
-        pad_h,
-        pad_w,
-        has_bias,
-        groups,
-        input_offset,
-        input_tex_w,
-        input_tex_h,
-        weight_tex_w,
-        weight_tex_h,
-        bias_tex_w,
-        out_tex_w,
-    ) = params
-    bias_expr = "read_bias(oc)" if has_bias else "0.0"
-    source = f"""
-#version 120
-uniform sampler2D input_tex;
-uniform sampler2D weight_tex;
-uniform sampler2D bias_tex;
-
-float pick_component(vec4 value, int component)
-{{
-    if (component == 0) return value.r;
-    if (component == 1) return value.g;
-    if (component == 2) return value.b;
-    return value.a;
-}}
-
-float read_input(int ic, int iy, int ix)
-{{
-    int linear_index = INPUT_OFFSET + ((ic * IN_H) + iy) * IN_W + ix;
-    int texel = linear_index / 4;
-    int component = linear_index - texel * 4;
-    int x = texel - (texel / INPUT_TEX_W) * INPUT_TEX_W;
-    int y = texel / INPUT_TEX_W;
-    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) / vec2(float(INPUT_TEX_W), float(INPUT_TEX_H));
-    return pick_component(texture2D(input_tex, uv), component);
-}}
-
-float read_weight(int oc, int ic, int ky, int kx)
-{{
-    int linear_index = (((oc * IN_C_PER_GROUP + ic) * K_H + ky) * K_W) + kx;
-    int texel = linear_index / 4;
-    int component = linear_index - texel * 4;
-    int x = texel - (texel / WEIGHT_TEX_W) * WEIGHT_TEX_W;
-    int y = texel / WEIGHT_TEX_W;
-    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) / vec2(float(WEIGHT_TEX_W), float(WEIGHT_TEX_H));
-    return pick_component(texture2D(weight_tex, uv), component);
-}}
-
-float read_bias(int oc)
-{{
-    int linear_index = oc;
-    int texel = linear_index / 4;
-    int component = linear_index - texel * 4;
-    int x = texel - (texel / BIAS_TEX_W) * BIAS_TEX_W;
-    int y = texel / BIAS_TEX_W;
-    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) / vec2(float(BIAS_TEX_W), float(BIAS_TEX_H));
-    return pick_component(texture2D(bias_tex, uv), component);
-}}
-
-float compute_output(int out_index)
-{{
-    if (out_index >= OUT_NUMEL) return 0.0;
-    int ox = out_index - (out_index / OUT_W) * OUT_W;
-    int tmp0 = out_index / OUT_W;
-    int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
-    int oc = tmp0 / OUT_H;
-    float acc = {bias_expr};
-
-    int group = oc / OUT_C_PER_GROUP;
-    int input_channel_start = group * IN_C_PER_GROUP;
-    for (int ic = 0; ic < IN_C_PER_GROUP; ++ic) {{
-        for (int ky = 0; ky < K_H; ++ky) {{
-            int iy = oy * STRIDE_H + ky - PAD_H;
-            if (iy >= 0 && iy < IN_H) {{
-                for (int kx = 0; kx < K_W; ++kx) {{
-                    int ix = ox * STRIDE_W + kx - PAD_W;
-                    if (ix >= 0 && ix < IN_W) {{
-                        acc += read_input(input_channel_start + ic, iy, ix) * read_weight(oc, ic, ky, kx);
-                    }}
-                }}
-            }}
-        }}
-    }}
-    return acc;
-}}
-
-void main()
-{{
-    int tex_x = int(floor(gl_FragCoord.x));
-    int tex_y = int(floor(gl_FragCoord.y));
-    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
-    gl_FragColor = vec4(
-        compute_output(base),
-        compute_output(base + 1),
-        compute_output(base + 2),
-        compute_output(base + 3)
-    );
-}}
-"""
-    replacements = {
-        "IN_C": in_c,
-        "IN_H": in_h,
-        "IN_W": in_w,
-        "OUT_C": out_c,
-        "OUT_H": out_h,
-        "OUT_W": out_w,
-        "OUT_NUMEL": out_c * out_h * out_w,
-        "GROUPS": groups,
-        "IN_C_PER_GROUP": in_c // groups,
-        "OUT_C_PER_GROUP": out_c // groups,
-        "K_H": kernel_h,
-        "K_W": kernel_w,
-        "STRIDE_H": stride_h,
-        "STRIDE_W": stride_w,
-        "PAD_H": pad_h,
-        "PAD_W": pad_w,
-        "INPUT_OFFSET": input_offset,
-        "INPUT_TEX_W": input_tex_w,
-        "INPUT_TEX_H": input_tex_h,
-        "WEIGHT_TEX_W": weight_tex_w,
-        "WEIGHT_TEX_H": weight_tex_h,
-        "BIAS_TEX_W": bias_tex_w,
-        "BIAS_TEX_H": max(1, _packed_atlas_size(max(out_c, 1))[1]),
-        "OUT_TEX_W": out_tex_w,
-    }
-    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        source = source.replace(name, str(value))
-    return source.encode("ascii")
-
-
-def _numel(shape: tuple[int, ...]) -> int:
-    return math.prod(shape)
-
-
-def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
-    stride = 1
-    strides = []
-    for size in reversed(shape):
-        strides.append(stride)
-        stride *= size
-    return tuple(reversed(strides))
-
-
-def _max_storage_index(shape: tuple[int, ...], strides: tuple[int, ...]) -> int:
-    if _numel(shape) == 0:
-        return 0
-    return sum((size - 1) * stride for size, stride in zip(shape, strides))
-
-
 def _is_contiguous_logical(tensor: "Gm45Tensor") -> bool:
     return tensor._logical_strides == _contiguous_strides(tuple(int(v) for v in tensor.shape))
 
@@ -2455,13 +2151,6 @@ def _validate_supported_shape(shape: tuple[int, ...]) -> None:
         raise RuntimeError("gm45 4D support is NCHW with batch size 1 only")
 
 
-def _packed_atlas_size(numel: int) -> tuple[int, int]:
-    texels = (numel + 3) // 4
-    width = max(1, math.ceil(math.sqrt(texels)))
-    height = math.ceil(texels / width)
-    return width, height
-
-
 def _create_rgba32f_texture(width: int, height: int, data: np.ndarray | None = None) -> int:
     if _profile_enabled:
         _profile_counters["texture_allocations"] += 1
@@ -2481,22 +2170,6 @@ def _create_rgba32f_texture(width: int, height: int, data: np.ndarray | None = N
     if _profile_enabled and data is not None:
         _profile_counters["texture_upload_seconds"] += time.perf_counter() - upload_started
     return texture.value
-
-
-def _pack_linear_rgba(matrix: np.ndarray) -> tuple[np.ndarray, _StorageLayout]:
-    flat = np.ascontiguousarray(matrix, dtype=np.float32).reshape(-1)
-    width, height = _packed_atlas_size(flat.size)
-    rgba = np.zeros((height, width, 4), dtype=np.float32)
-    rgba.reshape(-1)[: flat.size] = flat
-    return rgba, _StorageLayout("packed_rgba", width, height, flat.size)
-
-
-def _matrix_red_rgba(matrix: np.ndarray) -> tuple[np.ndarray, _StorageLayout]:
-    n = matrix.shape[0]
-    rgba = np.zeros((n, n, 4), dtype=np.float32)
-    rgba[:, :, 0] = matrix.astype(np.float32)
-    rgba[:, :, 3] = 1.0
-    return rgba, _StorageLayout("matrix2d_red", n, n, n * n)
 
 
 def _upload_array_to_texture(array: np.ndarray) -> _TextureOwner:
@@ -3898,290 +3571,12 @@ def _arange_start_step_gm45(start, end, step=1, *, dtype=None, layout=None, devi
 
 
 def _as_pair(value, name: str) -> tuple[int, int]:
+    """Normalize the shared two-dimensional operator argument form."""
     if isinstance(value, int):
         return (value, value)
     if isinstance(value, (list, tuple)) and len(value) == 2:
         return (int(value[0]), int(value[1]))
     raise RuntimeError(f"gm45 convolution expects {name} as int or pair")
-
-
-def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwner,
-                              weight_owner: _TextureOwner, bias_owner: _TextureOwner,
-                              params: tuple) -> "Gm45Tensor":
-    """Render a large packed output through physically small GPU textures."""
-    full_w, full_h = out_owner.layout.texture_width, out_owner.layout.texture_height
-    limit = CONV_PHYSICAL_TILE_LIMIT
-    tiles_x = math.ceil(full_w / limit)
-    tiles_y = math.ceil(full_h / limit)
-    if _profile_enabled:
-        _profile_counters["tiled_conv_calls"] += 1
-        _profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
-        _profile_counters["tiled_conv_max_tile_width"] = max(_profile_counters["tiled_conv_max_tile_width"], limit)
-        _profile_counters["tiled_conv_max_tile_height"] = max(_profile_counters["tiled_conv_max_tile_height"], limit)
-    _kernel_log(
-        f"Tiled Conv2D {_shape_text(input_tensor.shape)} -> "
-        f"{_shape_text((1, params[3], params[4], params[5]))} tiles={tiles_x}x{tiles_y}"
-    )
-    _trace(
-        "gm45.conv -> tiled dispatch\n"
-        f"  logical atlas: {full_w}x{full_h}\n"
-        f"  tile limit: {limit}x{limit}\n"
-        f"  physical tiles: {tiles_x}x{tiles_y} = {tiles_x * tiles_y}"
-    )
-    rt = _runtime_required()
-    _tile_diagnostic_snapshots.clear()
-    tile_owners: list[_TextureOwner] = []
-    try:
-        tile_render_started = time.perf_counter()
-        finish_before_tiles = _profile_counters["glFinish_seconds"]
-        for tile_y in range(tiles_y):
-            origin_y = tile_y * limit
-            tile_h = min(limit, full_h - origin_y)
-            for tile_x in range(tiles_x):
-                origin_x = tile_x * limit
-                tile_w = min(limit, full_w - origin_x)
-                tile = _new_physical_packed_owner(tile_w, tile_h)
-                tile_owners.append(tile)
-                if _profile_enabled:
-                    _profile_counters["tiled_draw_calls"] += 1
-                program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
-                try:
-                    gm.glViewport(0, 0, tile_w, tile_h)
-                    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-                    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
-                    if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
-                        raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
-                    gm.glUseProgram(program)
-                    for unit, texture, uniform in (
-                        (gm.GL_TEXTURE0, input_tensor._owner.texture, b"input_tex"),
-                        (gm.GL_TEXTURE1, weight_owner.texture, b"weight_tex"),
-                        (gm.GL_TEXTURE2, bias_owner.texture, b"bias_tex"),
-                    ):
-                        gm.glActiveTexture(unit)
-                        gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
-                        gm.glUniform1i(gm.glGetUniformLocation(program, uniform), unit - gm.GL_TEXTURE0)
-                    gm.glBegin(gm.GL_QUADS)
-                    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-                    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
-                    if (err := gm.glGetError()):
-                        raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
-                    gm.glFinish()
-                    if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
-                        diagnostic = _read_texture(tile, (1, 1, tile_h, tile_w * 4))
-                        _tile_diagnostic_snapshots.append({
-                            "tile_index": len(_tile_diagnostic_snapshots),
-                            "origin_x": origin_x,
-                            "origin_y": origin_y,
-                            "width": tile_w,
-                            "height": tile_h,
-                            "texture": tile.texture,
-                            "data": diagnostic,
-                        })
-                finally:
-                    gm.glDeleteProgram(program)
-
-        if _profile_enabled:
-            _profile_conv["tile_render"] += time.perf_counter() - tile_render_started
-            _profile_conv["sync"] += _profile_counters["glFinish_seconds"] - finish_before_tiles
-
-        # Old Mesa/GM45 drivers need an explicit ordering point before the
-        # separate copy pass consumes the tile render targets.
-        gm.glFinish()
-
-        # Assemble tiles entirely on the GPU with a simple copy shader.  The
-        # full viewport plus scissor keeps fragment coordinates global while
-        # limiting each dispatch to one physical tile.
-        index = 0
-        consolidation_started = time.perf_counter()
-        for tile_y in range(tiles_y):
-            origin_y = tile_y * limit
-            tile_h = min(limit, full_h - origin_y)
-            for tile_x in range(tiles_x):
-                origin_x = tile_x * limit
-                tile_w = min(limit, full_w - origin_x)
-                tile = tile_owners[index]
-                index += 1
-                program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
-                if _profile_enabled:
-                    _profile_counters["consolidation_draw_calls"] += 1
-                try:
-                    gm.glViewport(0, 0, full_w, full_h)
-                    gm.gl.glEnable(_GL_SCISSOR_TEST)
-                    gm.gl.glScissor(origin_x, origin_y, tile_w, tile_h)
-                    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-                    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
-                    if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
-                        raise RuntimeError("gm45 tiled convolution output framebuffer incomplete")
-                    gm.glUseProgram(program)
-                    gm.glActiveTexture(gm.GL_TEXTURE0)
-                    gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
-                    gm.glUniform1i(gm.glGetUniformLocation(program, b"tile_tex"), 0)
-                    gm.glBegin(gm.GL_QUADS)
-                    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-                    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
-                    gm.gl.glDisable(_GL_SCISSOR_TEST)
-                    if (err := gm.glGetError()):
-                        raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
-                finally:
-                    gm.glDeleteProgram(program)
-        gm.glFinish()
-        if _profile_enabled:
-            _profile_conv["consolidation"] += time.perf_counter() - consolidation_started
-        return Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
-    finally:
-        for tile in tile_owners:
-            if tile.texture:
-                texture = ctypes.c_uint(tile.texture)
-                gm.glDeleteTextures(1, ctypes.byref(texture))
-
-
-def _render_convolution(args) -> "Gm45Tensor":
-    conv_started = time.perf_counter()
-    input_tensor, weight_tensor, bias_tensor = args[0], args[1], args[2]
-    stride = _as_pair(args[3], "stride")
-    padding = _as_pair(args[4], "padding")
-    dilation = _as_pair(args[5], "dilation")
-    transposed = bool(args[6])
-    output_padding = _as_pair(args[7], "output_padding")
-    groups = int(args[8])
-
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 convolution requires input to be a Gm45Tensor")
-    if input_tensor._owner.layout.kind != "packed_rgba":
-        raise RuntimeError("gm45 convolution requires packed_rgba input storage")
-    _require_contiguous_logical(input_tensor, "convolution")
-    if tuple(input_tensor.shape)[0] != 1 or len(input_tensor.shape) != 4:
-        raise RuntimeError("gm45 convolution supports only batch-1 NCHW 4D input")
-    if not isinstance(weight_tensor, torch.Tensor) or weight_tensor.device.type != "cpu":
-        raise RuntimeError("gm45 convolution currently expects CPU weight tensor for upload")
-    if weight_tensor.dtype != torch.float32 or not weight_tensor.is_contiguous():
-        raise RuntimeError("gm45 convolution weights must be contiguous float32")
-    if bias_tensor is not None and (
-        not isinstance(bias_tensor, torch.Tensor)
-        or bias_tensor.device.type != "cpu"
-        or bias_tensor.dtype != torch.float32
-        or not bias_tensor.is_contiguous()
-    ):
-        raise RuntimeError("gm45 convolution bias must be a contiguous CPU float32 tensor or None")
-    if transposed:
-        raise RuntimeError("gm45 convolution does not support transposed convolution")
-    if output_padding != (0, 0):
-        raise RuntimeError("gm45 convolution requires output_padding=(0,0)")
-    if dilation != (1, 1):
-        raise RuntimeError("gm45 convolution currently supports dilation=(1,1) only")
-    _, in_c, in_h, in_w = (int(v) for v in input_tensor.shape)
-    out_c, weight_in_c, kernel_h, kernel_w = (int(v) for v in weight_tensor.shape)
-    if groups < 1 or in_c % groups != 0 or out_c % groups != 0:
-        raise RuntimeError("gm45 grouped convolution requires positive groups dividing Cin and Cout")
-    input_channels_per_group = in_c // groups
-    grouped = groups > 1 and weight_in_c == input_channels_per_group
-    if groups != 1 and not grouped:
-        raise RuntimeError("gm45 grouped convolution weight shape does not match Cin/groups")
-    if groups == 1 and weight_in_c != in_c:
-        raise RuntimeError("gm45 convolution input channels do not match weight channels")
-    if groups > 1 and (kernel_h, kernel_w) != (3, 3):
-        raise RuntimeError("gm45 grouped convolution currently supports only 3x3 kernels")
-    if kernel_h not in {1, 3} or kernel_w not in {1, 3}:
-        raise RuntimeError("gm45 convolution currently supports only 1x1 and 3x3 kernels")
-    if stride not in {(1, 1), (2, 2)}:
-        raise RuntimeError("gm45 convolution currently supports stride 1 or 2")
-    if padding not in {(0, 0), (1, 1)}:
-        raise RuntimeError("gm45 convolution currently supports padding 0 or 1")
-    if groups > 1 and (stride, padding) not in {((2, 2), (1, 1)), ((1, 1), (1, 1))}:
-        raise RuntimeError("gm45 grouped convolution supports only stride 1/2 with padding 1")
-    if bias_tensor is not None and tuple(bias_tensor.shape) != (out_c,):
-        raise RuntimeError("gm45 convolution bias shape must be [out_channels]")
-
-    out_h = (in_h + 2 * padding[0] - kernel_h) // stride[0] + 1
-    out_w = (in_w + 2 * padding[1] - kernel_w) // stride[1] + 1
-    out_shape = (1, out_c, out_h, out_w)
-    out_owner = _new_empty_packed_texture(out_shape)
-    if _profile_enabled:
-        _profile_conv["prepare"] += time.perf_counter() - conv_started
-    upload_started = time.perf_counter()
-    weight_owner = _upload_raw_packed_array(weight_tensor.detach().numpy().astype(np.float32, copy=False), "weight")
-    bias_owner = _upload_raw_packed_array(
-        bias_tensor.detach().numpy().astype(np.float32, copy=False)
-        if bias_tensor is not None
-        else np.zeros((1,), dtype=np.float32),
-        "bias",
-    )
-    if _profile_enabled:
-        _profile_conv["parameter_upload"] += time.perf_counter() - upload_started
-
-    params = (
-        in_c,
-        in_h,
-        in_w,
-        out_c,
-        out_h,
-        out_w,
-        kernel_h,
-        kernel_w,
-        stride[0],
-        stride[1],
-        padding[0],
-        padding[1],
-        bias_tensor is not None,
-        groups,
-        input_tensor._storage_offset,
-        input_tensor._owner.layout.texture_width,
-        input_tensor._owner.layout.texture_height,
-        weight_owner.layout.texture_width,
-        weight_owner.layout.texture_height,
-        bias_owner.layout.texture_width,
-        out_owner.layout.texture_width,
-    )
-    if out_owner.layout.texture_width > CONV_PHYSICAL_TILE_LIMIT or out_owner.layout.texture_height > CONV_PHYSICAL_TILE_LIMIT:
-        return _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params)
-    _kernel_log(f"Conv2D {_shape_text(input_tensor.shape)} -> {_shape_text(out_shape)}")
-    shader_setup_started = time.perf_counter()
-    program, input_loc, weight_loc, bias_loc = _conv_program(params)
-    rt = _runtime_required()
-
-    _trace(
-        "gm45.kernel -> convolution shader:\n"
-        f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)}\n"
-        f"  weight texture #{weight_owner.texture} shape={list(weight_tensor.shape)}\n"
-        f"  bias texture #{bias_owner.texture if bias_tensor is not None else 'none'}\n"
-        f"  -> output texture #{out_owner.texture} shape={list(out_shape)}"
-    )
-
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
-    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
-    if status != gm.GL_FRAMEBUFFER_COMPLETE:
-        raise RuntimeError(f"gm45 convolution framebuffer incomplete: 0x{status:04x}")
-
-    gm.glUseProgram(program)
-    gm.glActiveTexture(gm.GL_TEXTURE0)
-    gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
-    gm.glUniform1i(input_loc, 0)
-    gm.glActiveTexture(gm.GL_TEXTURE1)
-    gm.glBindTexture(gm.GL_TEXTURE_2D, weight_owner.texture)
-    gm.glUniform1i(weight_loc, 1)
-    gm.glActiveTexture(gm.GL_TEXTURE2)
-    gm.glBindTexture(gm.GL_TEXTURE_2D, bias_owner.texture)
-    gm.glUniform1i(bias_loc, 2)
-    if _profile_enabled:
-        _profile_conv["shader_setup"] += time.perf_counter() - shader_setup_started
-
-    render_started = time.perf_counter()
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
-    if _profile_enabled:
-        _profile_conv["tile_render"] += time.perf_counter() - render_started
-    _trace(f"gm45.opengl -> submitted Conv2D fullscreen quad, output texture #{out_owner.texture}")
-
-    err = gm.glGetError()
-    if err:
-        raise RuntimeError(f"gm45 OpenGL error after convolution: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
 
 
 def _render_batch_norm(args):
@@ -4449,7 +3844,7 @@ class Gm45Tensor(torch.Tensor):
             _trace("  -> Gm45Tensor.__torch_dispatch__")
             _trace("  -> GM45 Conv2D kernel")
             _trace("  -> GLSL fragment shader arithmetic: bias + sum(input * weight)")
-            return _render_convolution(args)
+            return _convolution.execute(args)
 
         if func is torch.ops.aten.native_batch_norm.default:
             _kernel_log("BatchNorm")

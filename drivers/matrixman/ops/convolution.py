@@ -1,0 +1,397 @@
+"""OpenGL/GLSL convolution implementation.
+
+The backend module owns the tensor wrapper and the shared OpenGL runtime.  This
+module owns only convolution execution and obtains those shared objects lazily
+to avoid creating a second runtime or an import cycle.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import math
+import os
+import time
+
+import numpy as np
+import torch
+
+from .. import gpumatrix as gm
+from ..storage import StorageLayout, packed_atlas_size
+
+
+CONV_PHYSICAL_TILE_LIMIT = 256
+_tile_diagnostic_snapshots: list[dict] = []
+_GL_SCISSOR_TEST = 0x0C11
+gm.gl.glScissor.restype = None
+gm.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+gm.gl.glEnable.restype = None
+gm.gl.glEnable.argtypes = [ctypes.c_uint]
+gm.gl.glDisable.restype = None
+gm.gl.glDisable.argtypes = [ctypes.c_uint]
+gm.gl.glCopyTexSubImage2D.restype = None
+gm.gl.glCopyTexSubImage2D.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+
+def _backend():
+    # Import only when a kernel is executed: gm45_backend imports this module.
+    from .. import gm45_backend
+    return gm45_backend
+
+
+def _conv_shader_source(params: tuple) -> bytes:
+    (
+        in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w,
+        stride_h, stride_w, pad_h, pad_w, has_bias, groups, input_offset,
+        input_tex_w, input_tex_h, weight_tex_w, weight_tex_h, bias_tex_w,
+        out_tex_w,
+    ) = params
+    bias_expr = "read_bias(oc)" if has_bias else "0.0"
+    source = f"""
+#version 120
+uniform sampler2D input_tex;
+uniform sampler2D weight_tex;
+uniform sampler2D bias_tex;
+
+float pick_component(vec4 value, int component)
+{{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}}
+
+float read_input(int ic, int iy, int ix)
+{{
+    int linear_index = INPUT_OFFSET + ((ic * IN_H) + iy) * IN_W + ix;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / INPUT_TEX_W) * INPUT_TEX_W;
+    int y = texel / INPUT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) / vec2(float(INPUT_TEX_W), float(INPUT_TEX_H));
+    return pick_component(texture2D(input_tex, uv), component);
+}}
+
+float read_weight(int oc, int ic, int ky, int kx)
+{{
+    int linear_index = (((oc * IN_C_PER_GROUP + ic) * K_H + ky) * K_W) + kx;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / WEIGHT_TEX_W) * WEIGHT_TEX_W;
+    int y = texel / WEIGHT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) / vec2(float(WEIGHT_TEX_W), float(WEIGHT_TEX_H));
+    return pick_component(texture2D(weight_tex, uv), component);
+}}
+
+float read_bias(int oc)
+{{
+    int linear_index = oc;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / BIAS_TEX_W) * BIAS_TEX_W;
+    int y = texel / BIAS_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) / vec2(float(BIAS_TEX_W), float(BIAS_TEX_H));
+    return pick_component(texture2D(bias_tex, uv), component);
+}}
+
+float compute_output(int out_index)
+{{
+    if (out_index >= OUT_NUMEL) return 0.0;
+    int ox = out_index - (out_index / OUT_W) * OUT_W;
+    int tmp0 = out_index / OUT_W;
+    int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
+    int oc = tmp0 / OUT_H;
+    float acc = {bias_expr};
+
+    int group = oc / OUT_C_PER_GROUP;
+    int input_channel_start = group * IN_C_PER_GROUP;
+    for (int ic = 0; ic < IN_C_PER_GROUP; ++ic) {{
+        for (int ky = 0; ky < K_H; ++ky) {{
+            int iy = oy * STRIDE_H + ky - PAD_H;
+            if (iy >= 0 && iy < IN_H) {{
+                for (int kx = 0; kx < K_W; ++kx) {{
+                    int ix = ox * STRIDE_W + kx - PAD_W;
+                    if (ix >= 0 && ix < IN_W) {{
+                        acc += read_input(input_channel_start + ic, iy, ix) * read_weight(oc, ic, ky, kx);
+                    }}
+                }}
+            }}
+        }}
+    }}
+    return acc;
+}}
+
+void main()
+{{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
+    gl_FragColor = vec4(
+        compute_output(base),
+        compute_output(base + 1),
+        compute_output(base + 2),
+        compute_output(base + 3)
+    );
+}}
+"""
+    replacements = {
+        "IN_C": in_c, "IN_H": in_h, "IN_W": in_w,
+        "OUT_C": out_c, "OUT_H": out_h, "OUT_W": out_w,
+        "OUT_NUMEL": out_c * out_h * out_w, "GROUPS": groups,
+        "IN_C_PER_GROUP": in_c // groups, "OUT_C_PER_GROUP": out_c // groups,
+        "K_H": kernel_h, "K_W": kernel_w,
+        "STRIDE_H": stride_h, "STRIDE_W": stride_w,
+        "PAD_H": pad_h, "PAD_W": pad_w, "INPUT_OFFSET": input_offset,
+        "INPUT_TEX_W": input_tex_w, "INPUT_TEX_H": input_tex_h,
+        "WEIGHT_TEX_W": weight_tex_w, "WEIGHT_TEX_H": weight_tex_h,
+        "BIAS_TEX_W": bias_tex_w,
+        "BIAS_TEX_H": max(1, packed_atlas_size(max(out_c, 1))[1]),
+        "OUT_TEX_W": out_tex_w,
+    }
+    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _conv_program(params: tuple) -> tuple[int, int, int, int]:
+    b = _backend()
+    rt = b._runtime_required()
+    if params not in rt.conv_programs:
+        b._trace(f"gm45.compile -> convolution GLSL fragment shader params={params}")
+        program = gm.make_program(_conv_shader_source(params))
+        rt.conv_programs[params] = program
+        rt.conv_uniforms[params] = (
+            gm.glGetUniformLocation(program, b"input_tex"),
+            gm.glGetUniformLocation(program, b"weight_tex"),
+            gm.glGetUniformLocation(program, b"bias_tex"),
+        )
+    input_loc, weight_loc, bias_loc = rt.conv_uniforms[params]
+    return rt.conv_programs[params], input_loc, weight_loc, bias_loc
+
+
+def _conv_tile_shader_source(params: tuple, tile_x: int, tile_y: int) -> bytes:
+    source = _conv_shader_source(params).decode("ascii")
+    out_tex_w = params[-1]
+    old = f"int base = (tex_y * {out_tex_w} + tex_x) * 4;"
+    new = f"int base = ((tex_y + {tile_y}) * {out_tex_w} + tex_x + {tile_x}) * 4;"
+    if old not in source:
+        raise RuntimeError("gm45 tiled convolution could not locate output address expression")
+    return source.replace(old, new).encode("ascii")
+
+
+def _tile_copy_shader_source(tile_width: int, tile_height: int, origin_x: int, origin_y: int) -> bytes:
+    return f"""
+#version 120
+uniform sampler2D tile_tex;
+void main() {{
+    int x = int(floor(gl_FragCoord.x)) - {origin_x};
+    int y = int(floor(gl_FragCoord.y)) - {origin_y};
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float({tile_width}), float({tile_height}));
+    gl_FragColor = texture2D(tile_tex, uv);
+}}
+""".encode("ascii")
+
+
+def _new_physical_packed_owner(width: int, height: int):
+    b = _backend()
+    texture = b._create_rgba32f_texture(width, height)
+    return b._TextureOwner(texture, StorageLayout("packed_rgba", width, height, width * height * 4))
+
+
+def _as_pair(value, name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        return (value, value)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (int(value[0]), int(value[1]))
+    raise RuntimeError(f"gm45 convolution expects {name} as int or pair")
+
+
+def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params):
+    b = _backend()
+    full_w, full_h = out_owner.layout.texture_width, out_owner.layout.texture_height
+    # Keep the compatibility probe's existing mutable backend limit visible.
+    limit = getattr(b, "CONV_PHYSICAL_TILE_LIMIT", CONV_PHYSICAL_TILE_LIMIT)
+    tiles_x = math.ceil(full_w / limit)
+    tiles_y = math.ceil(full_h / limit)
+    if b._profile_enabled:
+        b._profile_counters["tiled_conv_calls"] += 1
+        b._profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
+        b._profile_counters["tiled_conv_max_tile_width"] = max(b._profile_counters["tiled_conv_max_tile_width"], limit)
+        b._profile_counters["tiled_conv_max_tile_height"] = max(b._profile_counters["tiled_conv_max_tile_height"], limit)
+    b._kernel_log(f"Tiled Conv2D {b._shape_text(input_tensor.shape)} -> {b._shape_text((1, params[3], params[4], params[5]))} tiles={tiles_x}x{tiles_y}")
+    b._trace("gm45.conv -> tiled dispatch\n" f"  logical atlas: {full_w}x{full_h}\n" f"  tile limit: {limit}x{limit}\n" f"  physical tiles: {tiles_x}x{tiles_y} = {tiles_x * tiles_y}")
+    rt = b._runtime_required()
+    _tile_diagnostic_snapshots.clear()
+    tile_owners = []
+    try:
+        tile_render_started = time.perf_counter()
+        finish_before_tiles = b._profile_counters["glFinish_seconds"]
+        for tile_y in range(tiles_y):
+            origin_y = tile_y * limit
+            tile_h = min(limit, full_h - origin_y)
+            for tile_x in range(tiles_x):
+                origin_x = tile_x * limit
+                tile_w = min(limit, full_w - origin_x)
+                tile = _new_physical_packed_owner(tile_w, tile_h)
+                tile_owners.append(tile)
+                if b._profile_enabled:
+                    b._profile_counters["tiled_draw_calls"] += 1
+                program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
+                try:
+                    gm.glViewport(0, 0, tile_w, tile_h)
+                    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+                    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
+                    if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
+                        raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
+                    gm.glUseProgram(program)
+                    for unit, texture, uniform in ((gm.GL_TEXTURE0, input_tensor._owner.texture, b"input_tex"), (gm.GL_TEXTURE1, weight_owner.texture, b"weight_tex"), (gm.GL_TEXTURE2, bias_owner.texture, b"bias_tex")):
+                        gm.glActiveTexture(unit)
+                        gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
+                        gm.glUniform1i(gm.glGetUniformLocation(program, uniform), unit - gm.GL_TEXTURE0)
+                    gm.glBegin(gm.GL_QUADS)
+                    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
+                    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+                    if (err := gm.glGetError()):
+                        raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
+                    gm.glFinish()
+                    if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
+                        diagnostic = b._read_texture(tile, (1, 1, tile_h, tile_w * 4))
+                        _tile_diagnostic_snapshots.append({"tile_index": len(_tile_diagnostic_snapshots), "origin_x": origin_x, "origin_y": origin_y, "width": tile_w, "height": tile_h, "texture": tile.texture, "data": diagnostic})
+                finally:
+                    gm.glDeleteProgram(program)
+        if b._profile_enabled:
+            b._profile_conv["tile_render"] += time.perf_counter() - tile_render_started
+            b._profile_conv["sync"] += b._profile_counters["glFinish_seconds"] - finish_before_tiles
+        gm.glFinish()
+        index = 0
+        consolidation_started = time.perf_counter()
+        for tile_y in range(tiles_y):
+            origin_y = tile_y * limit
+            tile_h = min(limit, full_h - origin_y)
+            for tile_x in range(tiles_x):
+                origin_x = tile_x * limit
+                tile_w = min(limit, full_w - origin_x)
+                tile = tile_owners[index]
+                index += 1
+                program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
+                if b._profile_enabled:
+                    b._profile_counters["consolidation_draw_calls"] += 1
+                try:
+                    gm.glViewport(0, 0, full_w, full_h)
+                    gm.gl.glEnable(_GL_SCISSOR_TEST)
+                    gm.gl.glScissor(origin_x, origin_y, tile_w, tile_h)
+                    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+                    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+                    if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
+                        raise RuntimeError("gm45 tiled convolution output framebuffer incomplete")
+                    gm.glUseProgram(program)
+                    gm.glActiveTexture(gm.GL_TEXTURE0)
+                    gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
+                    gm.glUniform1i(gm.glGetUniformLocation(program, b"tile_tex"), 0)
+                    gm.glBegin(gm.GL_QUADS)
+                    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
+                    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+                    gm.gl.glDisable(_GL_SCISSOR_TEST)
+                    if (err := gm.glGetError()):
+                        raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
+                finally:
+                    gm.glDeleteProgram(program)
+        gm.glFinish()
+        if b._profile_enabled:
+            b._profile_conv["consolidation"] += time.perf_counter() - consolidation_started
+        return b.Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
+    finally:
+        for tile in tile_owners:
+            if tile.texture:
+                texture = ctypes.c_uint(tile.texture)
+                gm.glDeleteTextures(1, ctypes.byref(texture))
+
+
+def execute(args):
+    b = _backend()
+    tile_limit = getattr(b, "CONV_PHYSICAL_TILE_LIMIT", CONV_PHYSICAL_TILE_LIMIT)
+    conv_started = time.perf_counter()
+    input_tensor, weight_tensor, bias_tensor = args[0], args[1], args[2]
+    stride, padding, dilation = _as_pair(args[3], "stride"), _as_pair(args[4], "padding"), _as_pair(args[5], "dilation")
+    transposed, output_padding, groups = bool(args[6]), _as_pair(args[7], "output_padding"), int(args[8])
+    if not isinstance(input_tensor, b.Gm45Tensor):
+        raise RuntimeError("gm45 convolution requires input to be a Gm45Tensor")
+    if input_tensor._owner.layout.kind != "packed_rgba":
+        raise RuntimeError("gm45 convolution requires packed_rgba input storage")
+    b._require_contiguous_logical(input_tensor, "convolution")
+    if tuple(input_tensor.shape)[0] != 1 or len(input_tensor.shape) != 4:
+        raise RuntimeError("gm45 convolution supports only batch-1 NCHW 4D input")
+    if not isinstance(weight_tensor, torch.Tensor) or weight_tensor.device.type != "cpu":
+        raise RuntimeError("gm45 convolution currently expects CPU weight tensor for upload")
+    if weight_tensor.dtype != torch.float32 or not weight_tensor.is_contiguous():
+        raise RuntimeError("gm45 convolution weights must be contiguous float32")
+    if bias_tensor is not None and (not isinstance(bias_tensor, torch.Tensor) or bias_tensor.device.type != "cpu" or bias_tensor.dtype != torch.float32 or not bias_tensor.is_contiguous()):
+        raise RuntimeError("gm45 convolution bias must be a contiguous CPU float32 tensor or None")
+    if transposed:
+        raise RuntimeError("gm45 convolution does not support transposed convolution")
+    if output_padding != (0, 0):
+        raise RuntimeError("gm45 convolution requires output_padding=(0,0)")
+    if dilation != (1, 1):
+        raise RuntimeError("gm45 convolution currently supports dilation=(1,1) only")
+    _, in_c, in_h, in_w = (int(v) for v in input_tensor.shape)
+    out_c, weight_in_c, kernel_h, kernel_w = (int(v) for v in weight_tensor.shape)
+    if groups < 1 or in_c % groups != 0 or out_c % groups != 0:
+        raise RuntimeError("gm45 grouped convolution requires positive groups dividing Cin and Cout")
+    input_channels_per_group = in_c // groups
+    grouped = groups > 1 and weight_in_c == input_channels_per_group
+    if groups != 1 and not grouped:
+        raise RuntimeError("gm45 grouped convolution weight shape does not match Cin/groups")
+    if groups == 1 and weight_in_c != in_c:
+        raise RuntimeError("gm45 convolution input channels do not match weight channels")
+    if groups > 1 and (kernel_h, kernel_w) != (3, 3):
+        raise RuntimeError("gm45 grouped convolution currently supports only 3x3 kernels")
+    if kernel_h not in {1, 3} or kernel_w not in {1, 3}:
+        raise RuntimeError("gm45 convolution currently supports only 1x1 and 3x3 kernels")
+    if stride not in {(1, 1), (2, 2)}:
+        raise RuntimeError("gm45 convolution currently supports stride 1 or 2")
+    if padding not in {(0, 0), (1, 1)}:
+        raise RuntimeError("gm45 convolution currently supports padding 0 or 1")
+    if groups > 1 and (stride, padding) not in {((2, 2), (1, 1)), ((1, 1), (1, 1))}:
+        raise RuntimeError("gm45 grouped convolution supports only stride 1/2 with padding 1")
+    if bias_tensor is not None and tuple(bias_tensor.shape) != (out_c,):
+        raise RuntimeError("gm45 convolution bias shape must be [out_channels]")
+    out_h = (in_h + 2 * padding[0] - kernel_h) // stride[0] + 1
+    out_w = (in_w + 2 * padding[1] - kernel_w) // stride[1] + 1
+    out_shape = (1, out_c, out_h, out_w)
+    out_owner = b._new_empty_packed_texture(out_shape)
+    if b._profile_enabled:
+        b._profile_conv["prepare"] += time.perf_counter() - conv_started
+    upload_started = time.perf_counter()
+    weight_owner = b._upload_raw_packed_array(weight_tensor.detach().numpy().astype(np.float32, copy=False), "weight")
+    bias_owner = b._upload_raw_packed_array(bias_tensor.detach().numpy().astype(np.float32, copy=False) if bias_tensor is not None else np.zeros((1,), dtype=np.float32), "bias")
+    if b._profile_enabled:
+        b._profile_conv["parameter_upload"] += time.perf_counter() - upload_started
+    params = (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w, stride[0], stride[1], padding[0], padding[1], bias_tensor is not None, groups, input_tensor._storage_offset, input_tensor._owner.layout.texture_width, input_tensor._owner.layout.texture_height, weight_owner.layout.texture_width, weight_owner.layout.texture_height, bias_owner.layout.texture_width, out_owner.layout.texture_width)
+    if out_owner.layout.texture_width > tile_limit or out_owner.layout.texture_height > tile_limit:
+        return _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params)
+    b._kernel_log(f"Conv2D {b._shape_text(input_tensor.shape)} -> {b._shape_text(out_shape)}")
+    shader_setup_started = time.perf_counter()
+    program, input_loc, weight_loc, bias_loc = _conv_program(params)
+    rt = b._runtime_required()
+    b._trace("gm45.kernel -> convolution shader:\n" f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)}\n" f"  weight texture #{weight_owner.texture} shape={list(weight_tensor.shape)}\n" f"  bias texture #{bias_owner.texture if bias_tensor is not None else 'none'}\n" f"  -> output texture #{out_owner.texture} shape={list(out_shape)}")
+    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
+    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
+    if status != gm.GL_FRAMEBUFFER_COMPLETE:
+        raise RuntimeError(f"gm45 convolution framebuffer incomplete: 0x{status:04x}")
+    gm.glUseProgram(program)
+    gm.glActiveTexture(gm.GL_TEXTURE0); gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture); gm.glUniform1i(input_loc, 0)
+    gm.glActiveTexture(gm.GL_TEXTURE1); gm.glBindTexture(gm.GL_TEXTURE_2D, weight_owner.texture); gm.glUniform1i(weight_loc, 1)
+    gm.glActiveTexture(gm.GL_TEXTURE2); gm.glBindTexture(gm.GL_TEXTURE_2D, bias_owner.texture); gm.glUniform1i(bias_loc, 2)
+    if b._profile_enabled:
+        b._profile_conv["shader_setup"] += time.perf_counter() - shader_setup_started
+    render_started = time.perf_counter()
+    gm.glBegin(gm.GL_QUADS)
+    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0); gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+    if b._profile_enabled:
+        b._profile_conv["tile_render"] += time.perf_counter() - render_started
+    b._trace(f"gm45.opengl -> submitted Conv2D fullscreen quad, output texture #{out_owner.texture}")
+    if (err := gm.glGetError()):
+        raise RuntimeError(f"gm45 OpenGL error after convolution: 0x{err:04x}")
+    return b.Gm45Tensor._from_owner(out_owner, out_shape)

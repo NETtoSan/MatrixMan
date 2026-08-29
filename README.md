@@ -7,8 +7,11 @@
 MatrixMan is an experimental PyTorch execution backend for GPUs that do not
 have a usable native PyTorch compute backend.
 
-No CUDA? ROCm does not support your Radeon? Ancient integrated graphics? But
-programmable OpenGL shaders work?
+No CUDA? No usable native backend? Ancient integrated graphics? But
+programmable OpenGL shaders work? MatrixMan explores whether that is enough.
+
+Old Radeon/ROCm gaps, newer integrated GPUs, and other unsupported platforms
+are project motivation and portability goals, not claims of current support.
 
 Excellent.
 
@@ -47,9 +50,9 @@ operations needed by its current examples and model experiments, including:
 Unsupported operations fail explicitly. They do not quietly run tensor
 arithmetic on the CPU.
 
-## First Known Machine
+## Tested Hardware
 
-The first confirmed MatrixMan machine is:
+MatrixMan is currently confirmed working on:
 
 ```text
 ThinkPad X200
@@ -68,6 +71,19 @@ MatrixMan feeds the GM45 smaller tiles. It likes tiny bites.
 
 That is a detected/validated quirk of this path, not a universal limitation of
 all OpenGL GPUs.
+
+Other GPUs are currently unverified. OpenGL support alone does not guarantee
+MatrixMan compatibility: driver behavior, floating-point framebuffer support,
+shader behavior, texture limits, and other implementation details matter.
+Run the compatibility probe before assuming a machine works.
+
+### Experimental / Unverified
+
+Older AMD/Radeon hardware, NVIDIA GPUs, Apple GPUs, and Intel GPUs beyond the
+X200's GM45 are portability experiments or future goals, not tested MatrixMan
+platforms. The project is exploring whether such hardware can provide a
+usable graphics-based execution path; no compatibility claim is made for it
+until the probe and real workloads have passed there.
 
 ## Check Compatibility
 
@@ -151,8 +167,9 @@ with torch.no_grad():
 output_cpu = first_tensor(output_mm).cpu()
 ```
 
-The runnable example accepts any local Ultralytics YOLO detection checkpoint
-and an image. It does not download models automatically:
+The runnable example accepts a local Ultralytics YOLO detection checkpoint and
+an image. It does not download models automatically. A model is only expected
+to work when the operations exercised by that particular model are supported:
 
 ```bash
 python3 demo/example/yolo_example.py model.pt path/to/image.jpg --imgsz 320
@@ -171,9 +188,10 @@ Python `model.forward` and its control flow still execute normally on the
 CPU/PyTorch side. MatrixMan intercepts supported tensor operations involving a
 `Gm45Tensor` and executes their arithmetic through OpenGL/GLSL.
 
-MatrixMan is not specific to VisDrone. A particular Ultralytics model can be
-attempted when the ATen operations it exercises are supported; this does not
-mean every YOLO or Ultralytics model is supported.
+MatrixMan is not specific to VisDrone. Ultralytics YOLO models can be
+attempted when the ATen operations they exercise are supported; this does not
+mean every YOLO or Ultralytics model is supported. The current VisDrone-style
+checkpoint is tested evidence, not a general Ultralytics compatibility claim.
 
 ### Tested Model Evidence
 
@@ -265,3 +283,6 @@ MatrixMan:
 
 > **PyTorch says your GPU isn't supported?**  
 > **Does it draw triangles? Give it to MatrixMan.**
+
+That last line is a project slogan, not a compatibility guarantee. Whether a
+GPU actually works is what the compatibility checker is for.
