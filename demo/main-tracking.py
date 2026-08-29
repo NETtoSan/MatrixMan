@@ -452,6 +452,7 @@ def main() -> int:
 
     matrixman.set_trace(matrixman.debug_enabled())
     matrixman.init()
+    matrixman.profile_reset()
     yolo = YOLO(str(model_path))
     net = yolo.model.eval()
     cpu_net = YOLO(str(model_path)).model.eval() if (args.validate_cpu or args.diagnose_divergence) else None
@@ -548,6 +549,7 @@ def main() -> int:
         cap.release()
         if not args.no_display:
             cv2.destroyAllWindows()
+        matrixman.profile_report()
         matrixman.shutdown()
     print(f"completed frames: {frame_count}")
     return 0

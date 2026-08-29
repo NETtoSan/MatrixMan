@@ -31,9 +31,11 @@ experiment before implementing OpaqueTensorImpl/custom storage in C++.
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 from collections import Counter, defaultdict
 import math
+import time
 import traceback
 import weakref
 from dataclasses import dataclass
@@ -152,6 +154,14 @@ def _env_flag(name: str) -> bool:
 
 
 _trace_enabled = _env_flag("MATRIXMAN_DEBUG")
+_profile_enabled = _env_flag("MATRIXMAN_PROFILE")
+_profile_detail = _env_flag("MATRIXMAN_PROFILE_DETAIL")
+_profile_started = time.perf_counter()
+_profile_ops: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "total": 0.0, "max": 0.0})
+_profile_counters: dict[str, float] = defaultdict(float)
+_profile_parameters: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "bytes": 0, "repeated": 0})
+_profile_parameter_keys: set[tuple[str, int]] = set()
+_profile_conv: dict[str, float] = defaultdict(float)
 _unsupported_counts: Counter[str] = Counter()
 _unsupported_examples: dict[str, list[dict]] = defaultdict(list)
 _aten_privateuse1_lib = None
@@ -184,6 +194,110 @@ def _error_log(message: str) -> None:
 
 def _shape_text(shape) -> str:
     return "[" + ",".join(str(int(v)) for v in shape) + "]"
+
+
+def profile_enabled() -> bool:
+    return _profile_enabled
+
+
+def profile_reset() -> None:
+    global _profile_started
+    _profile_started = time.perf_counter()
+    _profile_ops.clear()
+    _profile_counters.clear()
+    _profile_parameters.clear()
+    _profile_parameter_keys.clear()
+    _profile_conv.clear()
+
+
+def _profile_gl_begin(mode):
+    if not _profile_enabled:
+        return _profile_gl_begin.original(mode)
+    _profile_counters["draw_calls"] += 1
+    return _profile_gl_begin.original(mode)
+
+
+def _profile_gl_finish():
+    if not _profile_enabled:
+        return _profile_gl_finish.original()
+    started = time.perf_counter()
+    result = _profile_gl_finish.original()
+    _profile_counters["glFinish_calls"] += 1
+    _profile_counters["glFinish_seconds"] += time.perf_counter() - started
+    return result
+
+
+_profile_gl_begin.original = gm.glBegin
+_profile_gl_finish.original = gm.glFinish
+if _profile_enabled:
+    gm.glBegin = _profile_gl_begin
+    gm.glFinish = _profile_gl_finish
+
+
+def _profile_dispatch(fn):
+    @functools.wraps(fn)
+    def wrapped(cls, func, types, args=(), kwargs=None):
+        if not _profile_enabled:
+            return fn(cls, func, types, args, kwargs)
+        name = str(func).removeprefix("aten.")
+        started = time.perf_counter()
+        try:
+            return fn(cls, func, types, args, kwargs)
+        finally:
+            elapsed = time.perf_counter() - started
+            record = _profile_ops[name]
+            record["calls"] += 1
+            record["total"] += elapsed
+            record["max"] = max(record["max"], elapsed)
+            if _profile_detail:
+                print(f"[MatrixMan profile] {name}: {elapsed:.6f}s")
+    return wrapped
+
+
+def profile_report() -> None:
+    if not _profile_enabled:
+        return
+    elapsed = time.perf_counter() - _profile_started
+    print("\nMatrixMan profile")
+    print("-----------------")
+    print(f"total backend time: {elapsed:.3f}s")
+    for name in ("convolution.default", "native_batch_norm.default", "silu_.default", "add.Tensor", "mul.Tensor", "div.Tensor", "sigmoid.default", "mm.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default"):
+        record = _profile_ops.get(name)
+        if record:
+            print(f"{name}: calls={int(record['calls'])} total={record['total']:.3f}s average={record['total']/record['calls']:.3f}s max={record['max']:.3f}s")
+    print("OpenGL:")
+    print(f"  draw calls: {int(_profile_counters['draw_calls'])}")
+    print(f"  tiled convolution draw calls: {int(_profile_counters['tiled_draw_calls'])}")
+    print(f"  consolidation draw calls: {int(_profile_counters['consolidation_draw_calls'])}")
+    print(f"  glFinish: {int(_profile_counters['glFinish_calls'])} ({_profile_counters['glFinish_seconds']:.3f}s)")
+    print("  glFlush: 0 (not exposed by the legacy helper)")
+    print(f"  texture allocations: {int(_profile_counters['texture_allocations'])}")
+    print(f"  texture uploads: {int(_profile_counters['texture_uploads'])} ({int(_profile_counters['texture_upload_bytes'])} bytes, {_profile_counters['texture_upload_seconds']:.3f}s)")
+    print("parameter uploads:")
+    print(f"  count: {int(_profile_counters['parameter_uploads'])}")
+    print(f"  bytes: {int(_profile_counters['parameter_upload_bytes'])}")
+    print(f"  repeated: {int(_profile_counters['repeated_parameter_uploads'])}")
+    print("readback:")
+    print(f"  calls: {int(_profile_counters['readback_calls'])} bytes: {int(_profile_counters['readback_bytes'])}")
+    print(f"  sync/wait: {_profile_counters['readback_sync_seconds']:.3f}s")
+    print(f"  transfer: {_profile_counters['readback_transfer_seconds']:.3f}s")
+    print(f"  conversion/tensor creation: {_profile_counters['readback_conversion_seconds']:.3f}s")
+    print(f"  total: {_profile_counters['readback_total_seconds']:.3f}s")
+    if _profile_conv:
+        print("Conv2D breakdown (aggregate):")
+        for key in ("prepare", "parameter_upload", "shader_setup", "tile_render", "sync", "consolidation"):
+            print(f"  {key}: {_profile_conv[key]:.3f}s")
+        print(
+            f"  tiled calls: {int(_profile_counters['tiled_conv_calls'])} "
+            f"tiles: {int(_profile_counters['tiled_conv_tiles'])} "
+            f"max physical tile: {int(_profile_counters['tiled_conv_max_tile_width'])}x"
+            f"{int(_profile_counters['tiled_conv_max_tile_height'])}"
+        )
+    slow = sorted(_profile_ops.items(), key=lambda item: item[1]["total"], reverse=True)[:3]
+    if slow:
+        print("Top slow operations:")
+        for index, (name, record) in enumerate(slow, 1):
+            print(f"  {index}. {name}: {record['total']:.3f}s ({int(record['calls'])} calls)")
 
 
 def _glsl_float(value: float) -> str:
@@ -2349,6 +2463,11 @@ def _packed_atlas_size(numel: int) -> tuple[int, int]:
 
 
 def _create_rgba32f_texture(width: int, height: int, data: np.ndarray | None = None) -> int:
+    if _profile_enabled:
+        _profile_counters["texture_allocations"] += 1
+        if data is not None:
+            _profile_counters["texture_uploads"] += 1
+            _profile_counters["texture_upload_bytes"] += data.nbytes
     texture = ctypes.c_uint()
     gm.glGenTextures(1, ctypes.byref(texture))
     gm.glBindTexture(gm.GL_TEXTURE_2D, texture.value)
@@ -2357,7 +2476,10 @@ def _create_rgba32f_texture(width: int, height: int, data: np.ndarray | None = N
     gm.glTexParameteri(gm.GL_TEXTURE_2D, gm.GL_TEXTURE_WRAP_S, gm.GL_CLAMP_TO_EDGE)
     gm.glTexParameteri(gm.GL_TEXTURE_2D, gm.GL_TEXTURE_WRAP_T, gm.GL_CLAMP_TO_EDGE)
     ptr = data.ctypes.data_as(ctypes.c_void_p) if data is not None else None
+    upload_started = time.perf_counter() if _profile_enabled and data is not None else 0.0
     gm.glTexImage2D(gm.GL_TEXTURE_2D, 0, gm.GL_RGBA32F, width, height, 0, gm.GL_RGBA, gm.GL_FLOAT, ptr)
+    if _profile_enabled and data is not None:
+        _profile_counters["texture_upload_seconds"] += time.perf_counter() - upload_started
     return texture.value
 
 
@@ -2388,7 +2510,17 @@ def _upload_array_to_texture(array: np.ndarray) -> _TextureOwner:
     return _TextureOwner(texture, layout)
 
 
-def _upload_raw_packed_array(array: np.ndarray) -> _TextureOwner:
+def _upload_raw_packed_array(array: np.ndarray, parameter_kind: str = "parameter") -> _TextureOwner:
+    if _profile_enabled:
+        key = (parameter_kind, int(array.__array_interface__["data"][0]))
+        _profile_counters["parameter_uploads"] += 1
+        _profile_counters["parameter_upload_bytes"] += array.nbytes
+        _profile_parameters[parameter_kind]["count"] += 1
+        _profile_parameters[parameter_kind]["bytes"] += array.nbytes
+        if key in _profile_parameter_keys:
+            _profile_counters["repeated_parameter_uploads"] += 1
+            _profile_parameters[parameter_kind]["repeated"] += 1
+        _profile_parameter_keys.add(key)
     data, layout = _pack_linear_rgba(array)
     texture = _create_rgba32f_texture(layout.texture_width, layout.texture_height, data)
     return _TextureOwner(texture, layout)
@@ -2492,6 +2624,9 @@ def _read_texture(
     logical_strides: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     rt = _runtime_required()
+    readback_started = time.perf_counter()
+    if _profile_enabled:
+        _profile_counters["readback_calls"] += 1
     _kernel_log(f"Readback {_shape_text(shape)} -> CPU")
     _trace(
         "gm45.readback:\n"
@@ -2500,21 +2635,36 @@ def _read_texture(
         f"strides={list(logical_strides or _contiguous_strides(shape))}\n"
         f"  -> torch shape {list(shape)}"
     )
+    sync_started = time.perf_counter()
     gm.glFinish()
+    if _profile_enabled:
+        _profile_counters["readback_sync_seconds"] += time.perf_counter() - sync_started
     numel = _numel(shape)
     if numel == 0:
+        if _profile_enabled:
+            _profile_counters["readback_total_seconds"] += time.perf_counter() - readback_started
         return torch.empty(shape, dtype=torch.float32, device="cpu")
     if owner.layout.kind == "empty":
         raise RuntimeError("gm45 empty placeholder has no readable texture data")
     if owner.layout.kind == "matrix2d_red":
         if storage_offset != 0:
             raise RuntimeError("gm45 matrix2d_red readback does not support nonzero storage offsets")
+        transfer_started = time.perf_counter()
         matrix = gpu_stress.read_texture(owner.texture, rt.fbo, owner.layout.texture_width)
-        return torch.from_numpy(matrix.copy()).reshape(shape)
+        if _profile_enabled:
+            _profile_counters["readback_transfer_seconds"] += time.perf_counter() - transfer_started
+        conversion_started = time.perf_counter()
+        result = torch.from_numpy(matrix.copy()).reshape(shape)
+        if _profile_enabled:
+            _profile_counters["readback_conversion_seconds"] += time.perf_counter() - conversion_started
+            _profile_counters["readback_bytes"] += owner.layout.texture_width * owner.layout.texture_height * 4 * 4
+            _profile_counters["readback_total_seconds"] += time.perf_counter() - readback_started
+        return result
 
     gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
     gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, owner.texture, 0)
     pixels = np.zeros((owner.layout.texture_height, owner.layout.texture_width, 4), dtype=np.float32)
+    transfer_started = time.perf_counter()
     gm.glReadPixels(
         0,
         0,
@@ -2524,20 +2674,34 @@ def _read_texture(
         gm.GL_FLOAT,
         pixels.ctypes.data_as(ctypes.c_void_p),
     )
+    if _profile_enabled:
+        _profile_counters["readback_transfer_seconds"] += time.perf_counter() - transfer_started
     logical_strides = logical_strides or _contiguous_strides(shape)
     max_storage_index = _max_storage_index(shape, logical_strides)
     if storage_offset < 0 or storage_offset + max_storage_index >= owner.layout.numel:
         raise RuntimeError("gm45 readback storage offset is outside texture storage")
     flat_storage = pixels.reshape(-1)
     if logical_strides == _contiguous_strides(shape):
+        conversion_started = time.perf_counter()
         flat = flat_storage[storage_offset : storage_offset + numel].copy()
-        return torch.from_numpy(flat.reshape(shape))
+        result = torch.from_numpy(flat.reshape(shape))
+        if _profile_enabled:
+            _profile_counters["readback_conversion_seconds"] += time.perf_counter() - conversion_started
+            _profile_counters["readback_bytes"] += owner.layout.texture_width * owner.layout.texture_height * 4 * 4
+            _profile_counters["readback_total_seconds"] += time.perf_counter() - readback_started
+        return result
 
+    conversion_started = time.perf_counter()
     result = np.empty(shape, dtype=np.float32)
     for index in np.ndindex(shape):
         source_index = storage_offset + sum(i * stride for i, stride in zip(index, logical_strides))
         result[index] = flat_storage[source_index]
-    return torch.from_numpy(result)
+    result = torch.from_numpy(result)
+    if _profile_enabled:
+        _profile_counters["readback_conversion_seconds"] += time.perf_counter() - conversion_started
+        _profile_counters["readback_bytes"] += owner.layout.texture_width * owner.layout.texture_height * 4 * 4
+        _profile_counters["readback_total_seconds"] += time.perf_counter() - readback_started
+    return result
 
 
 def _normalize_shape(shape_arg, old_numel: int) -> tuple[int, ...]:
@@ -3749,6 +3913,11 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
     limit = CONV_PHYSICAL_TILE_LIMIT
     tiles_x = math.ceil(full_w / limit)
     tiles_y = math.ceil(full_h / limit)
+    if _profile_enabled:
+        _profile_counters["tiled_conv_calls"] += 1
+        _profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
+        _profile_counters["tiled_conv_max_tile_width"] = max(_profile_counters["tiled_conv_max_tile_width"], limit)
+        _profile_counters["tiled_conv_max_tile_height"] = max(_profile_counters["tiled_conv_max_tile_height"], limit)
     _kernel_log(
         f"Tiled Conv2D {_shape_text(input_tensor.shape)} -> "
         f"{_shape_text((1, params[3], params[4], params[5]))} tiles={tiles_x}x{tiles_y}"
@@ -3763,6 +3932,8 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
     _tile_diagnostic_snapshots.clear()
     tile_owners: list[_TextureOwner] = []
     try:
+        tile_render_started = time.perf_counter()
+        finish_before_tiles = _profile_counters["glFinish_seconds"]
         for tile_y in range(tiles_y):
             origin_y = tile_y * limit
             tile_h = min(limit, full_h - origin_y)
@@ -3771,6 +3942,8 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
                 tile_w = min(limit, full_w - origin_x)
                 tile = _new_physical_packed_owner(tile_w, tile_h)
                 tile_owners.append(tile)
+                if _profile_enabled:
+                    _profile_counters["tiled_draw_calls"] += 1
                 program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
                 try:
                     gm.glViewport(0, 0, tile_w, tile_h)
@@ -3807,6 +3980,10 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
                 finally:
                     gm.glDeleteProgram(program)
 
+        if _profile_enabled:
+            _profile_conv["tile_render"] += time.perf_counter() - tile_render_started
+            _profile_conv["sync"] += _profile_counters["glFinish_seconds"] - finish_before_tiles
+
         # Old Mesa/GM45 drivers need an explicit ordering point before the
         # separate copy pass consumes the tile render targets.
         gm.glFinish()
@@ -3815,6 +3992,7 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
         # full viewport plus scissor keeps fragment coordinates global while
         # limiting each dispatch to one physical tile.
         index = 0
+        consolidation_started = time.perf_counter()
         for tile_y in range(tiles_y):
             origin_y = tile_y * limit
             tile_h = min(limit, full_h - origin_y)
@@ -3824,6 +4002,8 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
                 tile = tile_owners[index]
                 index += 1
                 program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
+                if _profile_enabled:
+                    _profile_counters["consolidation_draw_calls"] += 1
                 try:
                     gm.glViewport(0, 0, full_w, full_h)
                     gm.gl.glEnable(_GL_SCISSOR_TEST)
@@ -3845,6 +4025,8 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
                 finally:
                     gm.glDeleteProgram(program)
         gm.glFinish()
+        if _profile_enabled:
+            _profile_conv["consolidation"] += time.perf_counter() - consolidation_started
         return Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
     finally:
         for tile in tile_owners:
@@ -3854,6 +4036,7 @@ def _render_convolution_tiled(input_tensor: "Gm45Tensor", out_owner: _TextureOwn
 
 
 def _render_convolution(args) -> "Gm45Tensor":
+    conv_started = time.perf_counter()
     input_tensor, weight_tensor, bias_tensor = args[0], args[1], args[2]
     stride = _as_pair(args[3], "stride")
     padding = _as_pair(args[4], "padding")
@@ -3913,12 +4096,18 @@ def _render_convolution(args) -> "Gm45Tensor":
     out_w = (in_w + 2 * padding[1] - kernel_w) // stride[1] + 1
     out_shape = (1, out_c, out_h, out_w)
     out_owner = _new_empty_packed_texture(out_shape)
-    weight_owner = _upload_raw_packed_array(weight_tensor.detach().numpy().astype(np.float32, copy=False))
+    if _profile_enabled:
+        _profile_conv["prepare"] += time.perf_counter() - conv_started
+    upload_started = time.perf_counter()
+    weight_owner = _upload_raw_packed_array(weight_tensor.detach().numpy().astype(np.float32, copy=False), "weight")
     bias_owner = _upload_raw_packed_array(
         bias_tensor.detach().numpy().astype(np.float32, copy=False)
         if bias_tensor is not None
-        else np.zeros((1,), dtype=np.float32)
+        else np.zeros((1,), dtype=np.float32),
+        "bias",
     )
+    if _profile_enabled:
+        _profile_conv["parameter_upload"] += time.perf_counter() - upload_started
 
     params = (
         in_c,
@@ -3946,6 +4135,7 @@ def _render_convolution(args) -> "Gm45Tensor":
     if out_owner.layout.texture_width > CONV_PHYSICAL_TILE_LIMIT or out_owner.layout.texture_height > CONV_PHYSICAL_TILE_LIMIT:
         return _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params)
     _kernel_log(f"Conv2D {_shape_text(input_tensor.shape)} -> {_shape_text(out_shape)}")
+    shader_setup_started = time.perf_counter()
     program, input_loc, weight_loc, bias_loc = _conv_program(params)
     rt = _runtime_required()
 
@@ -3974,13 +4164,18 @@ def _render_convolution(args) -> "Gm45Tensor":
     gm.glActiveTexture(gm.GL_TEXTURE2)
     gm.glBindTexture(gm.GL_TEXTURE_2D, bias_owner.texture)
     gm.glUniform1i(bias_loc, 2)
+    if _profile_enabled:
+        _profile_conv["shader_setup"] += time.perf_counter() - shader_setup_started
 
+    render_started = time.perf_counter()
     gm.glBegin(gm.GL_QUADS)
     gm.glVertex2f(-1.0, -1.0)
     gm.glVertex2f(1.0, -1.0)
     gm.glVertex2f(1.0, 1.0)
     gm.glVertex2f(-1.0, 1.0)
     gm.glEnd()
+    if _profile_enabled:
+        _profile_conv["tile_render"] += time.perf_counter() - render_started
     _trace(f"gm45.opengl -> submitted Conv2D fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -4019,10 +4214,10 @@ def _render_batch_norm(args):
             raise RuntimeError(f"gm45 native_batch_norm {name} must be contiguous float32 shape [{channels}]")
         params.append(value)
 
-    weight_owner = _upload_raw_packed_array(params[0].detach().numpy().astype(np.float32, copy=False))
-    bias_owner = _upload_raw_packed_array(params[1].detach().numpy().astype(np.float32, copy=False))
-    mean_owner = _upload_raw_packed_array(params[2].detach().numpy().astype(np.float32, copy=False))
-    var_owner = _upload_raw_packed_array(params[3].detach().numpy().astype(np.float32, copy=False))
+    weight_owner = _upload_raw_packed_array(params[0].detach().numpy().astype(np.float32, copy=False), "bn_weight")
+    bias_owner = _upload_raw_packed_array(params[1].detach().numpy().astype(np.float32, copy=False), "bn_bias")
+    mean_owner = _upload_raw_packed_array(params[2].detach().numpy().astype(np.float32, copy=False), "bn_mean")
+    var_owner = _upload_raw_packed_array(params[3].detach().numpy().astype(np.float32, copy=False), "bn_var")
     out_owner = _new_empty_packed_texture(tuple(int(v) for v in input_tensor.shape))
 
     shader_params = (
@@ -4189,6 +4384,7 @@ class Gm45Tensor(torch.Tensor):
         return Gm45Tensor(owner, shape, storage_offset, strides)
 
     @classmethod
+    @_profile_dispatch
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         _trace(f"torch_dispatch -> {func}")
