@@ -130,12 +130,13 @@ The small example is also available as:
 python3 demo/example/pytorch_example.py
 ```
 
-## YOLO Example
+## YOLO / Ultralytics Example
 
-The minimal VisDrone example sends the preprocessed input into the underlying
-Ultralytics PyTorch model:
+The minimal Ultralytics example sends a preprocessed input tensor into the
+underlying PyTorch model through MatrixMan:
 
 ```python
+import torch
 from ultralytics import YOLO
 from drivers import matrixman
 
@@ -145,26 +146,41 @@ input_mm = matrixman.to_gm45(input_cpu)
 with torch.no_grad():
     output_mm = model(input_mm)
 
-# The example extracts the tensor from the model's tuple/list result first.
+# Ultralytics configurations may return a tensor, tuple, list, or dict.
+# The runnable example extracts the prediction tensor first, then reads back.
 output_cpu = first_tensor(output_mm).cpu()
 ```
 
-Run it with the included checkpoint and an image:
+The runnable example accepts any local Ultralytics YOLO detection checkpoint
+and an image. It does not download models automatically:
 
 ```bash
-python3 demo/example/yolo_example.py path/to/image.jpg --imgsz 320
+python3 demo/example/yolo_example.py model.pt path/to/image.jpg --imgsz 320
 ```
 
 The execution boundary is deliberately visible:
 
 ```text
-CPU: Python control flow, image preprocessing, model loading, uploads
-GPU: supported tensor arithmetic through MatrixMan/OpenGL/GLSL
-CPU: explicit final readback and simple postprocessing
+image -> CPU preprocessing -> PyTorch tensor -> matrixman.to_gm45()
+      -> Gm45Tensor -> Ultralytics/PyTorch forward
+      -> supported tensor arithmetic through MatrixMan/OpenGL/GLSL
+      -> explicit CPU readback -> CPU postprocessing
 ```
 
-Python `model.forward` itself remains Python control flow. Supported tensor
-operations dispatched from it are the part that runs through MatrixMan.
+Python `model.forward` and its control flow still execute normally on the
+CPU/PyTorch side. MatrixMan intercepts supported tensor operations involving a
+`Gm45Tensor` and executes their arithmetic through OpenGL/GLSL.
+
+MatrixMan is not specific to VisDrone. A particular Ultralytics model can be
+attempted when the ATen operations it exercises are supported; this does not
+mean every YOLO or Ultralytics model is supported.
+
+### Tested Model Evidence
+
+The project's confirmed real-model validation uses a custom Ultralytics YOLO
+detection checkpoint trained for VisDrone-style detection. The current
+checkpoint has been tested at 320x320 through 640x640 on GM45. VisDrone is
+evidence of a working trained model, not a requirement for using MatrixMan.
 
 ## CPU Fallback Policy
 

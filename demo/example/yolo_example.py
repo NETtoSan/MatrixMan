@@ -9,15 +9,11 @@ from pathlib import Path
 
 import cv2
 import torch
-from ultralytics import YOLO
 
 # Make ``python3 demo/example/yolo_example.py ...`` work from any directory.
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from drivers import matrixman
-
 
 def _first_tensor(value):
     if isinstance(value, torch.Tensor):
@@ -44,6 +40,7 @@ def _preprocess(image, imgsz: int) -> torch.Tensor:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal MatrixMan YOLO example")
+    parser.add_argument("model", type=Path, help="Ultralytics YOLO detection checkpoint")
     parser.add_argument("image", type=Path, help="input image path")
     parser.add_argument("--imgsz", type=int, default=320, help="square inference size")
     parser.add_argument("--conf", type=float, default=0.25, help="confidence threshold")
@@ -51,13 +48,17 @@ def main() -> int:
 
     if args.imgsz <= 0 or args.imgsz > 640 or args.imgsz % 32:
         parser.error("--imgsz must be a positive multiple of 32 no larger than 640")
+    if not args.model.is_file():
+        parser.error(f"could not find model checkpoint: {args.model}")
+    from ultralytics import YOLO
+    from drivers import matrixman
+
     image = cv2.imread(str(args.image))
     if image is None:
         parser.error(f"could not read image: {args.image}")
 
-    model_path = ROOT / "demo/models/VisDrone-arm64-480/weights/best.pt"
-    print("Loading:", model_path)
-    model = YOLO(str(model_path)).model.eval()
+    print("Loading:", args.model)
+    model = YOLO(str(args.model)).model.eval()
 
     input_cpu = _preprocess(image, args.imgsz)
     print("CPU input:", list(input_cpu.shape), input_cpu.dtype)
@@ -73,7 +74,7 @@ def main() -> int:
     if output_cpu is None:
         raise RuntimeError(f"model returned no tensor: {type(output_mm).__name__}")
     output_cpu = output_cpu.cpu()
-    if output_cpu.ndim != 3 or output_cpu.shape[0] != 1 or output_cpu.shape[1] != 14:
+    if output_cpu.ndim != 3 or output_cpu.shape[0] != 1 or output_cpu.shape[1] < 5:
         raise RuntimeError(f"unexpected model output shape: {list(output_cpu.shape)}")
 
     scores = output_cpu[:, 4:, :]
