@@ -8,10 +8,7 @@ MatrixMan is an experimental PyTorch execution backend for GPUs that do not
 have a usable native PyTorch compute backend.
 
 No CUDA? No usable native backend? Ancient integrated graphics? But
-programmable OpenGL shaders work? MatrixMan explores whether that is enough.
-
-Old Radeon/ROCm gaps, newer integrated GPUs, and other unsupported platforms
-are project motivation and portability goals, not claims of current support.
+programmable OpenGL shaders work? 
 
 Excellent.
 
@@ -82,8 +79,7 @@ Run the compatibility probe before assuming a machine works.
 Older AMD/Radeon hardware, NVIDIA GPUs, Apple GPUs, and Intel GPUs beyond the
 X200's GM45 are portability experiments or future goals, not tested MatrixMan
 platforms. The project is exploring whether such hardware can provide a
-usable graphics-based execution path; no compatibility claim is made for it
-until the probe and real workloads have passed there.
+usable graphics-based execution path; in other words, we dont have all the old toys to test with! 
 
 ## Check Compatibility
 
