@@ -57,6 +57,8 @@ _tile_copy_shader_source = _convolution._tile_copy_shader_source
 _new_physical_packed_owner = _convolution._new_physical_packed_owner
 _render_convolution_tiled = _convolution._render_convolution_tiled
 _tile_diagnostic_snapshots = _convolution._tile_diagnostic_snapshots
+_last_tile_geometry = _convolution._last_tile_geometry
+_last_tile_output_texture = None
 from .storage import (
     StorageLayout as _StorageLayout,
     contiguous_strides as _contiguous_strides,

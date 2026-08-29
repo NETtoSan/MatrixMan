@@ -136,6 +136,7 @@ glActiveTexture = gl_proc("glActiveTexture", None, ctypes.c_uint)
 glUseProgram = gl_proc("glUseProgram", None, ctypes.c_uint)
 glBegin = gl_proc("glBegin", None, ctypes.c_uint)
 glEnd = gl_proc("glEnd", None)
+glFlush = gl_proc("glFlush", None)
 glVertex2f = gl_proc("glVertex2f", None, ctypes.c_float, ctypes.c_float)
 glReadPixels = gl_proc(
     "glReadPixels",

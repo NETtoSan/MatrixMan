@@ -51,11 +51,23 @@ def _profile_gl_finish():
     return result
 
 
+def _profile_gl_flush():
+    if not enabled:
+        return _profile_gl_flush.original()
+    begin = time.perf_counter()
+    result = _profile_gl_flush.original()
+    counters["glFlush_calls"] += 1
+    counters["glFlush_seconds"] += time.perf_counter() - begin
+    return result
+
+
 _profile_gl_begin.original = gm.glBegin
 _profile_gl_finish.original = gm.glFinish
+_profile_gl_flush.original = gm.glFlush
 if enabled:
     gm.glBegin = _profile_gl_begin
     gm.glFinish = _profile_gl_finish
+    gm.glFlush = _profile_gl_flush
 
 
 def dispatch_timer(fn):
@@ -94,7 +106,9 @@ def report() -> None:
     print(f"  tiled convolution draw calls: {int(counters['tiled_draw_calls'])}")
     print(f"  consolidation draw calls: {int(counters['consolidation_draw_calls'])}")
     print(f"  glFinish: {int(counters['glFinish_calls'])} ({counters['glFinish_seconds']:.3f}s)")
-    print("  glFlush: 0 (not exposed by the legacy helper)")
+    print(f"  glFlush: {int(counters['glFlush_calls'])} ({counters['glFlush_seconds']:.3f}s)")
+    print(f"  tiled convolution sync mode: {os.environ.get('MATRIXMAN_TILE_SYNC', 'per_tile')}")
+    print(f"  physical tile limit: {os.environ.get('MATRIXMAN_TILE_LIMIT', '256')}")
     print(f"  texture allocations: {int(counters['texture_allocations'])}")
     print(f"  texture uploads: {int(counters['texture_uploads'])} ({int(counters['texture_upload_bytes'])} bytes, {counters['texture_upload_seconds']:.3f}s)")
     print("parameter uploads:")

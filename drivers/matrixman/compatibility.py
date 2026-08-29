@@ -8,13 +8,16 @@ are used only as references and for explicit readback verification.
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from .storage import pack_linear_rgba
 
 from . import gm45_backend as backend
 from . import gpumatrix as gm
@@ -148,14 +151,42 @@ def _silu() -> bool:
     return _report_metrics("SiLU_", actual, expected)
 
 
-def _large_conv(size: int) -> bool:
+def _report_physical_tiles(expected: torch.Tensor) -> None:
+    packed, _ = pack_linear_rgba(expected.numpy())
+    print(f"physical tiles (consolidation destination texture=#{backend._convolution._last_tile_output_texture}):")
+    all_passed = True
+    for snapshot in backend._tile_diagnostic_snapshots:
+        width, height = snapshot["width"], snapshot["height"]
+        origin_x, origin_y = snapshot["origin_x"], snapshot["origin_y"]
+        actual = snapshot["data"].reshape(height, width, 4).numpy()
+        reference = packed[origin_y:origin_y + height, origin_x:origin_x + width]
+        error = torch.from_numpy(actual - reference).to(torch.float64)
+        max_abs = float(error.abs().max()) if error.numel() else 0.0
+        mean_abs = float(error.abs().mean()) if error.numel() else 0.0
+        rmse = float(error.square().mean().sqrt()) if error.numel() else 0.0
+        passed = bool(torch.allclose(torch.from_numpy(actual), torch.from_numpy(reference), rtol=SELFTEST_RTOL, atol=SELFTEST_ATOL))
+        all_passed = all_passed and passed
+        print(
+            f"  tile {snapshot['tile_index']}: grid={snapshot['grid']} "
+            f"origin=({origin_x},{origin_y}) "
+            f"size={width}x{height} texture=#{snapshot['texture']} "
+            f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} rmse={rmse:.6g} "
+            f"result={'PASS' if passed else 'FAIL'}"
+        )
+    print(f"  physical tiles overall: {'PASS' if all_passed else 'FAIL'}")
+
+
+def _large_conv(size: int, *, report_tiles: bool = False) -> bool:
     torch.manual_seed(453 + size)
     source = torch.randn((1, 64, size, size), dtype=torch.float32) * 0.05
     weight = torch.randn((64, 64, 3, 3), dtype=torch.float32) * 0.05
     expected = F.conv2d(source, weight, padding=1)
     actual = F.conv2d(backend.to_gm45(source), weight, padding=1).cpu()
+    if report_tiles:
+        _report_physical_tiles(expected)
     atlas = size * 4
-    return _report_metrics(f"Conv atlas {atlas}x{atlas}", actual, expected)
+    label = f"Consolidated conv atlas {atlas}x{atlas}" if report_tiles else f"Conv atlas {atlas}x{atlas}"
+    return _report_metrics(label, actual, expected)
 
 
 def _isolated_one_shot() -> bool:
@@ -194,6 +225,44 @@ def _run_isolated_one_shot() -> bool:
     else:
         print("  512x512 one-shot isolated: PASS")
     return passed
+
+
+def _print_tile_geometry(width_limit: int, height_limit: int, atlas: int = 512) -> None:
+    tiles = backend._last_tile_geometry
+    print(f"atlas width/height: {atlas}x{atlas}")
+    print(
+        f"diagnostic width/height limit: {width_limit}x{height_limit}\n"
+        f"tile grid: {((atlas + width_limit - 1) // width_limit)}x"
+        f"{((atlas + height_limit - 1) // height_limit)}"
+    )
+    print(f"tile count: {len(tiles)}")
+    if not tiles:
+        print("tile geometry: no physical tiled render recorded")
+        return
+    areas = []
+    for index, tile in enumerate(tiles):
+        width, height = tile["width"], tile["height"]
+        areas.append(width * height)
+        print(
+            f"tile {index}: grid={tile['grid']} origin={tile['origin']} "
+            f"physical_size={width}x{height} "
+            f"logical/output region={tile['logical_region']} "
+            f"texture=#{tile.get('texture', 'unknown')} size={tile['texture_size']}"
+        )
+    widths = [tile["width"] for tile in tiles]
+    heights = [tile["height"] for tile in tiles]
+    remainder_width = atlas % width_limit or width_limit
+    remainder_height = atlas % height_limit or height_limit
+    print(f"maximum tile area: {max(areas)}")
+    print(f"minimum tile area: {min(areas)}")
+    print(f"remainder width: {remainder_width}")
+    print(f"remainder height: {remainder_height}")
+    for divisor in (2, 4, 8, 16, 32, 64):
+        print(
+            f"divisible by {divisor}: "
+            f"widths={'yes' if all(width % divisor == 0 for width in widths) else 'no'} "
+            f"heights={'yes' if all(height % divisor == 0 for height in heights) else 'no'}"
+        )
 
 
 def report() -> int:
@@ -310,8 +379,45 @@ def main() -> int:
     if "--test-large-tiled" in sys.argv:
         backend.set_trace(False)
         try:
+            os.environ["MATRIXMAN_DIAGNOSTIC_TILES"] = "1"
+            os.environ["MATRIXMAN_DIAGNOSTIC_RECT_TILES"] = "1"
             print("MatrixMan fresh-context tiled convolution test")
-            passed = _check("512x512 production tiled", lambda: _large_conv(128))
+            limit_text = os.environ.get("MATRIXMAN_TILE_LIMIT", "256")
+            try:
+                limit = int(limit_text)
+            except ValueError:
+                print(f"Invalid MATRIXMAN_TILE_LIMIT: {limit_text!r}")
+                return 1
+            if limit <= 0:
+                print("Invalid MATRIXMAN_TILE_LIMIT: must be positive")
+                return 1
+            atlas = 512
+            try:
+                diag_width = int(os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH", limit))
+                diag_height = int(os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT", limit))
+            except ValueError:
+                print("Invalid diagnostic tile dimensions: must be positive integers")
+                return 1
+            if diag_width <= 0 or diag_height <= 0:
+                print("Invalid diagnostic tile dimensions: must be positive")
+                return 1
+            tiles_x = (atlas + diag_width - 1) // diag_width
+            tiles_y = (atlas + diag_height - 1) // diag_height
+            print(f"MATRIXMAN_TILE_LIMIT: {limit}")
+            print(f"MATRIXMAN_DIAG_TILE_WIDTH/HEIGHT: {diag_width}x{diag_height}")
+            print(f"physical tile grid: {tiles_x}x{tiles_y} ({tiles_x * tiles_y} tiles)")
+            started = time.perf_counter()
+            passed = _check("512x512 production tiled", lambda: _large_conv(128, report_tiles=True))
+            print(f"elapsed: {time.perf_counter() - started:.3f}s")
+            _print_tile_geometry(diag_width, diag_height, atlas)
+            if backend.profile_enabled():
+                counters = backend._profile_counters
+                print(f"glFinish count: {int(counters['glFinish_calls'])}")
+                print(f"glFinish time: {counters['glFinish_seconds']:.3f}s")
+                print(f"glFlush count: {int(counters['glFlush_calls'])}")
+                print(f"glFlush time: {counters['glFlush_seconds']:.3f}s")
+            else:
+                print("glFinish counters: unavailable (set MATRIXMAN_PROFILE=1)")
             print(f"Result: {'PASS' if passed else 'FAIL'}")
             return 0 if passed else 1
         finally:

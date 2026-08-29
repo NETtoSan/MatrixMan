@@ -21,6 +21,8 @@ from ..storage import StorageLayout, packed_atlas_size
 
 CONV_PHYSICAL_TILE_LIMIT = 256
 _tile_diagnostic_snapshots: list[dict] = []
+_last_tile_geometry: list[dict] = []
+_last_tile_output_texture: int | None = None
 _GL_SCISSOR_TEST = 0x0C11
 gm.gl.glScissor.restype = None
 gm.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -206,34 +208,96 @@ def _as_pair(value, name: str) -> tuple[int, int]:
     raise RuntimeError(f"gm45 convolution expects {name} as int or pair")
 
 
-def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params):
+def _tile_sync_mode() -> str:
+    mode = os.environ.get("MATRIXMAN_TILE_SYNC", "per_tile").strip().lower() or "per_tile"
+    if mode not in {"per_tile", "end", "flush", "none"}:
+        raise RuntimeError(
+            "MATRIXMAN_TILE_SYNC must be one of: per_tile, end, flush, none"
+        )
+    return mode
+
+
+def _tile_limit() -> int:
+    """Return the experimental limit without changing the safe default."""
     b = _backend()
+    raw = os.environ.get("MATRIXMAN_TILE_LIMIT")
+    if raw is None or not raw.strip():
+        return int(getattr(b, "CONV_PHYSICAL_TILE_LIMIT", CONV_PHYSICAL_TILE_LIMIT))
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("MATRIXMAN_TILE_LIMIT must be a positive integer") from exc
+    if limit <= 0:
+        raise RuntimeError("MATRIXMAN_TILE_LIMIT must be a positive integer")
+    return limit
+
+
+def _tile_limits() -> tuple[int, int]:
+    limit = _tile_limit()
+    # Independent dimensions are intentionally diagnostic-only.  Normal
+    # execution always retains the square production limit.
+    if os.environ.get("MATRIXMAN_DIAGNOSTIC_RECT_TILES") != "1":
+        return limit, limit
+    width_raw = os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH")
+    height_raw = os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT")
+    if width_raw is None and height_raw is None:
+        return limit, limit
+    try:
+        width = int(width_raw if width_raw is not None else limit)
+        height = int(height_raw if height_raw is not None else limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            "MATRIXMAN_DIAG_TILE_WIDTH and MATRIXMAN_DIAG_TILE_HEIGHT must be positive integers"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError(
+            "MATRIXMAN_DIAG_TILE_WIDTH and MATRIXMAN_DIAG_TILE_HEIGHT must be positive integers"
+        )
+    return width, height
+
+
+def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params):
+    global _last_tile_output_texture
+    b = _backend()
+    sync_mode = _tile_sync_mode()
     full_w, full_h = out_owner.layout.texture_width, out_owner.layout.texture_height
     # Keep the compatibility probe's existing mutable backend limit visible.
-    limit = getattr(b, "CONV_PHYSICAL_TILE_LIMIT", CONV_PHYSICAL_TILE_LIMIT)
-    tiles_x = math.ceil(full_w / limit)
-    tiles_y = math.ceil(full_h / limit)
+    width_limit, height_limit = _tile_limits()
+    tiles_x = math.ceil(full_w / width_limit)
+    tiles_y = math.ceil(full_h / height_limit)
     if b._profile_enabled:
         b._profile_counters["tiled_conv_calls"] += 1
         b._profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
-        b._profile_counters["tiled_conv_max_tile_width"] = max(b._profile_counters["tiled_conv_max_tile_width"], limit)
-        b._profile_counters["tiled_conv_max_tile_height"] = max(b._profile_counters["tiled_conv_max_tile_height"], limit)
+        b._profile_counters["tiled_conv_max_tile_width"] = max(b._profile_counters["tiled_conv_max_tile_width"], width_limit)
+        b._profile_counters["tiled_conv_max_tile_height"] = max(b._profile_counters["tiled_conv_max_tile_height"], height_limit)
     b._kernel_log(f"Tiled Conv2D {b._shape_text(input_tensor.shape)} -> {b._shape_text((1, params[3], params[4], params[5]))} tiles={tiles_x}x{tiles_y}")
-    b._trace("gm45.conv -> tiled dispatch\n" f"  logical atlas: {full_w}x{full_h}\n" f"  tile limit: {limit}x{limit}\n" f"  physical tiles: {tiles_x}x{tiles_y} = {tiles_x * tiles_y}")
+    b._trace("gm45.conv -> tiled dispatch\n" f"  logical atlas: {full_w}x{full_h}\n" f"  tile limit: {width_limit}x{height_limit}\n" f"  physical tiles: {tiles_x}x{tiles_y} = {tiles_x * tiles_y}")
     rt = b._runtime_required()
     _tile_diagnostic_snapshots.clear()
+    _last_tile_geometry.clear()
+    _last_tile_output_texture = out_owner.texture
     tile_owners = []
     try:
         tile_render_started = time.perf_counter()
         finish_before_tiles = b._profile_counters["glFinish_seconds"]
+        flush_before_tiles = b._profile_counters["glFlush_seconds"]
         for tile_y in range(tiles_y):
-            origin_y = tile_y * limit
-            tile_h = min(limit, full_h - origin_y)
+            origin_y = tile_y * height_limit
+            tile_h = min(height_limit, full_h - origin_y)
             for tile_x in range(tiles_x):
-                origin_x = tile_x * limit
-                tile_w = min(limit, full_w - origin_x)
+                origin_x = tile_x * width_limit
+                tile_w = min(width_limit, full_w - origin_x)
+                _last_tile_geometry.append({
+                    "grid": (tile_x, tile_y),
+                    "origin": (origin_x, origin_y),
+                    "width": tile_w,
+                    "height": tile_h,
+                    "logical_region": (origin_x, origin_y, tile_w, tile_h),
+                    "texture_size": (tile_w, tile_h),
+                })
                 tile = _new_physical_packed_owner(tile_w, tile_h)
                 tile_owners.append(tile)
+                _last_tile_geometry[-1]["texture"] = tile.texture
                 if b._profile_enabled:
                     b._profile_counters["tiled_draw_calls"] += 1
                 program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
@@ -253,24 +317,50 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                     gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
                     if (err := gm.glGetError()):
                         raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
-                    gm.glFinish()
-                    if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
-                        diagnostic = b._read_texture(tile, (1, 1, tile_h, tile_w * 4))
-                        _tile_diagnostic_snapshots.append({"tile_index": len(_tile_diagnostic_snapshots), "origin_x": origin_x, "origin_y": origin_y, "width": tile_w, "height": tile_h, "texture": tile.texture, "data": diagnostic})
+                    if sync_mode == "per_tile":
+                        gm.glFinish()
+                    elif sync_mode == "flush":
+                        gm.glFlush()
                 finally:
                     gm.glDeleteProgram(program)
+        # Diagnostic readback is deliberately delayed until every production
+        # tile render has completed. It cannot alter inter-tile scheduling.
+        if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
+            for index, tile in enumerate(tile_owners):
+                geometry = _last_tile_geometry[index]
+                diagnostic = b._read_texture(
+                    tile, (1, 1, geometry["height"], geometry["width"] * 4)
+                )
+                _tile_diagnostic_snapshots.append({
+                    "tile_index": index,
+                    "grid": geometry["grid"],
+                    "origin_x": geometry["origin"][0],
+                    "origin_y": geometry["origin"][1],
+                    "width": geometry["width"],
+                    "height": geometry["height"],
+                    "texture": tile.texture,
+                    "data": diagnostic,
+                })
         if b._profile_enabled:
             b._profile_conv["tile_render"] += time.perf_counter() - tile_render_started
-            b._profile_conv["sync"] += b._profile_counters["glFinish_seconds"] - finish_before_tiles
-        gm.glFinish()
+            b._profile_conv["sync"] += (
+                b._profile_counters["glFinish_seconds"] - finish_before_tiles
+                + b._profile_counters["glFlush_seconds"] - flush_before_tiles
+            )
+        # This is the ordering point before consolidation.  It is retained for
+        # the default/end/none modes.  In flush mode, avoid immediately
+        # following the final glFlush with a glFinish as requested by the
+        # experiment; the existing post-consolidation barrier remains.
+        if sync_mode != "flush":
+            gm.glFinish()
         index = 0
         consolidation_started = time.perf_counter()
         for tile_y in range(tiles_y):
-            origin_y = tile_y * limit
-            tile_h = min(limit, full_h - origin_y)
+            origin_y = tile_y * height_limit
+            tile_h = min(height_limit, full_h - origin_y)
             for tile_x in range(tiles_x):
-                origin_x = tile_x * limit
-                tile_w = min(limit, full_w - origin_x)
+                origin_x = tile_x * width_limit
+                tile_w = min(width_limit, full_w - origin_x)
                 tile = tile_owners[index]
                 index += 1
                 program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
@@ -309,7 +399,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
 
 def execute(args):
     b = _backend()
-    tile_limit = getattr(b, "CONV_PHYSICAL_TILE_LIMIT", CONV_PHYSICAL_TILE_LIMIT)
+    tile_limit = _tile_limit()
     conv_started = time.perf_counter()
     input_tensor, weight_tensor, bias_tensor = args[0], args[1], args[2]
     stride, padding, dilation = _as_pair(args[3], "stride"), _as_pair(args[4], "padding"), _as_pair(args[5], "dilation")
