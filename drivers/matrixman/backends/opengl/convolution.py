@@ -15,8 +15,8 @@ import time
 import numpy as np
 import torch
 
-from .. import gpumatrix as gm
-from ..storage import StorageLayout, packed_atlas_size
+from . import gpumatrix as gm
+from .storage import StorageLayout, packed_atlas_size
 
 
 # Conservative GM45-validated default; larger physical draws may be unstable.
@@ -37,7 +37,7 @@ gm.gl.glCopyTexSubImage2D.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int,
 
 def _backend():
     # Import only when a kernel is executed: gm45_backend imports this module.
-    from .. import gm45_backend
+    from . import backend as gm45_backend
     return gm45_backend
 
 

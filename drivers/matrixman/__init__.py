@@ -1,4 +1,4 @@
-"""MatrixMan's strict OpenGL/GLSL GM45 PyTorch backend."""
+"""MatrixMan's backend-neutral public API."""
 
 from .gm45_backend import (
     Gm45Tensor,
@@ -17,6 +17,9 @@ from .gm45_backend import (
     to_gm45,
     unsupported_report,
 )
+from .selector import select_backend
+
+select_backend()
 
 __all__ = [
     "Gm45Tensor",

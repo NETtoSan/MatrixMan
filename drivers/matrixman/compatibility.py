@@ -21,8 +21,8 @@ import torch.nn.functional as F
 
 from . import gm45_backend as backend
 from . import gpumatrix as gm
-from .ops import convolution
-from .storage import StorageLayout, pack_linear_rgba, packed_atlas_size
+from .backends.opengl import convolution
+from .backends.opengl.storage import StorageLayout, pack_linear_rgba, packed_atlas_size
 
 
 GL_VENDOR = 0x1F00
