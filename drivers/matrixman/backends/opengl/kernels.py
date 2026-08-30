@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from . import gpumatrix as gm
 from . import gpu_stress
+from . import diagnostics
 from . import runtime
 
 
+def glsl_float(value: float) -> str:
+    """Format a GLSL float literal exactly as the backend historically did."""
+    text = f"{float(value):.10g}"
+    if "." not in text and "e" not in text and "E" not in text:
+        text += ".0"
+    return text
+
+
 def _trace(message: str) -> None:
-    from . import implementation
-    implementation._trace(message)
+    diagnostics.trace(message)
 
 
 def program(kind: str, n: int) -> tuple[int, int, int]:

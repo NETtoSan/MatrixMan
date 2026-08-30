@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import math
 
+from . import diagnostics
 from .tensor import Gm45Tensor
 from .storage import contiguous_strides
 
 
-def _impl():
-    from . import implementation
-    return implementation
-
-
 def _validate(shape):
-    _impl()._validate_supported_shape(shape)
+    validate_supported_shape(shape)
 
 
 def _trace(message):
-    _impl()._trace(message)
+    diagnostics.trace(message)
+
+
+def validate_supported_shape(shape: tuple[int, ...]) -> None:
+    if len(shape) == 0:
+        raise RuntimeError("gm45 does not support scalar tensors yet")
+    if len(shape) not in {1, 2, 3, 4}:
+        raise RuntimeError("gm45 supports only 1D, 2D, 3D, and 4D NCHW tensors")
+    if any(size <= 0 for size in shape):
+        raise RuntimeError("gm45 does not support empty dimensions")
+    if len(shape) == 4 and shape[0] != 1:
+        raise RuntimeError("gm45 4D support is NCHW with batch size 1 only")
 
 
 def is_contiguous_logical(tensor) -> bool:
@@ -168,3 +175,69 @@ def metadata_expand(args, kwargs):
         f"  metadata only; output strides={list(strides)}; no shader copy or GPU readback"
     )
     return Gm45Tensor._from_owner(input_tensor._owner, shape, input_tensor._storage_offset, strides)
+
+
+def metadata_split(args, kwargs) -> tuple["Gm45Tensor", ...]:
+    input_tensor = args[0]
+    split_size_or_sections = args[1]
+    dim = int(args[2]) if len(args) > 2 else int(kwargs.get("dim", 0))
+    if not isinstance(input_tensor, Gm45Tensor):
+        raise RuntimeError("gm45 split requires a Gm45Tensor input")
+    if input_tensor._owner.layout.kind != "packed_rgba":
+        raise RuntimeError("gm45 split currently supports only packed_rgba tensor storage")
+    require_contiguous_logical(input_tensor, "split")
+
+    shape = tuple(int(v) for v in input_tensor.shape)
+    if dim < 0:
+        dim += len(shape)
+    if dim < 0 or dim >= len(shape):
+        raise RuntimeError("gm45 split dim out of range")
+
+    if isinstance(split_size_or_sections, int):
+        split_size = int(split_size_or_sections)
+        if split_size <= 0:
+            raise RuntimeError("gm45 split_size must be positive")
+        sections = []
+        remaining = shape[dim]
+        while remaining > 0:
+            take = min(split_size, remaining)
+            sections.append(take)
+            remaining -= take
+    elif isinstance(split_size_or_sections, (list, tuple)):
+        sections = [int(v) for v in split_size_or_sections]
+        split_size = None
+        if any(v <= 0 for v in sections) or sum(sections) != shape[dim]:
+            raise RuntimeError("gm45 split sections must be positive and sum to the selected dimension")
+    else:
+        raise RuntimeError("gm45 split expects an int split size or list of section sizes")
+
+    # With contiguous flattened storage, a split is metadata-only only when each
+    # output is one contiguous run. Current YOLO uses 4D NCHW channel splitting
+    # and 3D [batch, channel, anchor] splitting in the DFL box decoder.
+    is_nchw_split = len(shape) == 4 and shape[0] == 1 and dim == 1
+    is_dfl_split = len(shape) == 3 and shape[0] == 1 and dim == 1 and split_size == 2
+    if not (is_nchw_split or is_dfl_split):
+        raise RuntimeError(
+            "gm45 split currently supports only batch-1 NCHW channel splits and "
+            "the YOLO 3D [batch,channel,anchor] split_size=2 case"
+        )
+
+    inner_block = math.prod(shape[dim + 1 :])
+    outputs = []
+    logical_start = 0
+    trace_lines = [
+        "gm45.split:",
+        f"  input texture #{input_tensor._owner.texture}",
+        f"  shape {list(shape)}",
+        f"  dim={dim}",
+        f"  split_size={split_size if split_size is not None else sections}",
+    ]
+    for index, section in enumerate(sections):
+        out_shape = shape[:dim] + (section,) + shape[dim + 1 :]
+        out_offset = input_tensor._storage_offset + logical_start * inner_block
+        outputs.append(Gm45Tensor._from_owner(input_tensor._owner, out_shape, out_offset))
+        trace_lines.append(f"  output {index} offset={out_offset} shape={list(out_shape)}")
+        logical_start += section
+    trace_lines.append("  metadata only; no shader copy or GPU readback")
+    _trace("\n".join(trace_lines))
+    return tuple(outputs)

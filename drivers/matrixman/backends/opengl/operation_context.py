@@ -6,9 +6,12 @@ render, and profiling services.  It intentionally contains no operator math.
 
 from __future__ import annotations
 
+import numpy as np
+import torch
+
 from . import gpumatrix as gm
 from . import kernels, metadata, profiling, render, resources, runtime
-from .tensor import Gm45Tensor
+from .tensor import Gm45Tensor, owner_from_texture
 
 
 def gl_runtime():
@@ -16,11 +19,17 @@ def gl_runtime():
 
 
 def output_texture(shape):
-    """Allocate the existing logical packed output through its compatibility boundary."""
-    # The allocation helper still includes tensor-specific tracing and remains
-    # in implementation.py until allocation is split further.
-    from . import implementation
-    return implementation._new_empty_packed_texture(shape)
+    """Allocate an empty packed logical output through the shared services."""
+    shape = tuple(int(value) for value in shape)
+    validate_shape(shape)
+    texture, layout = resources.allocate_packed_texture(shape)
+    owner = owner_from_texture(texture, layout)
+    from . import diagnostics
+    diagnostics.trace(
+        f"gm45.texture_alloc -> packed output texture #{texture} shape={list(shape)} "
+        f"atlas={layout.texture_width}x{layout.texture_height}"
+    )
+    return owner
 
 
 def tensor_from_owner(owner, shape, storage_offset=0, logical_strides=None):
@@ -28,8 +37,27 @@ def tensor_from_owner(owner, shape, storage_offset=0, logical_strides=None):
 
 
 def validate_shape(shape) -> None:
-    from . import implementation
-    implementation._validate_supported_shape(shape)
+    metadata.validate_supported_shape(shape)
+
+
+def is_scalar_operand(value) -> bool:
+    if isinstance(value, Gm45Tensor):
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.device.type == "cpu" and value.numel() == 1 and value.dtype in {
+            torch.float32, torch.float64, torch.int64, torch.int32
+        }
+    return isinstance(value, (int, float, np.integer, np.floating))
+
+
+def scalar_value(value) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu" or value.numel() != 1:
+            raise RuntimeError("gm45 scalar add only supports CPU scalar tensor operands")
+        return float(value.item())
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    return float(value)
 
 
 def contiguous(tensor) -> bool:

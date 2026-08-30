@@ -77,13 +77,10 @@ def init() -> None:
     if _runtime is not None:
         return
 
-    # These hooks remain in the implementation module until the remaining
-    # implementation responsibilities are extracted.  The import is lazy so
-    # implementation.py can import this module without a cycle during import.
-    from . import implementation as impl
+    from . import diagnostics, factories
 
-    impl._register_privateuse_name()
-    impl._trace("gm45.init -> SDL hidden OpenGL 2.1 context")
+    factories.register_privateuse_name()
+    diagnostics.trace("gm45.init -> SDL hidden OpenGL 2.1 context")
     gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
     gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
     gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MINOR_VERSION, 1)
@@ -117,8 +114,6 @@ def init() -> None:
         upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={},
         scratch_texture_pool={}, parameter_cache={}, parameter_cache_current={},
     )
-    # Existing implementation code still reads its compatibility mirror.
-    impl._runtime = _runtime
 
 
 def shutdown() -> None:
@@ -127,9 +122,9 @@ def shutdown() -> None:
     if _runtime is None:
         return
 
-    from . import implementation as impl
+    from .tensor import live_textures
 
-    for owner in list(impl._live_textures):
+    for owner in list(live_textures):
         if owner.texture:
             tex = ctypes.c_uint(owner.texture)
             gm.glDeleteTextures(1, ctypes.byref(tex))
@@ -162,10 +157,13 @@ def shutdown() -> None:
     gm.sdl.SDL_DestroyWindow(_runtime.window)
     gm.sdl.SDL_Quit()
     _runtime = None
-    impl._runtime = None
 
 
 def runtime_required() -> _GlRuntime:
     init()
     assert _runtime is not None
     return _runtime
+
+
+def is_active() -> bool:
+    return _runtime is not None
