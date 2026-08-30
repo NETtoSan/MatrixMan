@@ -513,8 +513,11 @@ def execute(args):
     if b._profile_enabled:
         b._profile_conv["prepare"] += time.perf_counter() - conv_started
     upload_started = time.perf_counter()
-    weight_owner = b._upload_raw_packed_array(weight_tensor.detach().numpy().astype(np.float32, copy=False), "weight")
-    bias_owner = b._upload_raw_packed_array(bias_tensor.detach().numpy().astype(np.float32, copy=False) if bias_tensor is not None else np.zeros((1,), dtype=np.float32), "bias")
+    weight_owner = b._cached_parameter_texture(weight_tensor, "weight")
+    if bias_tensor is not None:
+        bias_owner = b._cached_parameter_texture(bias_tensor, "bias")
+    else:
+        bias_owner = b._upload_raw_packed_array(np.zeros((1,), dtype=np.float32), "bias")
     if b._profile_enabled:
         b._profile_conv["parameter_upload"] += time.perf_counter() - upload_started
     params = (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w, stride[0], stride[1], padding[0], padding[1], bias_tensor is not None, groups, input_tensor._storage_offset, input_tensor._owner.layout.texture_width, input_tensor._owner.layout.texture_height, weight_owner.layout.texture_width, weight_owner.layout.texture_height, bias_owner.layout.texture_width, out_owner.layout.texture_width)
