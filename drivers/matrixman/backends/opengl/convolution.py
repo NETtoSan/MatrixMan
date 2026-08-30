@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from . import gpumatrix as gm
+from . import resources as _resources
 from .storage import StorageLayout, packed_atlas_size
 
 
@@ -230,7 +231,7 @@ void main() {{
 
 def _new_physical_packed_owner(width: int, height: int):
     b = _backend()
-    texture = b._acquire_scratch_texture(width, height)
+    texture = _resources.acquire_scratch_texture(width, height)
     return b._TextureOwner(texture, StorageLayout("packed_rgba", width, height, width * height * 4))
 
 
@@ -418,7 +419,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         return b.Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
     finally:
         for tile in tile_owners:
-            b._release_scratch_texture(tile)
+            _resources.release_scratch_texture(tile)
 
 
 def _consolidate_tiles(tile_owners, geometries, out_owner, full_w, full_h, width_limit, height_limit, rt):
@@ -513,11 +514,11 @@ def execute(args):
     if b._profile_enabled:
         b._profile_conv["prepare"] += time.perf_counter() - conv_started
     upload_started = time.perf_counter()
-    weight_owner = b._cached_parameter_texture(weight_tensor, "weight")
+    weight_owner = _resources.cached_parameter_texture(weight_tensor, "weight")
     if bias_tensor is not None:
-        bias_owner = b._cached_parameter_texture(bias_tensor, "bias")
+        bias_owner = _resources.cached_parameter_texture(bias_tensor, "bias")
     else:
-        bias_owner = b._upload_raw_packed_array(np.zeros((1,), dtype=np.float32), "bias")
+        bias_owner = _resources.upload_raw_packed_array(np.zeros((1,), dtype=np.float32), "bias")
     if b._profile_enabled:
         b._profile_conv["parameter_upload"] += time.perf_counter() - upload_started
     params = (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w, stride[0], stride[1], padding[0], padding[1], bias_tensor is not None, groups, input_tensor._storage_offset, input_tensor._owner.layout.texture_width, input_tensor._owner.layout.texture_height, weight_owner.layout.texture_width, weight_owner.layout.texture_height, bias_owner.layout.texture_width, out_owner.layout.texture_width)

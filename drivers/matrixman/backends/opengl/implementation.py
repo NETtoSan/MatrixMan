@@ -45,6 +45,12 @@ import torch
 from . import gpumatrix as gm
 from . import gpu_stress
 from . import convolution as _convolution
+from . import resources as _resources
+from .runtime import (
+    _GlRuntime,
+    _MAX_PARAMETER_CACHE_ENTRIES,
+    _MAX_SCRATCH_TEXTURES,
+)
 from ...backend import Backend
 
 # Private compatibility aliases for the existing diagnostics.  The
@@ -139,68 +145,8 @@ def _register_privateuse_name() -> None:
             raise
 
 
-@dataclass
-class _GlRuntime:
-    window: int
-    context: int
-    fbo: ctypes.c_uint
-    add_programs: dict[int, int]
-    matmul_programs: dict[int, int]
-    conv_programs: dict[tuple, int]
-    conv_tile_programs: dict[tuple[bytes, bytes], int]
-    tile_copy_programs: dict[tuple[bytes, bytes], int]
-    batchnorm_programs: dict[tuple, int]
-    silu_programs: dict[tuple, int]
-    packed_add_programs: dict[tuple, int]
-    packed_sub_programs: dict[tuple, int]
-    packed_strided_add_programs: dict[tuple, int]
-    packed_scalar_div_programs: dict[tuple, int]
-    packed_broadcast_mul_programs: dict[tuple, int]
-    packed_sigmoid_programs: dict[tuple, int]
-    scalar_add_programs: dict[tuple, int]
-    stack_programs: dict[tuple, int]
-    fill_programs: dict[tuple, int]
-    cat_programs: dict[tuple, int]
-    cat_dim0_2d_programs: dict[tuple, int]
-    cat_lastdim_programs: dict[tuple, int]
-    cat_dim1_3d_programs: dict[tuple, int]
-    maxpool_programs: dict[tuple, int]
-    upsample_programs: dict[tuple, int]
-    arange_programs: dict[tuple, int]
-    softmax_programs: dict[tuple, int]
-    add_uniforms: dict[int, tuple[int, int]]
-    matmul_uniforms: dict[int, tuple[int, int]]
-    conv_uniforms: dict[tuple, tuple[int, int, int]]
-    conv_tile_uniforms: dict[tuple[bytes, bytes], tuple[int, int, int]]
-    tile_copy_uniforms: dict[tuple[bytes, bytes], int]
-    batchnorm_uniforms: dict[tuple, tuple[int, int, int, int, int]]
-    silu_uniforms: dict[tuple, int]
-    packed_add_uniforms: dict[tuple, tuple[int, int]]
-    packed_sub_uniforms: dict[tuple, tuple[int, int]]
-    packed_strided_add_uniforms: dict[tuple, tuple[int, int]]
-    packed_scalar_div_uniforms: dict[tuple, int]
-    packed_broadcast_mul_uniforms: dict[tuple, tuple[int, int]]
-    packed_sigmoid_uniforms: dict[tuple, int]
-    scalar_add_uniforms: dict[tuple, int]
-    stack_uniforms: dict[tuple, tuple[int, ...]]
-    fill_uniforms: dict[tuple, tuple]
-    cat_uniforms: dict[tuple, tuple[int, ...]]
-    cat_dim0_2d_uniforms: dict[tuple, tuple[int, ...]]
-    cat_lastdim_uniforms: dict[tuple, tuple[int, ...]]
-    cat_dim1_3d_uniforms: dict[tuple, tuple[int, int]]
-    maxpool_uniforms: dict[tuple, int]
-    upsample_uniforms: dict[tuple, int]
-    arange_uniforms: dict[tuple, tuple]
-    softmax_uniforms: dict[tuple, int]
-    scratch_texture_pool: dict[tuple[int, int], list[int]]
-    parameter_cache: dict[tuple, "_ParameterCacheEntry"]
-    parameter_cache_current: dict[tuple, tuple]
-
-
-_runtime: _GlRuntime | None = None
+_runtime: _GlRuntime | None = None  # Compatibility mirror; runtime.py owns the state.
 _live_textures: weakref.WeakSet["_TextureOwner"] = weakref.WeakSet()
-_MAX_SCRATCH_TEXTURES = 32
-_MAX_PARAMETER_CACHE_ENTRIES = 256
 
 
 def _env_flag(name: str) -> bool:
@@ -336,144 +282,20 @@ class _ParameterCacheEntry:
 
 
 def init() -> None:
-    """Initialize the hidden SDL/OpenGL context and register the gm45 name."""
-    global _runtime
-    if _runtime is not None:
-        return
-
-    _register_privateuse_name()
-    _trace("gm45.init -> SDL hidden OpenGL 2.1 context")
-    gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
-    gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
-    gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MINOR_VERSION, 1)
-    gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_PROFILE_MASK, gm.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
-    window = gm.sdl.SDL_CreateWindow(
-        b"gm45_backend",
-        0,
-        0,
-        64,
-        64,
-        gm.SDL_WINDOW_OPENGL | gm.SDL_WINDOW_HIDDEN,
-    )
-    gm.sdl_check(bool(window), "SDL_CreateWindow failed")
-    context = gm.sdl.SDL_GL_CreateContext(window)
-    gm.sdl_check(bool(context), "SDL_GL_CreateContext failed")
-
-    fbo = ctypes.c_uint()
-    gm.glGenFramebuffers(1, ctypes.byref(fbo))
-    _runtime = _GlRuntime(
-        window=window,
-        context=context,
-        fbo=fbo,
-        add_programs={},
-        matmul_programs={},
-        conv_programs={},
-        conv_tile_programs={},
-        tile_copy_programs={},
-        batchnorm_programs={},
-        silu_programs={},
-        packed_add_programs={},
-        packed_sub_programs={},
-        packed_strided_add_programs={},
-        packed_scalar_div_programs={},
-        packed_broadcast_mul_programs={},
-        packed_sigmoid_programs={},
-        scalar_add_programs={},
-        stack_programs={},
-        fill_programs={},
-        cat_programs={},
-        cat_dim0_2d_programs={},
-        cat_lastdim_programs={},
-        cat_dim1_3d_programs={},
-        maxpool_programs={},
-        upsample_programs={},
-        arange_programs={},
-        softmax_programs={},
-        add_uniforms={},
-        matmul_uniforms={},
-        conv_uniforms={},
-        conv_tile_uniforms={},
-        tile_copy_uniforms={},
-        batchnorm_uniforms={},
-        silu_uniforms={},
-        packed_add_uniforms={},
-        packed_sub_uniforms={},
-        packed_strided_add_uniforms={},
-        packed_scalar_div_uniforms={},
-        packed_broadcast_mul_uniforms={},
-        packed_sigmoid_uniforms={},
-        scalar_add_uniforms={},
-        stack_uniforms={},
-        fill_uniforms={},
-        cat_uniforms={},
-        cat_dim0_2d_uniforms={},
-        cat_lastdim_uniforms={},
-        cat_dim1_3d_uniforms={},
-        maxpool_uniforms={},
-        upsample_uniforms={},
-        arange_uniforms={},
-        softmax_uniforms={},
-        scratch_texture_pool={},
-        parameter_cache={},
-        parameter_cache_current={},
-    )
+    """Compatibility wrapper for the extracted runtime lifecycle."""
+    from . import runtime
+    runtime.init()
 
 
 def shutdown() -> None:
-    """Release GL objects owned by the prototype backend."""
-    global _runtime
-    if _runtime is None:
-        return
-    for owner in list(_live_textures):
-        if owner.texture:
-            tex = ctypes.c_uint(owner.texture)
-            gm.glDeleteTextures(1, ctypes.byref(tex))
-            owner.texture = 0
-    for textures in _runtime.scratch_texture_pool.values():
-        for texture in textures:
-            texture_id = ctypes.c_uint(texture)
-            gm.glDeleteTextures(1, ctypes.byref(texture_id))
-    _runtime.scratch_texture_pool.clear()
-    _runtime.parameter_cache.clear()
-    _runtime.parameter_cache_current.clear()
-    for program in (
-        list(_runtime.add_programs.values())
-        + list(_runtime.matmul_programs.values())
-        + list(_runtime.conv_programs.values())
-        + list(_runtime.conv_tile_programs.values())
-        + list(_runtime.tile_copy_programs.values())
-        + list(_runtime.batchnorm_programs.values())
-        + list(_runtime.silu_programs.values())
-        + list(_runtime.packed_add_programs.values())
-        + list(_runtime.packed_sub_programs.values())
-        + list(_runtime.packed_strided_add_programs.values())
-        + list(_runtime.packed_scalar_div_programs.values())
-        + list(_runtime.packed_broadcast_mul_programs.values())
-        + list(_runtime.packed_sigmoid_programs.values())
-        + list(_runtime.scalar_add_programs.values())
-        + list(_runtime.stack_programs.values())
-        + list(_runtime.fill_programs.values())
-        + list(_runtime.cat_programs.values())
-        + list(_runtime.cat_dim0_2d_programs.values())
-        + list(_runtime.cat_lastdim_programs.values())
-        + list(_runtime.cat_dim1_3d_programs.values())
-        + list(_runtime.maxpool_programs.values())
-        + list(_runtime.upsample_programs.values())
-        + list(_runtime.arange_programs.values())
-        + list(_runtime.softmax_programs.values())
-    ):
-        gm.glDeleteProgram(program)
-    gm.glDeleteFramebuffers(1, ctypes.byref(_runtime.fbo))
-    gm.sdl.SDL_GL_DeleteContext(_runtime.context)
-    gm.sdl.SDL_DestroyWindow(_runtime.window)
-    gm.sdl.SDL_Quit()
-    _runtime = None
+    """Compatibility wrapper for the extracted runtime lifecycle."""
+    from . import runtime
+    runtime.shutdown()
 
 
-def _runtime_required() -> _GlRuntime:
-    init()
-    assert _runtime is not None
-    return _runtime
+def _runtime_required():
+    from . import runtime
+    return runtime.runtime_required()
 
 
 def _program(kind: str, n: int) -> tuple[int, int, int]:
@@ -2207,130 +2029,31 @@ def _validate_supported_shape(shape: tuple[int, ...]) -> None:
 
 
 def _create_rgba32f_texture(width: int, height: int, data: np.ndarray | None = None) -> int:
-    if _profile_enabled:
-        _profile_counters["texture_allocations"] += 1
-        if data is not None:
-            _profile_counters["texture_uploads"] += 1
-            _profile_counters["texture_upload_bytes"] += data.nbytes
-    texture = ctypes.c_uint()
-    gm.glGenTextures(1, ctypes.byref(texture))
-    gm.glBindTexture(gm.GL_TEXTURE_2D, texture.value)
-    gm.glTexParameteri(gm.GL_TEXTURE_2D, gm.GL_TEXTURE_MIN_FILTER, gm.GL_NEAREST)
-    gm.glTexParameteri(gm.GL_TEXTURE_2D, gm.GL_TEXTURE_MAG_FILTER, gm.GL_NEAREST)
-    gm.glTexParameteri(gm.GL_TEXTURE_2D, gm.GL_TEXTURE_WRAP_S, gm.GL_CLAMP_TO_EDGE)
-    gm.glTexParameteri(gm.GL_TEXTURE_2D, gm.GL_TEXTURE_WRAP_T, gm.GL_CLAMP_TO_EDGE)
-    ptr = data.ctypes.data_as(ctypes.c_void_p) if data is not None else None
-    upload_started = time.perf_counter() if _profile_enabled and data is not None else 0.0
-    gm.glTexImage2D(gm.GL_TEXTURE_2D, 0, gm.GL_RGBA32F, width, height, 0, gm.GL_RGBA, gm.GL_FLOAT, ptr)
-    if _profile_enabled and data is not None:
-        _profile_counters["texture_upload_seconds"] += time.perf_counter() - upload_started
-    return texture.value
+    return _resources.create_rgba32f_texture(width, height, data)
 
 
 def _acquire_scratch_texture(width: int, height: int) -> int:
-    """Acquire a context-local, empty RGBA32F texture for temporary work."""
-    rt = _runtime_required()
-    key = (int(width), int(height))
-    pooled = rt.scratch_texture_pool.get(key)
-    if pooled:
-        texture = pooled.pop()
-        if _profile_enabled:
-            _profile_counters["scratch_texture_reuses"] += 1
-        return texture
-    if _profile_enabled:
-        _profile_counters["scratch_texture_allocations"] += 1
-    return _create_rgba32f_texture(width, height)
+    return _resources.acquire_scratch_texture(width, height)
 
 
 def _release_scratch_texture(owner: _TextureOwner) -> None:
-    """Return a no-longer-live scratch owner to this runtime's bounded pool."""
-    texture = owner.texture
-    owner.texture = 0
-    if not texture or _runtime is None:
-        return
-    rt = _runtime
-    key = (owner.layout.texture_width, owner.layout.texture_height)
-    pooled = rt.scratch_texture_pool.setdefault(key, [])
-    pooled_count = sum(len(textures) for textures in rt.scratch_texture_pool.values())
-    if pooled_count >= _MAX_SCRATCH_TEXTURES:
-        texture_id = ctypes.c_uint(texture)
-        gm.glDeleteTextures(1, ctypes.byref(texture_id))
-        if _profile_enabled:
-            _profile_counters["scratch_texture_evictions"] += 1
-        return
-    pooled.append(texture)
-    if _profile_enabled:
-        _profile_counters["scratch_texture_releases"] += 1
+    _resources.release_scratch_texture(owner)
 
 
 def _upload_array_to_texture(array: np.ndarray) -> _TextureOwner:
-    shape = tuple(int(v) for v in array.shape)
-    _validate_supported_shape(shape)
-    if len(shape) == 2 and shape[0] == shape[1]:
-        data, layout = _matrix_red_rgba(array)
-    else:
-        data, layout = _pack_linear_rgba(array)
-    texture = _create_rgba32f_texture(layout.texture_width, layout.texture_height, data)
-    return _TextureOwner(texture, layout)
+    return _resources.upload_array_to_texture(array)
 
 
 def _upload_raw_packed_array(array: np.ndarray, parameter_kind: str = "parameter") -> _TextureOwner:
-    if _profile_enabled:
-        key = (parameter_kind, int(array.__array_interface__["data"][0]))
-        _profile_counters["parameter_uploads"] += 1
-        _profile_counters["parameter_upload_bytes"] += array.nbytes
-        _profile_parameters[parameter_kind]["count"] += 1
-        _profile_parameters[parameter_kind]["bytes"] += array.nbytes
-        if key in _profile_parameter_keys:
-            _profile_counters["repeated_parameter_uploads"] += 1
-            _profile_parameters[parameter_kind]["repeated"] += 1
-        _profile_parameter_keys.add(key)
-    data, layout = _pack_linear_rgba(array)
-    texture = _create_rgba32f_texture(layout.texture_width, layout.texture_height, data)
-    return _TextureOwner(texture, layout)
+    return _resources.upload_raw_packed_array(array, parameter_kind)
 
 
 def _parameter_cache_key(tensor: torch.Tensor, parameter_kind: str) -> tuple:
-    storage = tensor.untyped_storage()
-    storage_identity = int(storage._cdata)
-    return (
-        parameter_kind,
-        id(tensor),
-        storage_identity,
-        int(tensor.data_ptr()),
-        int(tensor.storage_offset()),
-        tuple(int(size) for size in tensor.shape),
-        str(tensor.dtype),
-        int(tensor._version),
-    )
+    return _resources.parameter_cache_key(tensor, parameter_kind)
 
 
 def _cached_parameter_texture(tensor: torch.Tensor, parameter_kind: str) -> _TextureOwner:
-    """Return a persistent texture for an eligible immutable Conv2D parameter."""
-    rt = _runtime_required()
-    key = _parameter_cache_key(tensor, parameter_kind)
-    base_key = key[:-1]
-    current_key = rt.parameter_cache_current.get(base_key)
-    if current_key is not None and current_key != key and _profile_enabled:
-        _profile_counters["parameter_cache_invalidations"] += 1
-
-    entry = rt.parameter_cache.get(key)
-    if entry is not None and entry.source_ref() is tensor and entry.owner.texture:
-        if _profile_enabled:
-            _profile_counters["parameter_cache_hits"] += 1
-        return entry.owner
-
-    if _profile_enabled:
-        _profile_counters["parameter_cache_misses"] += 1
-    array = tensor.detach().numpy().astype(np.float32, copy=False)
-    owner = _upload_raw_packed_array(array, parameter_kind)
-    if len(rt.parameter_cache) >= _MAX_PARAMETER_CACHE_ENTRIES:
-        if _profile_enabled:
-            _profile_counters["parameter_cache_bypasses"] += 1
-        return owner
-    rt.parameter_cache[key] = _ParameterCacheEntry(owner, weakref.ref(tensor))
-    rt.parameter_cache_current[base_key] = key
-    return owner
+    return _resources.cached_parameter_texture(tensor, parameter_kind)
 
 
 def _new_empty_packed_texture(shape: tuple[int, ...]) -> _TextureOwner:
