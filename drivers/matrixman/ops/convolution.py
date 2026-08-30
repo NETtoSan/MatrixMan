@@ -181,6 +181,39 @@ def _conv_tile_shader_source(params: tuple, tile_x: int, tile_y: int) -> bytes:
     return source.replace(old, new).encode("ascii")
 
 
+def _program_key(fragment_source: bytes) -> tuple[bytes, bytes]:
+    """Identify a linked program by the exact shader sources it uses."""
+    return gm.VERTEX_SHADER, fragment_source
+
+
+def _conv_tile_program(fragment_source: bytes) -> tuple[int, int, int, int]:
+    b = _backend()
+    rt = b._runtime_required()
+    key = _program_key(fragment_source)
+    if key not in rt.conv_tile_programs:
+        b._trace("gm45.compile -> tiled convolution GLSL fragment shader")
+        program = gm.make_program(fragment_source)
+        rt.conv_tile_programs[key] = program
+        rt.conv_tile_uniforms[key] = (
+            gm.glGetUniformLocation(program, b"input_tex"),
+            gm.glGetUniformLocation(program, b"weight_tex"),
+            gm.glGetUniformLocation(program, b"bias_tex"),
+        )
+    return (rt.conv_tile_programs[key], *rt.conv_tile_uniforms[key])
+
+
+def _tile_copy_program(fragment_source: bytes) -> tuple[int, int]:
+    b = _backend()
+    rt = b._runtime_required()
+    key = _program_key(fragment_source)
+    if key not in rt.tile_copy_programs:
+        b._trace("gm45.compile -> tiled convolution copy GLSL fragment shader")
+        program = gm.make_program(fragment_source)
+        rt.tile_copy_programs[key] = program
+        rt.tile_copy_uniforms[key] = gm.glGetUniformLocation(program, b"tile_tex")
+    return rt.tile_copy_programs[key], rt.tile_copy_uniforms[key]
+
+
 def _tile_copy_shader_source(tile_width: int, tile_height: int, origin_x: int, origin_y: int) -> bytes:
     return f"""
 #version 120
@@ -321,29 +354,28 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
             _last_tile_geometry[-1]["texture"] = tile.texture
             if b._profile_enabled:
                 b._profile_counters["tiled_draw_calls"] += 1
-            program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
-            try:
-                gm.glViewport(0, 0, tile_w, tile_h)
-                gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-                gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
-                if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
-                    raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
-                gm.glUseProgram(program)
-                for unit, texture, uniform in ((gm.GL_TEXTURE0, input_tensor._owner.texture, b"input_tex"), (gm.GL_TEXTURE1, weight_owner.texture, b"weight_tex"), (gm.GL_TEXTURE2, bias_owner.texture, b"bias_tex")):
-                    gm.glActiveTexture(unit)
-                    gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
-                    gm.glUniform1i(gm.glGetUniformLocation(program, uniform), unit - gm.GL_TEXTURE0)
-                gm.glBegin(gm.GL_QUADS)
-                gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-                gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
-                if (err := gm.glGetError()):
-                    raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
-                if sync_mode == "per_tile":
-                    gm.glFinish()
-                elif sync_mode == "flush":
-                    gm.glFlush()
-            finally:
-                gm.glDeleteProgram(program)
+            program, input_loc, weight_loc, bias_loc = _conv_tile_program(
+                _conv_tile_shader_source(params, origin_x, origin_y)
+            )
+            gm.glViewport(0, 0, tile_w, tile_h)
+            gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+            gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
+            if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
+            gm.glUseProgram(program)
+            for unit, texture, uniform_location in ((gm.GL_TEXTURE0, input_tensor._owner.texture, input_loc), (gm.GL_TEXTURE1, weight_owner.texture, weight_loc), (gm.GL_TEXTURE2, bias_owner.texture, bias_loc)):
+                gm.glActiveTexture(unit)
+                gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
+                gm.glUniform1i(uniform_location, unit - gm.GL_TEXTURE0)
+            gm.glBegin(gm.GL_QUADS)
+            gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
+            gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+            if (err := gm.glGetError()):
+                raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
+            if sync_mode == "per_tile":
+                gm.glFinish()
+            elif sync_mode == "flush":
+                gm.glFlush()
         # Diagnostic readback is deliberately delayed until every production
         # tile render has completed. It cannot alter inter-tile scheduling.
         if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
@@ -404,29 +436,28 @@ def _consolidate_tiles(tile_owners, geometries, out_owner, full_w, full_h, width
             origin_x = tile_x * width_limit
             tile_w = min(width_limit, full_w - origin_x)
             tile = tiles_by_grid[(tile_x, tile_y)]
-            program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
+            program, tile_loc = _tile_copy_program(
+                _tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y)
+            )
             if b._profile_enabled:
                 b._profile_counters["consolidation_draw_calls"] += 1
-            try:
-                gm.glViewport(0, 0, full_w, full_h)
-                gm.gl.glEnable(_GL_SCISSOR_TEST)
-                gm.gl.glScissor(origin_x, origin_y, tile_w, tile_h)
-                gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-                gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
-                if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
-                    raise RuntimeError("gm45 tiled convolution output framebuffer incomplete")
-                gm.glUseProgram(program)
-                gm.glActiveTexture(gm.GL_TEXTURE0)
-                gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
-                gm.glUniform1i(gm.glGetUniformLocation(program, b"tile_tex"), 0)
-                gm.glBegin(gm.GL_QUADS)
-                gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-                gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
-                gm.gl.glDisable(_GL_SCISSOR_TEST)
-                if (err := gm.glGetError()):
-                    raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
-            finally:
-                gm.glDeleteProgram(program)
+            gm.glViewport(0, 0, full_w, full_h)
+            gm.gl.glEnable(_GL_SCISSOR_TEST)
+            gm.gl.glScissor(origin_x, origin_y, tile_w, tile_h)
+            gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+            gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+            if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("gm45 tiled convolution output framebuffer incomplete")
+            gm.glUseProgram(program)
+            gm.glActiveTexture(gm.GL_TEXTURE0)
+            gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
+            gm.glUniform1i(tile_loc, 0)
+            gm.glBegin(gm.GL_QUADS)
+            gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
+            gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+            gm.gl.glDisable(_GL_SCISSOR_TEST)
+            if (err := gm.glGetError()):
+                raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
 
 
 def execute(args):

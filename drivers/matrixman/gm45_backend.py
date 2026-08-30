@@ -125,6 +125,8 @@ class _GlRuntime:
     add_programs: dict[int, int]
     matmul_programs: dict[int, int]
     conv_programs: dict[tuple, int]
+    conv_tile_programs: dict[tuple[bytes, bytes], int]
+    tile_copy_programs: dict[tuple[bytes, bytes], int]
     batchnorm_programs: dict[tuple, int]
     silu_programs: dict[tuple, int]
     packed_add_programs: dict[tuple, int]
@@ -147,6 +149,8 @@ class _GlRuntime:
     add_uniforms: dict[int, tuple[int, int]]
     matmul_uniforms: dict[int, tuple[int, int]]
     conv_uniforms: dict[tuple, tuple[int, int, int]]
+    conv_tile_uniforms: dict[tuple[bytes, bytes], tuple[int, int, int]]
+    tile_copy_uniforms: dict[tuple[bytes, bytes], int]
     batchnorm_uniforms: dict[tuple, tuple[int, int, int, int, int]]
     silu_uniforms: dict[tuple, int]
     packed_add_uniforms: dict[tuple, tuple[int, int]]
@@ -331,6 +335,8 @@ def init() -> None:
         add_programs={},
         matmul_programs={},
         conv_programs={},
+        conv_tile_programs={},
+        tile_copy_programs={},
         batchnorm_programs={},
         silu_programs={},
         packed_add_programs={},
@@ -353,6 +359,8 @@ def init() -> None:
         add_uniforms={},
         matmul_uniforms={},
         conv_uniforms={},
+        conv_tile_uniforms={},
+        tile_copy_uniforms={},
         batchnorm_uniforms={},
         silu_uniforms={},
         packed_add_uniforms={},
@@ -389,6 +397,8 @@ def shutdown() -> None:
         list(_runtime.add_programs.values())
         + list(_runtime.matmul_programs.values())
         + list(_runtime.conv_programs.values())
+        + list(_runtime.conv_tile_programs.values())
+        + list(_runtime.tile_copy_programs.values())
         + list(_runtime.batchnorm_programs.values())
         + list(_runtime.silu_programs.values())
         + list(_runtime.packed_add_programs.values())
