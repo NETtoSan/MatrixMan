@@ -34,7 +34,7 @@ def trace(message: str) -> None:
 
 
 def kernel_log(message: str) -> None:
-    print(f"[GM45] {message}")
+    print(f"[MatrixMan/OpenGL] {message}")
 
 
 def error_log(message: str) -> None:

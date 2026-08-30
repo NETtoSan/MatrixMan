@@ -6,6 +6,10 @@ from __future__ import annotations
 class Backend:
     """Operations required by the MatrixMan-facing layer."""
 
+    def device_info(self) -> dict[str, str]:
+        """Return concise runtime information for user-facing reporting."""
+        return {"backend": self.__class__.__name__}
+
     def matmul(self, a, b):
         raise NotImplementedError
 

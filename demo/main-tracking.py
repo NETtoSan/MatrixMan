@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VisDrone video demo using the MatrixMan GM45 PyTorch backend.
+"""VisDrone video demo using the MatrixMan PyTorch backend.
 
 The model forward is intentionally called directly with a Gm45Tensor.  Only
 the final model output is read back to CPU; OpenCV and postprocessing stay on
@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from drivers import matrixman
+from drivers.matrixman.backend import get_backend
 
 
 def _stage(label: str, started: float, detail: str = "") -> float:
@@ -122,7 +123,7 @@ def _run_divergence_diagnostic(cpu_net, gpu_net, cpu_input, gpu_input, selected,
         gpu_leaves = gpu_records.get(index, [])
         print(f"  module {index} ({type(module).__name__})")
         if len(cpu_leaves) != len(gpu_leaves):
-            print(f"    tensor-count mismatch: CPU={len(cpu_leaves)} GM45={len(gpu_leaves)}")
+            print(f"    tensor-count mismatch: CPU={len(cpu_leaves)} MatrixMan={len(gpu_leaves)}")
             first_bad = index if first_bad is None else first_bad
             continue
         module_bad = False
@@ -137,13 +138,13 @@ def _run_divergence_diagnostic(cpu_net, gpu_net, cpu_input, gpu_input, selected,
             if cpu["shape"] != gpu["shape"] or max_error > 1e-3 or mean_error > 1e-4 or abs(zero_fraction_cpu - zero_fraction_gpu) > 0.01:
                 module_bad = True
             print(
-                f"    tensor {leaf_index}: shape CPU={cpu['shape']} GM45={gpu['shape']} "
+                f"    tensor {leaf_index}: shape CPU={cpu['shape']} MatrixMan={gpu['shape']} "
                 f"error max/mean/rmse=({max_error:.6g},{mean_error:.6g},{rmse:.6g}) "
                 f"min/max/mean CPU=({cpu['min']:.6g},{cpu['max']:.6g},{cpu['mean']:.6g}) "
-                f"GM45=({gpu['min']:.6g},{gpu['max']:.6g},{gpu['mean']:.6g}) "
-                f"mean_abs CPU/GM45=({cpu['mean_abs']:.6g},{gpu['mean_abs']:.6g}) "
-                f"zeros CPU/GM45=({zero_fraction_cpu:.2%},{zero_fraction_gpu:.2%}) "
-                f"nan/inf CPU=({cpu['nan']},{cpu['inf']}) GM45=({gpu['nan']},{gpu['inf']})"
+                f"MatrixMan=({gpu['min']:.6g},{gpu['max']:.6g},{gpu['mean']:.6g}) "
+                f"mean_abs CPU/MatrixMan=({cpu['mean_abs']:.6g},{gpu['mean_abs']:.6g}) "
+                f"zeros CPU/MatrixMan=({zero_fraction_cpu:.2%},{zero_fraction_gpu:.2%}) "
+                f"nan/inf CPU=({cpu['nan']},{cpu['inf']}) MatrixMan=({gpu['nan']},{gpu['inf']})"
             )
         if module_bad and first_bad is None:
             first_bad = index
@@ -255,7 +256,7 @@ def _run_detect_diagnostic(cpu_net, gpu_net, cpu_input, gpu_input, started):
     for key, cpu_records in cpu_store.items():
         gpu_records = gpu_store.get(key)
         if gpu_records is None or len(cpu_records) != len(gpu_records):
-            print(f"  {key}: checkpoint mismatch CPU={len(cpu_records)} GM45={len(gpu_records or [])}")
+            print(f"  {key}: checkpoint mismatch CPU={len(cpu_records)} MatrixMan={len(gpu_records or [])}")
             first_bad = key
             break
         key_bad = False
@@ -270,11 +271,11 @@ def _run_detect_diagnostic(cpu_net, gpu_net, cpu_input, gpu_input, started):
             if cpu["shape"] != gpu["shape"] or max_error > 1e-3 or mean_error > 1e-4 or abs(cpu_zero - gpu_zero) > 0.01:
                 key_bad = True
             print(
-                f"  {key} tensor={leaf_index} shape CPU={cpu['shape']} GM45={gpu['shape']} "
+                f"  {key} tensor={leaf_index} shape CPU={cpu['shape']} MatrixMan={gpu['shape']} "
                 f"error max/mean/rmse=({max_error:.6g},{mean_error:.6g},{rmse:.6g}) "
                 f"CPU min/max/mean=({cpu['min']:.6g},{cpu['max']:.6g},{cpu['mean']:.6g}) "
-                f"GM45 min/max/mean=({gpu['min']:.6g},{gpu['max']:.6g},{gpu['mean']:.6g}) "
-                f"zeros CPU/GM45=({cpu_zero:.2%},{gpu_zero:.2%})"
+                f"MatrixMan min/max/mean=({gpu['min']:.6g},{gpu['max']:.6g},{gpu['mean']:.6g}) "
+                f"zeros CPU/MatrixMan=({cpu_zero:.2%},{gpu_zero:.2%})"
             )
         if key_bad and first_bad is None:
             first_bad = key
@@ -362,7 +363,7 @@ def _detections(prediction, width: int, height: int, names: dict, conf_threshold
 def _validation_metrics(cpu_output: torch.Tensor, gm45_output: torch.Tensor, names: dict, started: float) -> None:
     compare_started = time.perf_counter()
     if tuple(cpu_output.shape) != tuple(gm45_output.shape):
-        raise RuntimeError(f"CPU/GM45 output shape mismatch: {list(cpu_output.shape)} vs {list(gm45_output.shape)}")
+        raise RuntimeError(f"CPU/MatrixMan output shape mismatch: {list(cpu_output.shape)} vs {list(gm45_output.shape)}")
     if cpu_output.ndim != 3 or tuple(cpu_output.shape[:2]) != (1, 14) or cpu_output.shape[-1] <= 0:
         raise RuntimeError(f"unexpected validation output shape: {list(cpu_output.shape)}")
 
@@ -381,20 +382,20 @@ def _validation_metrics(cpu_output: torch.Tensor, gm45_output: torch.Tensor, nam
 
     print("\nCPU vs MatrixMan raw-output validation")
     print(f"  CPU output shape: {list(cpu_output.shape)}")
-    print(f"  GM45 output shape: {list(gm45_output.shape)}")
+    print(f"  MatrixMan output shape: {list(gm45_output.shape)}")
     print(f"  overall max_abs_error={overall[0]:.6g} mean_abs_error={overall[1]:.6g} rmse={overall[2]:.6g}")
     print(f"  maximum relative error (|CPU|>1e-8): {float(relative.max()):.6g}")
-    print(f"  NaN values: CPU={int(torch.isnan(cpu_output).sum())} GM45={int(torch.isnan(gm45_output).sum())}")
-    print(f"  Inf values: CPU={int(torch.isinf(cpu_output).sum())} GM45={int(torch.isinf(gm45_output).sum())}")
+    print(f"  NaN values: CPU={int(torch.isnan(cpu_output).sum())} MatrixMan={int(torch.isnan(gm45_output).sum())}")
+    print(f"  Inf values: CPU={int(torch.isinf(cpu_output).sum())} MatrixMan={int(torch.isinf(gm45_output).sum())}")
     print(f"  BOX CHANNELS [0:4]: max_abs_error={boxes[0]:.6g} mean_abs_error={boxes[1]:.6g} rmse={boxes[2]:.6g}")
     print(f"  CLASS SCORES [4:14]: max_abs_error={scores[0]:.6g} mean_abs_error={scores[1]:.6g} rmse={scores[2]:.6g}")
-    print(f"    CPU max={float(cpu_scores.max()):.6g} GM45 max={float(gm45_scores.max()):.6g}")
-    print(f"    CPU mean={float(cpu_scores.mean()):.6g} GM45 mean={float(gm45_scores.mean()):.6g}")
+    print(f"    CPU max={float(cpu_scores.max()):.6g} MatrixMan max={float(gm45_scores.max()):.6g}")
+    print(f"    CPU mean={float(cpu_scores.mean()):.6g} MatrixMan mean={float(gm45_scores.mean()):.6g}")
 
     cpu_anchor_scores, cpu_classes = cpu_scores.max(dim=0)
     gm45_anchor_scores, gm45_classes = gm45_scores.max(dim=0)
     for threshold in (0.01, 0.05, 0.10, 0.25, 0.50):
-        print(f"  threshold {threshold:.2f}: anchors above CPU={int((cpu_anchor_scores > threshold).sum())} GM45={int((gm45_anchor_scores > threshold).sum())}")
+        print(f"  threshold {threshold:.2f}: anchors above CPU={int((cpu_anchor_scores > threshold).sum())} MatrixMan={int((gm45_anchor_scores > threshold).sum())}")
 
     def print_top(label: str, output: torch.Tensor, anchor_scores: torch.Tensor, classes: torch.Tensor) -> None:
         print(f"  top 10 {label} predictions:")
@@ -405,14 +406,14 @@ def _validation_metrics(cpu_output: torch.Tensor, gm45_output: torch.Tensor, nam
             print(f"    anchor={anchor} class={cls} ({names.get(cls, str(cls))}) confidence={value:.6g} box={box}")
 
     print_top("CPU", cpu_output, cpu_anchor_scores, cpu_classes)
-    print_top("GM45", gm45_output, gm45_anchor_scores, gm45_classes)
+    print_top("MatrixMan", gm45_output, gm45_anchor_scores, gm45_classes)
     _stage("numerical comparison complete", started,
            f"duration={time.perf_counter() - compare_started:.3f}s")
 
 
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="MatrixMan GM45 VisDrone tracking demo")
+    parser = argparse.ArgumentParser(description="MatrixMan VisDrone tracking demo")
     parser.add_argument("--model", type=Path, default=base / "models/VisDrone-arm64-480/weights/best.pt")
     parser.add_argument("--video", type=Path, default=base / "videos/video0.mp4")
     parser.add_argument("--imgsz", type=int, default=640)
@@ -420,8 +421,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--frames", type=int, default=0, help="stop after N frames; 0 means until quit/end")
     parser.add_argument("--no-display", action="store_true")
-    parser.add_argument("--validate-cpu", action="store_true", help="compare one frame's raw CPU and GM45 outputs")
-    parser.add_argument("--diagnose-divergence", action="store_true", help="compare selected CPU/GM45 module activations for one frame")
+    parser.add_argument("--validate-cpu", action="store_true", help="compare one frame's raw CPU and MatrixMan outputs")
+    parser.add_argument("--diagnose-divergence", action="store_true", help="compare selected CPU/MatrixMan module activations for one frame")
     parser.add_argument("--diagnostic-checkpoints", default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
                         help="top-level YOLO module indices to inspect")
     return parser.parse_args()
@@ -448,10 +449,16 @@ def main() -> int:
     print(f"  model: {model_path}")
     print(f"  video: {video_path}")
     print(f"  inference resolution: {args.imgsz}x{args.imgsz}")
-    print("  backend: MatrixMan / Intel GM45 / OpenGL 2.1 / GLSL 1.20")
-
     matrixman.set_trace(matrixman.debug_enabled())
     matrixman.init()
+    backend_info = get_backend().device_info()
+    print(
+        "  backend: MatrixMan / "
+        f"{backend_info['backend']} / {backend_info.get('vendor', 'unknown')} / "
+        f"{backend_info.get('renderer', 'unknown')} / "
+        f"OpenGL {backend_info.get('opengl', 'unknown')} / "
+        f"GLSL {backend_info.get('glsl', 'unknown')}"
+    )
     matrixman.profile_reset()
     yolo = YOLO(str(model_path))
     net = yolo.model.eval()
@@ -483,7 +490,7 @@ def main() -> int:
             if args.diagnose_divergence:
                 upload_started = time.perf_counter()
                 gpu_input = matrixman.to_gm45(cpu_input)
-                _stage("CPU->GM45 upload complete", started, f"duration={time.perf_counter() - upload_started:.3f}s")
+                _stage("CPU->MatrixMan upload complete", started, f"duration={time.perf_counter() - upload_started:.3f}s")
                 _run_detect_diagnostic(cpu_net, net, cpu_input, gpu_input, started)
                 frame_count += 1
                 break
@@ -499,17 +506,17 @@ def main() -> int:
             upload_started = time.perf_counter()
             gpu_input = matrixman.to_gm45(cpu_input)
             upload_time = time.perf_counter() - upload_started
-            _stage("CPU->GM45 upload complete", started, f"duration={time.perf_counter() - upload_started:.3f}s")
+            _stage("CPU->MatrixMan upload complete", started, f"duration={time.perf_counter() - upload_started:.3f}s")
             print(f"  MatrixMan input: {gpu_input}")
             with torch.no_grad():
                 gpu_forward_started = time.perf_counter()
                 raw = net(gpu_input)
             gpu_forward_time = time.perf_counter() - gpu_forward_started
-            _stage("GM45 forward complete", started, f"duration={time.perf_counter() - gpu_forward_started:.3f}s")
+            _stage("MatrixMan forward complete", started, f"duration={time.perf_counter() - gpu_forward_started:.3f}s")
             gpu_output = _first_tensor(raw)
             if not matrixman.is_gm45_tensor(gpu_output):
                 raise RuntimeError("model output did not remain a Gm45Tensor")
-            print(f"  GM45 forward complete; explicit readback: output texture #{gpu_output._owner.texture}")
+            print(f"  MatrixMan forward complete; explicit readback: output texture #{gpu_output._owner.texture}")
             readback_started = time.perf_counter()
             prediction = gpu_output.cpu()
             readback_time = time.perf_counter() - readback_started
@@ -531,13 +538,13 @@ def main() -> int:
             _stage("drawing complete", started, f"{len(detections)} detections; duration={time.perf_counter() - drawing_started:.3f}s")
             elapsed = time.perf_counter() - frame_started
             overlay_scale = max(0.3, min(0.6, args.imgsz / 640.0 * 0.6))
-            cv2.putText(display_frame, f"GM45 {args.imgsz} | det {len(detections)} | FPS {1 / max(elapsed, 1e-9):.2f}",
+            cv2.putText(display_frame, f"MatrixMan {args.imgsz} | det {len(detections)} | FPS {1 / max(elapsed, 1e-9):.2f}",
                         (6, max(16, int(20 * overlay_scale / 0.6))), cv2.FONT_HERSHEY_SIMPLEX,
                         overlay_scale, (0, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(display_frame, f"fwd {gpu_forward_time:.1f}s  rb {readback_time:.1f}s  total {elapsed:.1f}s",
                         (6, max(30, int(42 * overlay_scale / 0.6))), cv2.FONT_HERSHEY_SIMPLEX,
                         max(0.28, overlay_scale - 0.08), (0, 255, 255), 1, cv2.LINE_AA)
-            print(f"frame {frame_count}: input=[1,3,{args.imgsz},{args.imgsz}] output={list(prediction.shape)} anchors={prediction.shape[-1]} candidates_before_nms={candidates_before_nms} detections={len(detections)} preprocess={preprocess_time:.3f}s upload={upload_time:.3f}s GM45 forward={gpu_forward_time:.3f}s readback={readback_time:.3f}s postprocess={postprocess_time:.3f}s drawing={time.perf_counter() - drawing_started:.3f}s total={elapsed:.3f}s FPS={1 / max(elapsed, 1e-9):.2f}")
+            print(f"frame {frame_count}: input=[1,3,{args.imgsz},{args.imgsz}] output={list(prediction.shape)} anchors={prediction.shape[-1]} candidates_before_nms={candidates_before_nms} detections={len(detections)} preprocess={preprocess_time:.3f}s upload={upload_time:.3f}s MatrixMan forward={gpu_forward_time:.3f}s readback={readback_time:.3f}s postprocess={postprocess_time:.3f}s drawing={time.perf_counter() - drawing_started:.3f}s total={elapsed:.3f}s FPS={1 / max(elapsed, 1e-9):.2f}")
             print(f"  CPU postprocessing/drawing complete; detections={len(detections)}")
             frame_count += 1
             if not args.no_display:

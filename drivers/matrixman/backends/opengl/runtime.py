@@ -80,7 +80,7 @@ def init() -> None:
     from . import diagnostics, factories
 
     factories.register_privateuse_name()
-    diagnostics.trace("gm45.init -> SDL hidden OpenGL 2.1 context")
+    diagnostics.trace("MatrixMan/OpenGL init -> SDL hidden compatibility-profile context")
     gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
     gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
     gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MINOR_VERSION, 1)

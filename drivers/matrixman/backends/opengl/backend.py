@@ -9,6 +9,9 @@ from .ops import matmul
 class OpenGLBackend(Backend):
     name = "opengl"
 
+    def device_info(self) -> dict[str, str]:
+        return device_info()
+
     @classmethod
     def probe(cls) -> bool:
         try:
@@ -22,6 +25,32 @@ class OpenGLBackend(Backend):
 
     def synchronize(self):
         gm.glFinish()
+
+
+def device_info() -> dict[str, str]:
+    """Return device and shading-language information from the active context."""
+
+    def text(value) -> str:
+        if value is None:
+            return "unavailable"
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    runtime.init()
+    values = {
+        "backend": "OpenGL",
+        "vendor": gm.glGetString(0x1F00),
+        "renderer": gm.glGetString(0x1F01),
+        "opengl": gm.glGetString(0x1F02),
+        "glsl": gm.glGetString(0x8B8C),
+    }
+    return {
+        key: text(value)
+        for key, value in values.items()
+    }
 
 
 Gm45Tensor = tensor_module.Gm45Tensor
