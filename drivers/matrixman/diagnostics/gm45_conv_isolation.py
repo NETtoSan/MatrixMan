@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 
 from drivers import matrixman as gm45
-from drivers.matrixman import gm45_backend as backend
+from drivers.matrixman.backends.opengl import storage
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -71,7 +71,7 @@ def exact_case():
     report("  overall", cpu_out, gpu_cpu)
     print(f"  layouts: input tex={gpu_input._owner.layout.texture_width}x{gpu_input._owner.layout.texture_height}; output tex={gpu_out._owner.layout.texture_width}x{gpu_out._owner.layout.texture_height}")
     print(f"  logical/packed: input={exact_input.numel()}/{exact_input.numel() // 4} texels; weight={weight.numel()}/{(weight.numel() + 3) // 4} texels; output={cpu_out.numel()}/{cpu_out.numel() // 4} texels")
-    print(f"  computed atlas: input={backend._packed_atlas_size(exact_input.numel())}; weight={backend._packed_atlas_size(weight.numel())}; output={backend._packed_atlas_size(cpu_out.numel())}")
+    print(f"  computed atlas: input={storage.packed_atlas_size(exact_input.numel())}; weight={storage.packed_atlas_size(weight.numel())}; output={storage.packed_atlas_size(cpu_out.numel())}")
 
     errors = (gpu_cpu - cpu_out).abs()
     channel_rows = []

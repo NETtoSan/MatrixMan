@@ -9,8 +9,8 @@ from pathlib import Path
 import torch
 
 from drivers import matrixman as gm45
-from drivers.matrixman import gm45_backend as backend
 from drivers.matrixman import gpumatrix as gl
+from drivers.matrixman.backends.opengl import operation_context, runtime, storage
 
 
 def _probe_shader(numel: int, source_width: int, source_height: int, output_width: int, mode: str) -> bytes:
@@ -71,10 +71,10 @@ void main()
 
 
 def _run_probe(tensor: gm45.Gm45Tensor, mode: str, shape: tuple[int, ...]) -> torch.Tensor:
-    out_owner = backend._new_empty_packed_texture(shape)
-    rt = backend._runtime_required()
+    out_owner = operation_context.output_texture(shape)
+    rt = runtime.runtime_required()
     program = gl.make_program(_probe_shader(
-        backend._numel(shape), tensor._owner.layout.texture_width,
+        storage.numel(shape), tensor._owner.layout.texture_width,
         tensor._owner.layout.texture_height, out_owner.layout.texture_width, mode,
     ))
     try:

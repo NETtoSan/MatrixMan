@@ -14,8 +14,9 @@ import torch
 import torch.nn.functional as F
 
 from drivers import matrixman as gm45
-from drivers.matrixman import gm45_backend as backend
 from drivers.matrixman import gpumatrix as gl
+from drivers.matrixman.backends.opengl import convolution, operation_context, resources, runtime, storage
+from drivers.matrixman.backends.opengl import tensor as tensor_module
 
 gl.gl.glScissor.restype = None
 gl.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -48,10 +49,10 @@ void main() {{ {body} }}
 
 def render_scalar(gx, gw, input_dims, weight_dims, body):
     in_c, in_h, in_w = input_dims
-    input_tw, input_th = backend._packed_atlas_size(gx._owner.layout.numel)
-    weight_tw, weight_th = backend._packed_atlas_size(gw._owner.layout.numel)
-    owner = backend._new_empty_packed_texture((1,))
-    rt = backend._runtime_required()
+    input_tw, input_th = storage.packed_atlas_size(gx._owner.layout.numel)
+    weight_tw, weight_th = storage.packed_atlas_size(gw._owner.layout.numel)
+    owner = operation_context.output_texture((1,))
+    rt = runtime.runtime_required()
     program = gl.make_program(shader_source(in_c, in_h, in_w, input_tw, input_th, weight_tw, weight_th, body))
     try:
         gl.glViewport(0, 0, 1, 1)
@@ -69,14 +70,14 @@ def render_scalar(gx, gw, input_dims, weight_dims, body):
         gl.glEnd()
         if (error := gl.glGetError()):
             raise RuntimeError(f"arithmetic diagnostic OpenGL error: 0x{error:04x}")
-        return backend.Gm45Tensor._from_owner(owner, (1,)).cpu().item()
+        return tensor_module.Gm45Tensor._from_owner(owner, (1,)).cpu().item()
     finally:
         gl.glDeleteProgram(program)
 
 
 def render_constant(iterations, looped):
-    owner = backend._new_empty_packed_texture((1,))
-    rt = backend._runtime_required()
+    owner = operation_context.output_texture((1,))
+    rt = runtime.runtime_required()
     if looped:
         body = f"float acc=0.0; for(int i=0;i<{iterations};++i) acc+=0.125; gl_FragColor=vec4(acc,0,0,0);"
     else:
@@ -87,7 +88,7 @@ def render_constant(iterations, looped):
         gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER,gl.GL_COLOR_ATTACHMENT0,gl.GL_TEXTURE_2D,owner.texture,0)
         gl.glUseProgram(program); gl.glBegin(gl.GL_QUADS)
         gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
-        return backend.Gm45Tensor._from_owner(owner,(1,)).cpu().item()
+        return tensor_module.Gm45Tensor._from_owner(owner,(1,)).cpu().item()
     finally:
         gl.glDeleteProgram(program)
 
@@ -95,16 +96,16 @@ def render_constant(iterations, looped):
 def render_full_conv(x, weight):
     """Run the existing full-output shader source without dispatching aten.convolution."""
     gx = gm45.to_gm45(x)
-    weight_owner = backend._upload_raw_packed_array(weight.numpy())
+    weight_owner = resources.upload_raw_packed_array(weight.numpy())
     out_shape = (1, weight.shape[0], x.shape[2], x.shape[3])
-    out_owner = backend._new_empty_packed_texture(tuple(out_shape))
+    out_owner = operation_context.output_texture(tuple(out_shape))
     params = (x.shape[1], x.shape[2], x.shape[3], weight.shape[0], x.shape[2], x.shape[3],
               3, 3, 1, 1, 1, 1, False, 1, gx._storage_offset,
               gx._owner.layout.texture_width, gx._owner.layout.texture_height,
               weight_owner.layout.texture_width, weight_owner.layout.texture_height,
               weight_owner.layout.texture_width, out_owner.layout.texture_width)
-    program, input_loc, weight_loc, bias_loc = backend._conv_program(params)
-    rt = backend._runtime_required()
+    program, input_loc, weight_loc, bias_loc = convolution._conv_program(params)
+    rt = runtime.runtime_required()
     try:
         gl.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, rt.fbo.value)
@@ -117,26 +118,26 @@ def render_full_conv(x, weight):
         gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
         if (error := gl.glGetError()):
             raise RuntimeError(f"full arithmetic diagnostic OpenGL error: 0x{error:04x}")
-        return backend.Gm45Tensor._from_owner(out_owner, out_shape).cpu(), gx, weight_owner
+        return tensor_module.Gm45Tensor._from_owner(out_owner, out_shape).cpu(), gx, weight_owner
     except Exception:
-        gl.glDeleteTextures(1, backend.ctypes.byref(weight_owner.texture))
+        gl.glDeleteTextures(1, ctypes.byref(weight_owner.texture))
         raise
 
 
 def render_full_dispatch(x, weight, *, tiles=1, reset=False, out_owner=None):
     """Production shader dispatch with optional scissor tiling/state reset."""
     gx = gm45.to_gm45(x)
-    weight_owner = backend._upload_raw_packed_array(weight.numpy())
+    weight_owner = resources.upload_raw_packed_array(weight.numpy())
     out_shape = (1, weight.shape[0], x.shape[2], x.shape[3])
     if out_owner is None:
-        out_owner = backend._new_empty_packed_texture(tuple(out_shape))
+        out_owner = operation_context.output_texture(tuple(out_shape))
     in_tw, in_th = gx._owner.layout.texture_width, gx._owner.layout.texture_height
     params = (x.shape[1], x.shape[2], x.shape[3], weight.shape[0], x.shape[2], x.shape[3], 3, 3,
               1, 1, 1, 1, False, 1, gx._storage_offset, in_tw, in_th,
               weight_owner.layout.texture_width, weight_owner.layout.texture_height,
               weight_owner.layout.texture_width, out_owner.layout.texture_width)
-    program, input_loc, weight_loc, bias_loc = backend._conv_program(params)
-    rt = backend._runtime_required()
+    program, input_loc, weight_loc, bias_loc = convolution._conv_program(params)
+    rt = runtime.runtime_required()
     width, height = out_owner.layout.texture_width, out_owner.layout.texture_height
     if reset:
         gl.gl.glDisable(0x0BE2)  # GL_BLEND
@@ -167,7 +168,7 @@ def render_full_dispatch(x, weight, *, tiles=1, reset=False, out_owner=None):
     if tiles != 1:
         gl.gl.glDisable(GL_SCISSOR_TEST)
     error = gl.glGetError()
-    actual = backend.Gm45Tensor._from_owner(out_owner, out_shape).cpu()
+    actual = tensor_module.Gm45Tensor._from_owner(out_owner, out_shape).cpu()
     print(f"dispatch state: fbo={rt.fbo.value} complete={complete} viewport={width}x{height} active_texture=GL_TEXTURE2 input_tex={gx._owner.texture} weight_tex={weight_owner.texture} output_tex={out_owner.texture} program={program} samplers=(0,1,2) gl_error=0x{error:04x}")
     return actual, out_owner
 
@@ -256,7 +257,7 @@ def main():
         expected=F.conv2d(x,w,padding=1)
         actual,_,_=render_full_conv(x,w)
         delta=(actual-expected).abs()
-        tw,th=backend._packed_atlas_size(x.numel())
+        tw,th=storage.packed_atlas_size(x.numel())
         print(f"size={size} input_atlas={tw}x{th} output_atlas={tw}x{th} fbo_viewport={tw}x{th}: max_abs={delta.max().item():.6g} mean_abs={delta.mean().item():.6g} rmse={delta.square().mean().sqrt().item():.6g} allclose={torch.allclose(actual,expected,rtol=1e-4,atol=1e-4)}")
     print("dispatch controls at first failing size=128")
     x,w,_,_=setup(64,64,128,128); expected=F.conv2d(x,w,padding=1)

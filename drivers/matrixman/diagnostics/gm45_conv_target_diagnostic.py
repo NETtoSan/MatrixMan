@@ -10,8 +10,9 @@ import torch
 import torch.nn.functional as F
 
 from drivers import matrixman as gm45
-from drivers.matrixman import gm45_backend as backend
 from drivers.matrixman import gpumatrix as gl
+from drivers.matrixman.backends.opengl import convolution, operation_context, resources, runtime, storage
+from drivers.matrixman.backends.opengl import tensor as tensor_module
 
 gl.gl.glScissor.restype = None
 gl.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -23,13 +24,13 @@ gl.gl.glColorMask.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte, ct
 
 def _params(x, w, out_owner, full_out_w, full_out_h, tile_base=0):
     inp = gm45.to_gm45(x)
-    wo = backend._upload_raw_packed_array(w.numpy())
+    wo = resources.upload_raw_packed_array(w.numpy())
     params = (x.shape[1], x.shape[2], x.shape[3], w.shape[0], full_out_h, x.shape[3],
               3, 3, 1, 1, 1, 1, False, 1, inp._storage_offset,
               inp._owner.layout.texture_width, inp._owner.layout.texture_height,
               wo.layout.texture_width, wo.layout.texture_height, wo.layout.texture_width,
               full_out_w)
-    source = backend._conv_shader_source(params).decode("ascii")
+    source = convolution._conv_shader_source(params).decode("ascii")
     source = source.replace(
         "int base = (tex_y * " + str(full_out_w) + " + tex_x) * 4;",
         "int base = " + str(tile_base) + " + (tex_y * " + str(full_out_w) + " + tex_x) * 4;",
@@ -38,9 +39,9 @@ def _params(x, w, out_owner, full_out_w, full_out_h, tile_base=0):
 
 
 def physical_owner(width, height):
-    texture = backend._create_rgba32f_texture(width, height)
-    layout = backend._StorageLayout("packed_rgba", width, height, width * height * 4)
-    return backend._TextureOwner(texture, layout)
+    texture = resources.create_rgba32f_texture(width, height)
+    layout = storage.StorageLayout("packed_rgba", width, height, width * height * 4)
+    return tensor_module._TextureOwner(texture, layout)
 
 
 def _draw_conv(x, w, physical_w, physical_h, *, tile_base=0, out_owner=None, reset=False):
@@ -55,7 +56,7 @@ def _draw_conv(x, w, physical_w, physical_h, *, tile_base=0, out_owner=None, res
         "int base = " + str(tile_base) + " + (tex_y * " + str(logical_w * 4) + " + tex_x) * 4;"
     ).encode("ascii")
     program = gl.make_program(source)
-    rt = backend._runtime_required()
+    rt = runtime.runtime_required()
     if reset:
         gl.gl.glDisable(0x0BE2); gl.gl.glDisable(0x0B71); gl.gl.glDisable(0x0C11)
         gl.gl.glDisable(0x0BC0); gl.gl.glDisable(0x0BD0); gl.gl.glColorMask(True, True, True, True)
@@ -73,7 +74,7 @@ def _draw_conv(x, w, physical_w, physical_h, *, tile_base=0, out_owner=None, res
     gl.glBegin(gl.GL_QUADS)
     gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
     err = gl.glGetError()
-    result = backend.Gm45Tensor._from_owner(out_owner, tuple(out_owner_shape(out_owner))).cpu()
+    result = tensor_module.Gm45Tensor._from_owner(out_owner, tuple(out_owner_shape(out_owner))).cpu()
     gl.glDeleteProgram(program)
     return result, out_owner, complete, err, inp, wo
 
@@ -92,7 +93,7 @@ def copy_tile_rows(stitched, tile, origin_x, origin_y, tile_w, tile_h, full_atla
 
 def target_only(size):
     owner = physical_owner(size, size)
-    rt = backend._runtime_required()
+    rt = runtime.runtime_required()
     source = f"#version 120\nvoid main(){{ int i=(int(floor(gl_FragCoord.y))*{size}+int(floor(gl_FragCoord.x)))*4; gl_FragColor=vec4(float(i),float(i+1),float(i+2),float(i+3)); }}".encode("ascii")
     program = gl.make_program(source)
     gl.glViewport(0,0,size,size); gl.glBindFramebuffer(gl.GL_FRAMEBUFFER,rt.fbo.value)
@@ -100,7 +101,7 @@ def target_only(size):
     complete=gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)==gl.GL_FRAMEBUFFER_COMPLETE
     gl.glUseProgram(program); gl.glBegin(gl.GL_QUADS)
     gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
-    err=gl.glGetError(); actual=backend.Gm45Tensor._from_owner(owner,out_owner_shape(owner)).cpu().reshape(-1)
+    err=gl.glGetError(); actual=tensor_module.Gm45Tensor._from_owner(owner,out_owner_shape(owner)).cpu().reshape(-1)
     expected=torch.arange(size*size*4,dtype=torch.float32)
     d=(actual-expected).abs(); gl.glDeleteProgram(program)
     return complete,err,d.max().item(),d.mean().item()
@@ -127,7 +128,7 @@ def main():
         result=F.conv2d(gm45.to_gm45(x),w,padding=1).cpu()
         print(f"production result: shape={list(result.shape)} max_abs={(result-expected).abs().max().item():.6g} allclose={torch.allclose(result,expected,rtol=1e-4,atol=1e-4)}")
         full_atlas=640
-        for item in backend._tile_diagnostic_snapshots:
+        for item in convolution._tile_diagnostic_snapshots:
             local=item["data"].reshape(item["height"],item["width"]*4)
             ref=expected.reshape(full_atlas,full_atlas*4)[item["origin_y"]:item["origin_y"]+item["height"], item["origin_x"]*4:(item["origin_x"]+item["width"])*4]
             d=(local-ref).abs()
@@ -147,7 +148,7 @@ def main():
     expected=F.conv2d(x,w,padding=1)
     print("TEST A: 512x512 input atlas with physically small output target")
     for size in (128,256):
-        owner=backend._new_empty_packed_texture((1,1,size,size*4))
+        owner=operation_context.output_texture((1,1,size,size*4))
         actual,_,complete,err,inp,wo=_draw_conv(x,w,size,size,out_owner=owner,reset=True)
         gathered=actual.reshape(-1)
         expected_tile=expected.reshape(-1).reshape(512, 512*4)[:size,:size*4].reshape(-1)

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from . import gm45_backend as backend
 from . import gpumatrix as gm
-from .backends.opengl import convolution
+from .backends.opengl import convolution, profiling, resources, runtime as runtime_module, tensor
 from .backends.opengl.storage import StorageLayout, pack_linear_rgba, packed_atlas_size
 
 
@@ -155,9 +155,9 @@ def _silu() -> bool:
 
 def _report_physical_tiles(expected: torch.Tensor) -> None:
     packed, _ = pack_linear_rgba(expected.numpy())
-    print(f"physical tiles (consolidation destination texture=#{backend._convolution._last_tile_output_texture}):")
+    print(f"physical tiles (consolidation destination texture=#{convolution._last_tile_output_texture}):")
     all_passed = True
-    for snapshot in backend._tile_diagnostic_snapshots:
+    for snapshot in convolution._tile_diagnostic_snapshots:
         width, height = snapshot["width"], snapshot["height"]
         origin_x, origin_y = snapshot["origin_x"], snapshot["origin_y"]
         actual = snapshot["data"].reshape(height, width, 4).numpy()
@@ -218,12 +218,12 @@ def _diagnostic_workload(name: str) -> dict[str, int]:
 
 def _isolated_one_shot() -> bool:
     """Probe the known-unsafe large render in a disposable GL context."""
-    configured_limit = backend.CONV_PHYSICAL_TILE_LIMIT
-    backend.CONV_PHYSICAL_TILE_LIMIT = 1 << 30
+    configured_limit = convolution.CONV_PHYSICAL_TILE_LIMIT
+    convolution.CONV_PHYSICAL_TILE_LIMIT = 1 << 30
     try:
         return _large_conv(128)
     finally:
-        backend.CONV_PHYSICAL_TILE_LIMIT = configured_limit
+        convolution.CONV_PHYSICAL_TILE_LIMIT = configured_limit
 
 
 def _run_isolated_one_shot() -> bool:
@@ -255,7 +255,7 @@ def _run_isolated_one_shot() -> bool:
 
 
 def _print_tile_geometry(width_limit: int, height_limit: int, atlas: int = 512) -> None:
-    tiles = backend._last_tile_geometry
+    tiles = convolution._last_tile_geometry
     print(f"atlas width/height: {atlas}x{atlas}")
     print(
         f"diagnostic width/height limit: {width_limit}x{height_limit}\n"
@@ -318,8 +318,8 @@ def _test_consolidation() -> bool:
                 origin_x = tile_x * width_limit
                 tile_w = min(width_limit, atlas - origin_x)
                 tile_data = np.ascontiguousarray(pattern[origin_y:origin_y + tile_h, origin_x:origin_x + tile_w])
-                texture = backend._create_rgba32f_texture(tile_w, tile_h, tile_data)
-                owner = backend._TextureOwner(
+                texture = resources.create_rgba32f_texture(tile_w, tile_h, tile_data)
+                owner = tensor._TextureOwner(
                     texture, StorageLayout("packed_rgba", tile_w, tile_h, tile_w * tile_h * 4)
                 )
                 tile_owners.append(owner)
@@ -331,7 +331,7 @@ def _test_consolidation() -> bool:
                     "texture": texture,
                 })
         for geometry, owner in zip(geometries, tile_owners):
-            uploaded = backend._read_texture(
+            uploaded = tensor.readback_tensor(
                 owner, (1, 1, geometry["height"], geometry["width"] * 4)
             ).reshape(geometry["height"], geometry["width"], 4).numpy()
             expected = pattern[
@@ -343,19 +343,19 @@ def _test_consolidation() -> bool:
             if not passed:
                 return False
 
-        destination_texture = backend._create_rgba32f_texture(atlas, atlas)
-        destination = backend._TextureOwner(
+        destination_texture = resources.create_rgba32f_texture(atlas, atlas)
+        destination = tensor._TextureOwner(
             destination_texture,
             StorageLayout("packed_rgba", atlas, atlas, atlas * atlas * 4),
         )
-        runtime = backend._runtime_required()
+        runtime = runtime_module.runtime_required()
         gm.glFinish()
         convolution._consolidate_tiles(
             tile_owners, geometries, destination, atlas, atlas,
             width_limit, height_limit, runtime,
         )
         gm.glFinish()
-        actual = backend._read_texture(
+        actual = tensor.readback_tensor(
             destination, (1, 1, atlas, atlas * 4)
         ).reshape(atlas, atlas, 4).numpy()
         max_abs, mean_abs, rmse, passed = _consolidation_metrics(actual, pattern)
@@ -456,7 +456,7 @@ def report() -> int:
     results = [_check(name, fn) for name, fn in tests]
 
     print("\nLarge Conv Render:")
-    print(f"  configured safe tile size: {backend.CONV_PHYSICAL_TILE_LIMIT}x{backend.CONV_PHYSICAL_TILE_LIMIT}")
+    print(f"  configured safe tile size: {convolution.CONV_PHYSICAL_TILE_LIMIT}x{convolution.CONV_PHYSICAL_TILE_LIMIT}")
     # Validate the normal production path before probing the known-unsafe
     # one-shot render. Each call allocates fresh input/output resources.
     large_256 = _check("  256x256 logical atlas", lambda: _large_conv(64))
@@ -557,7 +557,7 @@ def main() -> int:
             print(f"elapsed: {time.perf_counter() - started:.3f}s")
             _print_tile_geometry(diag_width, diag_height, atlas)
             if backend.profile_enabled():
-                counters = backend._profile_counters
+                counters = profiling.counters
                 print(f"glFinish count: {int(counters['glFinish_calls'])}")
                 print(f"glFinish time: {counters['glFinish_seconds']:.3f}s")
                 print(f"glFlush count: {int(counters['glFlush_calls'])}")
