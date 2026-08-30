@@ -53,7 +53,7 @@ The working MatrixMan backend is currently OpenGL. The following are verified
 hardware results, not a claim that all GPUs from these vendors or families are
 supported:
 
-| Hardware / driver | OpenGL / GLSL | MatrixMan result | YOLO 320 evidence |
+| Hardware / driver | OpenGL / GLSL | MatrixMan result | YOLO 320x320 evidence |
 | --- | --- | --- | --- |
 | Intel GM45 / GMA 4500MHD, Mesa | 2.1 / 1.20 | Compatibility and YOLO path verified; conservative tiling required | historically about 5.4–5.7 s forward |
 | Intel HD Graphics 4400, Mesa i915 | 4.6 compatibility profile / 4.60 | Compatibility suite PASS; 512x512 one-shot Conv PASS; tiling not required by that test | 2.210 s forward, 2.623 s total, about 0.38 FPS |
