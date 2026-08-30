@@ -29,7 +29,7 @@ This is not universal OpenGL magic. Compatibility depends on the driver,
 OpenGL/GLSL version, floating-point texture support, and floating-point
 framebuffer support.
 
-## Current Status
+## Implemented Operation Subset
 
 MatrixMan is experimental and intentionally strict. It implements only the
 operations needed by its current examples and model experiments, including:
@@ -47,39 +47,39 @@ operations needed by its current examples and model experiments, including:
 Unsupported operations fail explicitly. They do not quietly run tensor
 arithmetic on the CPU.
 
-## Tested Hardware
+## Current Status
 
-MatrixMan is currently confirmed working on:
+The working MatrixMan backend is currently OpenGL. The following are verified
+hardware results, not a claim that all GPUs from these vendors or families are
+supported:
 
-```text
-ThinkPad X200
-Intel GMA 4500MHD / GM45
-Mesa
-OpenGL 2.1
-GLSL 1.20
-YOLO inference: working
-```
+| Hardware / driver | OpenGL / GLSL | MatrixMan result | YOLO 320 evidence |
+| --- | --- | --- | --- |
+| Intel GM45 / GMA 4500MHD, Mesa | 2.1 / 1.20 | Compatibility and YOLO path verified; conservative tiling required | historically about 5.4–5.7 s forward |
+| Intel HD Graphics 4400, Mesa i915 | 4.6 compatibility profile / 4.60 | Compatibility suite PASS; 512x512 one-shot Conv PASS; tiling not required by that test | 2.210 s forward, 2.623 s total, about 0.38 FPS |
+| NVIDIA GT 720M / NVD7, Mesa nouveau | 4.3 compatibility profile / 4.30 | Compatibility suite PASS; 512x512 one-shot Conv PASS; tiling not required by that test | 1.519 s forward, 1.975 s total, about 0.51 FPS |
 
-The GM45 can corrupt the large one-shot convolution render path. MatrixMan
-uses physically small convolution tiles, up to 256x256 texels, and has
-validated the tiled path on this machine.
+The GM45 can corrupt large one-shot convolution renders. MatrixMan therefore
+keeps physically small convolution tiles as its production baseline. Newer
+tested GPUs tolerate larger one-shot renders in the compatibility test, but
+that does not change the conservative defaults.
 
 MatrixMan feeds the GM45 smaller tiles. It likes tiny bites.
 
-That is a detected/validated quirk of this path, not a universal limitation of
-all OpenGL GPUs.
+Run the compatibility probe on a new machine before treating its result as
+evidence for a model workload:
 
-Other GPUs are currently unverified. OpenGL support alone does not guarantee
-MatrixMan compatibility: driver behavior, floating-point framebuffer support,
-shader behavior, texture limits, and other implementation details matter.
-Run the compatibility probe before assuming a machine works.
+```bash
+python3 -m drivers.matrixman.compatibility
+```
 
 ### Experimental / Unverified
 
-Older AMD/Radeon hardware, NVIDIA GPUs, Apple GPUs, and Intel GPUs beyond the
-X200's GM45 are portability experiments or future goals, not tested MatrixMan
-platforms. The project is exploring whether such hardware can provide a
-usable graphics-based execution path; in other words, we dont have all the old toys to test with! 
+Other Intel, NVIDIA, AMD/Radeon, Apple, and accelerator configurations remain
+unverified unless listed above. OpenGL support alone does not guarantee
+MatrixMan compatibility: driver behavior, floating-point framebuffer support,
+shader behavior, texture limits, and the supported ATen operator subset all
+matter.
 
 ## Check Compatibility
 
@@ -119,6 +119,35 @@ validated fallback passes.
 See [Compatibility and diagnostics](drivers/matrixman/COMPATIBILITY.md) for
 verified hardware, diagnostic modes, and the GM45 findings behind these
 defaults.
+
+## Architecture
+
+MatrixMan has a small explicit backend interface and currently selects OpenGL
+as its only usable backend. The OpenGL implementation is split into modules
+under `drivers/matrixman/backends/opengl/`:
+
+```text
+backend.py          backend façade and public entrypoint
+runtime.py          SDL/OpenGL context and context-owned lifetime
+resources.py        textures, uploads, readback resources, and caches
+tensor.py           Gm45Tensor and OpenGL texture ownership
+metadata.py         logical views, strides, offsets, and split metadata
+kernels.py          shader/program lookup and shared kernel helpers
+render.py           shared framebuffer and fullscreen-render plumbing
+operation_context.py shared operation services
+diagnostics.py      tracing and unsupported-operation reporting
+profiling.py        timing and OpenGL counters
+factories.py        PyTorch PrivateUse1 factory registration
+dispatch.py         PyTorch/ATen dispatch bridge
+convolution.py      dedicated tiled Conv2D subsystem
+ops/                arithmetic, activation, normalization, pooling, resize,
+                    concat, softmax, and matmul implementations
+```
+
+`implementation.py` is now only a small compatibility re-export façade. It is
+not in the normal runtime execution path. The `backends/cuda/` and
+`backends/opencl/` directories are reserved placeholder packages only; neither
+backend is implemented or selected.
 
 ## Basic PyTorch Usage
 
@@ -193,12 +222,17 @@ attempted when the ATen operations they exercise are supported; this does not
 mean every YOLO or Ultralytics model is supported. The current VisDrone-style
 checkpoint is tested evidence, not a general Ultralytics compatibility claim.
 
+The historical public names `Gm45Tensor`, `to_gm45()`, and device name
+`gm45:0` are retained for compatibility. They identify the current PyTorch
+integration and do not imply that execution is restricted to GM45 hardware.
+
 ### Tested Model Evidence
 
 The project's confirmed real-model validation uses a custom Ultralytics YOLO
-detection checkpoint trained for VisDrone-style detection. The current
-checkpoint has been tested at 320x320 through 640x640 on GM45. VisDrone is
-evidence of a working trained model, not a requirement for using MatrixMan.
+detection checkpoint trained for VisDrone-style detection. The 320x320 timings
+listed above are measurements from the verified OpenGL machines; the older
+GM45 result is historical. VisDrone is evidence of a working trained model,
+not a requirement for using MatrixMan.
 
 ## CPU Fallback Policy
 
@@ -236,10 +270,46 @@ Is an Intel GMA 4500MHD a good neural-network accelerator?
 
 **HAHAHAHAHAHAHAHAHA.**
 
-Performance work is ongoing. Likely areas include synchronization overhead,
-tiled convolution overhead, parameter texture caching, Conv+BatchNorm
-folding, Conv+BatchNorm+SiLU fusion, shader optimization, and reducing
-unnecessary texture consolidation.
+Performance work is ongoing. The reported YOLO timings above are measurements
+from the listed machines and are not benchmarks for other hardware or models.
+The GM45-safe path retains synchronization and tiling overhead even on newer
+tested GPUs because the production defaults must remain correct on GM45.
+
+## Safe Defaults and Compatibility Notes
+
+The conservative production defaults remain:
+
+```text
+MATRIXMAN_TILE_LIMIT=256
+MATRIXMAN_TILE_SYNC=per_tile
+```
+
+The 256x256 physical tile limit and per-tile synchronization are required by
+the validated GM45 behavior. The HD 4400 and GT 720M compatibility tests did
+not require tiling for their 512x512 one-shot checks, but those results do not
+promote larger renders to the general production baseline. Diagnostic tile
+controls remain separate from ordinary model execution.
+
+MatrixMan supports only a deliberately limited set of PyTorch operations and
+tensor shapes. Unsupported operations fail explicitly rather than silently
+performing CPU tensor arithmetic. Model compatibility therefore depends on the
+actual ATen operations exercised by that model.
+
+## Future Backends
+
+The backend layout leaves room for future sibling implementations:
+
+```text
+drivers/matrixman/backends/
+├── opengl/   verified current backend
+├── cuda/     placeholder only; not implemented
+└── opencl/   placeholder only; not implemented
+```
+
+CUDA and OpenCL support are not currently provided. A future backend will need
+its own runtime, resource ownership, tensor representation, dispatch bridge,
+operator implementations, and framework/factory integration. The current
+OpenGL `Gm45Tensor` is not intended to be shared by those backends.
 
 ## What MatrixMan Is Not
 
