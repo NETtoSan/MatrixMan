@@ -13,14 +13,14 @@ env/
 .idea/
 
 # Models / large files
-*.pt
-*.pth
-*.onnx
+# *.pt
+# *.pth
+# *.onnx
 
 # Videos
-*.mp4
-*.avi
-*.mkv
+# *.mp4
+# *.avi
+# *.mkv
 
 # Generated/debug output
 output/
