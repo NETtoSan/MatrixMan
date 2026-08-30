@@ -1,255 +1,126 @@
-# MatrixMan testing guide
+# MatrixMan testing
 
-Run these commands from the repository root. MatrixMan uses its selected
-backend during package startup. On a working OpenGL machine, the normal
-startup lines are:
+Run commands from the repository root. MatrixMan currently selects OpenGL when
+the SDL/OpenGL probe succeeds:
 
 ```text
 MatrixMan probe: OpenCL=not implemented, OpenGL=available
 MatrixMan selected: OpenGL
 ```
 
-This means that OpenGL was probed successfully and selected. The testers use
-real OpenGL rendering; they need SDL2, a usable OpenGL 2.1-compatible context,
-and a graphical environment. In a headless environment they can fail before
-the numerical test with `SDL_Init failed: No available video device`.
+The tests require SDL2, a usable OpenGL context, floating-point texture and
+framebuffer support, and a graphical environment. A headless failure such as
+`SDL_Init failed: No available video device` is an environment failure, not a
+numerical MatrixMan result.
 
-## Start here: matrix multiplication
+## Test layers
 
-### Standalone OpenGL matrix multiplication
+| Layer | Entry point | Purpose |
+| --- | --- | --- |
+| Public demo | `demo/main-tracking.py` | User-facing VisDrone YOLO demonstration. |
+| Benchmark | `drivers/matrixman/benchmarks/yolo_benchmark.py` | Warmed performance runs, profiling, GPU timing, and JSON results. |
+| Diagnostics | `drivers/matrixman/diagnostics/` | Focused correctness, compatibility, address, and stress tests. |
 
-```bash
-python3 drivers/matrixman/backends/opengl/gpumatrix.py
-```
+The public demo deliberately does not expose benchmark warm-up, profiling
+internals, GPU tuning, or diagnostic checkpoint options.
 
-This is the standalone OpenGL/MatrixMan matrix multiplication diagnostic used
-to verify GPU matrix multiplication against a CPU/NumPy reference. It creates
-deterministic `4x4` float32 matrices (`1..16` and `16..1`), stores them in
-RGBA32F textures, executes GLSL 1.20 fragment-shader addition and
-multiplication, reads back the red channel, and reports the maximum absolute
-difference and `np.allclose` result against NumPy.
-
-The old root path `drivers/matrixman/gpumatrix.py` is now a compatibility
-wrapper and is not the executable tester. Use the OpenGL path above.
-
-### MatrixMan PyTorch matmul demo
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_pytorch_demo
-python3 -m drivers.matrixman.diagnostics.gm45_pytorch_demo --trace
-```
-
-This exercises the MatrixMan-facing PyTorch path: CPU float32 tensors are
-uploaded to MatrixMan, `torch.matmul` runs through the selected OpenGL backend,
-and the result is read back explicitly. It generates deterministic random
-`16x16` tensors with `torch.manual_seed(123)`, checks addition, matrix
-multiplication, and a matmul-then-add chain, and compares against CPU PyTorch
-using `torch.allclose(rtol=5e-4, atol=5e-4)`. Successful output reports small
-maximum errors and `matches=True`.
-
-## OpenGL benchmarks and stress tests
-
-### CPU versus GPU matrix multiplication benchmark
-
-```bash
-python3 -m drivers.matrixman.diagnostics.cpu_gpu_benchmark --skip-stress
-python3 -m drivers.matrixman.diagnostics.cpu_gpu_benchmark
-python3 -m drivers.matrixman.diagnostics.cpu_gpu_benchmark --seconds-per-bench 3 --stress-seconds 60
-```
-
-This is a lower-level OpenGL benchmark, not the MatrixMan PyTorch tensor API.
-It tests `256x256` and `512x512` matrices, generated from seeded NumPy uniform
-data. It compares NumPy `A @ B` with GPU shader-only execution and GPU
-execution including uploads/readback. GPU validation uses
-`np.allclose(rtol=5e-4, atol=5e-4)`. The default benchmark duration is three
-seconds per path; `--skip-stress` omits the additional stress phase.
-
-The actual options are `--seconds-per-bench`, `--skip-stress`, and
-`--stress-seconds`.
-
-### Legacy OpenGL matrix stress test
-
-```bash
-python3 -m drivers.matrixman.backends.opengl.gpu_stress --seconds 10 --size 128
-python3 -m drivers.matrixman.backends.opengl.gpu_stress
-```
-
-This directly exercises repeated GLSL add/matmul chains. It prefers a square
-matrix size of `256x256` by default, periodically reads back the GPU result,
-and compares the expected chain against CPU NumPy calculations. It reports
-matmul throughput, estimated GFLOPS, OpenGL errors, and maximum observed
-error. Its options are `--seconds`, `--size`, `--validate-interval`, and
-`--regen-interval`.
-
-## MatrixMan operation diagnostics
-
-These scripts use `drivers.matrixman` and validate a focused supported
-operation by reading the result back and comparing it with a CPU PyTorch
-reference. A successful run generally reports a small `max_abs_error` and
-`allclose: True`. Options shown below are present in the scripts.
-
-| Command | What it checks |
-|---|---|
-| `python3 -m drivers.matrixman.diagnostics.gm45_add_demo`<br>`... --trace` | Packed NCHW addition cases. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_add_strided_demo` | Stride-aware addition used by YOLO decode. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_arange_demo` | Device-side `arange` values and CPU comparison. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_batchnorm_demo`<br>`... --trace` | Eval/inference BatchNorm correctness. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_cat_demo`<br>`... --trace` | Packed NCHW channel concatenation. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_cat_dim1_3d_demo` | Rank-3 channel concatenation for box decode. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_cat_lastdim_demo`<br>`... --trace` | Final-dimension concatenation in the detection head. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_div_demo` | Scalar division for YOLO decode shapes. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_mul_demo` | Broadcast multiplication for YOLO decode; this is elementwise multiplication, not matrix multiplication. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_sigmoid_demo` | Sigmoid on YOLO detection-score shapes. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_silu_demo`<br>`... --trace` | In-place SiLU correctness. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_softmax_demo` | DFL softmax on the traced YOLO shape. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_maxpool_demo`<br>`... --trace` | YOLO-subset max pooling. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_upsample_demo`<br>`... --trace` | YOLO-subset nearest-neighbor upsampling. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_grouped_conv_demo` | Depthwise and general grouped Conv2D regressions. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_split_demo`<br>`... --trace` | Metadata-only split behavior. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_split_3d_demo` | 3D split/chunk behavior for DFL decoding. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_transpose_demo` | Metadata-only transpose and unsqueeze. |
-| `python3 -m drivers.matrixman.diagnostics.gm45_storage_demo`<br>`... --trace` | GPU-resident RGBA32F storage and CPU round trips. |
-
-The `... --trace` notation means append `--trace` to the full command; it is
-not a separate shell command.
-
-## Convolution and address diagnostics
-
-These are more specialized than the ordinary operation tests.
-
-### Basic Conv2D correctness
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_conv_demo
-python3 -m drivers.matrixman.diagnostics.gm45_conv_demo --trace
-```
-
-Runs several supported 1x1 and 3x3 Conv2D cases, with and without bias, and
-compares the read-back result against CPU PyTorch Conv2D.
-
-### Grouped Conv2D
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_grouped_conv_demo
-```
-
-Runs deterministic depthwise and general grouped Conv2D regressions and
-compares them with CPU PyTorch.
-
-### Packed-address diagnostic
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_address_diagnostic
-```
-
-Checks packed RGBA addressing for input, weight, and output shapes, including
-larger YOLO-like tensors. It is an address test and deliberately performs no
-convolution.
-
-### Convolution arithmetic probes
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_conv_arithmetic_diagnostic
-python3 -m drivers.matrixman.diagnostics.gm45_conv_arithmetic_diagnostic --dispatch-only --tiles 1
-python3 -m drivers.matrixman.diagnostics.gm45_conv_arithmetic_diagnostic --dispatch-only --tiles 1 --reuse --reset
-```
-
-These standalone probes isolate shader arithmetic and dispatch behavior. They
-compare selected products/sums or full Conv2D values with CPU PyTorch. The
-normal path explicitly says that MatrixMan convolution is not called.
-`--dispatch-only` is an argv-driven diagnostic mode; it also accepts
-`--tiles N`, `--reset`, and `--reuse`.
-
-### Physical convolution target diagnostic
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_conv_target_diagnostic
-python3 -m drivers.matrixman.diagnostics.gm45_conv_target_diagnostic --production-tiles
-```
-
-Checks framebuffer target sizes and reports completeness, GL errors, and
-numerical comparisons. `--production-tiles` runs the existing tiled production
-path and prints per-tile comparisons. It is a diagnostic of physical targets,
-not a change to production behavior.
-
-### Large Conv2D isolation diagnostic
-
-```bash
-python3 -m drivers.matrixman.diagnostics.gm45_conv_isolation
-```
-
-Runs the exact large Detect-head Conv2D divergence investigation plus synthetic
-regressions. It requires the repository's VisDrone model, Ultralytics, and the
-video/model environment used by the diagnostic.
-
-## Compatibility and YOLO operation discovery
-
-### Compatibility checker
+## Compatibility and core checks
 
 ```bash
 python3 -m drivers.matrixman.compatibility
 python3 -m drivers.matrixman --check
+python3 -m drivers.matrixman.diagnostics.gm45_pytorch_demo
+python3 -m drivers.matrixman.diagnostics.gm45_pytorch_demo --trace
 ```
 
-Reports OpenGL capabilities and runs MatrixMan numerical compatibility checks.
-It requires a working SDL/OpenGL context. Successful output includes the
-detected renderer/version and passing numerical checks.
+The compatibility commands report the active renderer, OpenGL limits,
+numerical checks, and convolution tiling behavior. The PyTorch demo verifies
+MatrixMan tensor upload, matmul, addition, and explicit readback.
 
-### Ultralytics operator discovery
+Focused operation checks include:
 
 ```bash
-python3 -m drivers.matrixman.diagnostics.gm45_yolo_test
-python3 -m drivers.matrixman.diagnostics.gm45_yolo_test --model yolov8n.yaml --imgsz 64 --limit 20
+python3 -m drivers.matrixman.diagnostics.gm45_add_demo
+python3 -m drivers.matrixman.diagnostics.gm45_batchnorm_demo
+python3 -m drivers.matrixman.diagnostics.gm45_cat_demo
+python3 -m drivers.matrixman.diagnostics.gm45_grouped_conv_demo
+python3 -m drivers.matrixman.diagnostics.gm45_silu_demo
+python3 -m drivers.matrixman.diagnostics.gm45_softmax_demo
+python3 -m drivers.matrixman.diagnostics.gm45_maxpool_demo
+python3 -m drivers.matrixman.diagnostics.gm45_upsample_demo
+python3 -m drivers.matrixman.diagnostics.gm45_storage_demo
 ```
 
-This is primarily an operator-inventory tool. It uses Ultralytics plus
-PyTorch FakeTensor/meta execution and a TorchDispatch recorder to identify
-operations needed by YOLO; it does not claim to perform ordinary CPU fallback
-arithmetic. Its options are `--model`, `--imgsz`, and `--limit`.
+Additional address, split, transpose, arithmetic, sigmoid, and concatenation
+diagnostics are available in the same directory. These scripts compare
+read-back GPU results with CPU references where appropriate; unsupported
+tensor arithmetic must fail rather than silently execute on CPU.
 
-## Broader model/inference test
+## Public YOLO demo
 
 ```bash
-python3 demo/main-tracking.py --imgsz 320
+python3 demo/main-tracking.py --imgsz 320 --frames 5 --no-display
 ```
 
-This is substantially broader than matrix multiplication. It loads the
-VisDrone model and video, runs model inference through MatrixMan/OpenGL, and
-exercises the accumulated tensor, convolution, normalization, activation,
-pooling, upsampling, and YOLO decode paths. A successful run reaches model
-loading and inference logs while preserving the existing detailed line:
+Useful options are `--model`, `--video`, `--imgsz`, `--conf`, `--iou`,
+`--frames`, and `--no-display`. The demo loads the VisDrone model and video,
+preprocesses frames, runs inference through MatrixMan, explicitly reads back
+the final output, performs detection postprocessing, and optionally draws
+results. Its output is intentionally concise and user-oriented.
+
+Do not use the public demo as a benchmark or diagnostic harness. Use the
+dedicated runner and scripts below for those purposes.
+
+## YOLO benchmark
+
+The warmed benchmark is documented in [benchmarking.md](benchmarking.md). A
+minimal run is:
+
+```bash
+python3 -m drivers.matrixman.benchmarks.yolo_benchmark \
+  --imgsz 320 --warmup 2 --frames 5 \
+  --env MATRIXMAN_TILE_LIMIT=512 \
+  --env MATRIXMAN_TILE_SYNC=end \
+  --env MATRIXMAN_PROFILE=1 \
+  --env MATRIXMAN_GPU_TIMING=1
+```
+
+## Convolution and specialized diagnostics
+
+```bash
+python3 -m drivers.matrixman.diagnostics.gm45_conv_demo
+python3 -m drivers.matrixman.diagnostics.gm45_conv_target_diagnostic
+python3 -m drivers.matrixman.diagnostics.gm45_conv_target_diagnostic --production-tiles
+python3 -m drivers.matrixman.diagnostics.gm45_conv_isolation
+python3 -m drivers.matrixman.diagnostics.gm45_conv_10a_diagnostic
+python3 -m drivers.matrixman.diagnostics.gm45_address_diagnostic
+```
+
+The Step 10B diagnostic compares baseline GPU Conv with the opt-in spatial
+reuse path on the dominant `[1,64,80,80]` 3×3 workload and also runs a tiny
+deterministic Conv. The address diagnostic does not perform convolution.
+
+For low-level OpenGL checks:
+
+```bash
+python3 drivers/matrixman/backends/opengl/gpumatrix.py
+python3 -m drivers.matrixman.diagnostics.cpu_gpu_benchmark --skip-stress
+python3 -m drivers.matrixman.backends.opengl.gpu_stress --seconds 10 --size 128
+```
+
+The first command is a standalone shader test; the latter two are lower-level
+OpenGL benchmark/stress tools, not public MatrixMan model demonstrations.
+
+## Hardware notes
+
+Verified OpenGL environments include Intel GM45/GMA 4500MHD, Intel HD
+Graphics 4400 with Mesa i915, and NVIDIA GT 720M-class/NVD7 with Mesa
+nouveau. The production-safe defaults remain:
 
 ```text
-backend: MatrixMan / Intel GM45 / OpenGL 2.1 / GLSL 1.20
+MATRIXMAN_TILE_LIMIT=256
+MATRIXMAN_TILE_SYNC=per_tile
 ```
 
-The demo's actual options are `--model`, `--video`, `--imgsz`, `--conf`,
-`--iou`, `--frames`, `--no-display`, `--validate-cpu`,
-`--diagnose-divergence`, and `--diagnostic-checkpoints`. `--imgsz` must be a
-positive multiple of 32 and no larger than 640. The default model/video paths
-are under `demo/`; use `--no-display` for runs where OpenCV windows are not
-available.
-
-The smaller examples are also runnable from the repository root:
-
-```bash
-python3 demo/example/pytorch_example.py
-python3 demo/example/yolo_example.py
-```
-
-They demonstrate MatrixMan tensor use and minimal Ultralytics inference,
-respectively; they are examples rather than dedicated diagnostics.
-
-## What is duplicated or obsolete?
-
-There are two distinct matrix-multiplication paths:
-
-1. `backends/opengl/gpumatrix.py` is the small deterministic `4x4` low-level
-   OpenGL tester.
-2. `diagnostics/gm45_pytorch_demo.py` is the MatrixMan-facing PyTorch `16x16`
-   matmul test.
-
-They overlap in purpose but exercise different layers. The
-`cpu_gpu_benchmark.py` and `backends/opengl/gpu_stress.py` scripts are related
-benchmarks/stress tools, not obsolete copies. The many `gm45_*_demo.py` files
-are focused operation regressions, not alternate matrix multiplication tests.
+Larger tile limits and alternate synchronization modes are experiments for
+specific newer GPUs. They are not GM45-safe defaults.

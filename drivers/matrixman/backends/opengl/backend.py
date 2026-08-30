@@ -3,7 +3,7 @@
 from ...backend import Backend
 from . import diagnostics, factories, gpumatrix as gm, profiling, runtime, tensor as tensor_module
 from . import metadata, operation_context, resources
-from .ops import matmul
+from .ops import matmul, postprocessing
 
 
 class OpenGLBackend(Backend):
@@ -98,6 +98,11 @@ randn = tensor_module.randn
 to_gm45 = tensor_module.to_gm45
 is_gm45_tensor = tensor_module.is_gm45_tensor
 install_tensor_method = tensor_module.install_tensor_method
+
+
+def gpu_postprocess_detection(tensor):
+    """Experimental GPU-side fixed-size detection reduction."""
+    return postprocessing.reduce_detection_output(tensor)
 
 # Narrow compatibility service surface used by convolution.py.  These are
 # direct aliases to the extracted owners, not a second implementation path.

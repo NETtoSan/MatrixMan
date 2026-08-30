@@ -254,18 +254,21 @@ def _run_isolated_one_shot() -> bool:
     return passed
 
 
-def _print_tile_geometry(width_limit: int, height_limit: int, atlas: int = 512) -> None:
+def _print_tile_geometry(width_limit: int, height_limit: int, atlas_width: int, atlas_height: int) -> None:
     tiles = convolution._last_tile_geometry
-    print(f"atlas width/height: {atlas}x{atlas}")
+    print(f"logical output atlas dimensions: {atlas_width}x{atlas_height}")
     print(
         f"diagnostic width/height limit: {width_limit}x{height_limit}\n"
-        f"tile grid: {((atlas + width_limit - 1) // width_limit)}x"
-        f"{((atlas + height_limit - 1) // height_limit)}"
+        f"physical tile grid: {((atlas_width + width_limit - 1) // width_limit)}x"
+        f"{((atlas_height + height_limit - 1) // height_limit)}"
     )
     print(f"tile count: {len(tiles)}")
     if not tiles:
-        print("tile geometry: no physical tiled render recorded")
+        print("execution path: one-shot Conv2D (no physical tiled render)")
+        print("consolidation occurred: no")
         return
+    print("execution path: physical tiled Conv2D")
+    print("consolidation occurred: yes")
     areas = []
     for index, tile in enumerate(tiles):
         width, height = tile["width"], tile["height"]
@@ -512,7 +515,6 @@ def main() -> int:
             if limit <= 0:
                 print("Invalid MATRIXMAN_TILE_LIMIT: must be positive")
                 return 1
-            atlas = 512
             try:
                 diag_width = int(os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH", limit))
                 diag_height = int(os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT", limit))
@@ -522,8 +524,6 @@ def main() -> int:
             if diag_width <= 0 or diag_height <= 0:
                 print("Invalid diagnostic tile dimensions: must be positive")
                 return 1
-            tiles_x = (atlas + diag_width - 1) // diag_width
-            tiles_y = (atlas + diag_height - 1) // diag_height
             workload_name = os.environ.get("MATRIXMAN_DIAG_CONV_WORKLOAD", "heavy").strip().lower() or "heavy"
             try:
                 workload = _diagnostic_workload(workload_name)
@@ -531,7 +531,12 @@ def main() -> int:
                 print(str(exc))
                 return 1
             macs = workload["cin"] * workload["kernel"] * workload["kernel"]
+            logical_numel = workload["cout"] * workload["spatial"] * workload["spatial"]
+            atlas_width, atlas_height = packed_atlas_size(logical_numel)
+            tiles_x = (atlas_width + diag_width - 1) // diag_width
+            tiles_y = (atlas_height + diag_height - 1) // diag_height
             print(f"MATRIXMAN_TILE_LIMIT: {limit}")
+            print(f"MATRIXMAN_TILE_SYNC: {os.environ.get('MATRIXMAN_TILE_SYNC', 'per_tile')}")
             print(f"MATRIXMAN_DIAG_TILE_WIDTH/HEIGHT: {diag_width}x{diag_height}")
             print(f"MATRIXMAN_DIAG_TILE_ORDER: {os.environ.get('MATRIXMAN_DIAG_TILE_ORDER', 'normal')}")
             print(f"MATRIXMAN_DIAG_CONV_WORKLOAD: {workload_name}")
@@ -542,10 +547,11 @@ def main() -> int:
                 f"stride=1 padding={1 if workload['kernel'] == 3 else 0} "
                 f"MACs/output={macs} texture_samples/output={macs}"
             )
-            print(f"physical tile grid: {tiles_x}x{tiles_y} ({tiles_x * tiles_y} tiles)")
+            print(f"logical output atlas dimensions: {atlas_width}x{atlas_height}")
+            print(f"configured physical tile grid: {tiles_x}x{tiles_y} ({tiles_x * tiles_y} tiles)")
             started = time.perf_counter()
             passed = _check(
-                "512x512 production tiled",
+                "Conv2D diagnostic",
                 lambda: _large_conv(
                     workload["spatial"],
                     cin=workload["cin"],
@@ -555,11 +561,13 @@ def main() -> int:
                 ),
             )
             print(f"elapsed: {time.perf_counter() - started:.3f}s")
-            _print_tile_geometry(diag_width, diag_height, atlas)
+            _print_tile_geometry(diag_width, diag_height, atlas_width, atlas_height)
             if backend.profile_enabled():
                 counters = profiling.counters
                 print(f"glFinish count: {int(counters['glFinish_calls'])}")
                 print(f"glFinish time: {counters['glFinish_seconds']:.3f}s")
+                print(f"pre-consolidation glFinish executed: {int(counters['pre_consolidation_sync_calls'])}")
+                print(f"pre-consolidation glFinish skipped: {int(counters['pre_consolidation_sync_skips'])}")
                 print(f"glFlush count: {int(counters['glFlush_calls'])}")
                 print(f"glFlush time: {counters['glFlush_seconds']:.3f}s")
             else:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .. import diagnostics, gpumatrix as gm, operation_context
+from .. import diagnostics, gpumatrix as gm, operation_context, profiling
 from ..kernels import glsl_float as _glsl_float
 from ..storage import contiguous_strides, numel
 from ..tensor import Gm45Tensor
@@ -625,7 +625,8 @@ def _render_cat_dim1_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
         gm.glActiveTexture(unit)
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(uniform, unit - gm.GL_TEXTURE0)
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("Cat"):
+        operation_context.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after 3D dim-1 cat: 0x{err:04x}")
@@ -707,7 +708,8 @@ def _render_cat(args, kwargs) -> "Gm45Tensor":
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("Cat"):
+        operation_context.draw_fullscreen_quad()
     diagnostics.trace(f"gm45.opengl -> submitted cat fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -778,7 +780,8 @@ def _render_cat_dim0_2d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("Cat"):
+        operation_context.draw_fullscreen_quad()
     diagnostics.trace(f"gm45.opengl -> submitted 2D dim-0 cat fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -850,7 +853,8 @@ def _render_cat_lastdim_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("Cat"):
+        operation_context.draw_fullscreen_quad()
     diagnostics.trace(f"gm45.opengl -> submitted 3D last-dim cat fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()

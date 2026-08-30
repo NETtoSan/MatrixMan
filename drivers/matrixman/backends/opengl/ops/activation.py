@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .. import diagnostics, gpumatrix as gm, kernels, operation_context
+from .. import diagnostics, gpumatrix as gm, kernels, operation_context, profiling
 from ..storage import numel
 from ..tensor import Gm45Tensor
 
@@ -114,7 +114,8 @@ def _render_packed_sigmoid(tensor: "Gm45Tensor") -> "Gm45Tensor":
     gm.glActiveTexture(gm.GL_TEXTURE0)
     gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("Sigmoid"):
+        operation_context.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after sigmoid: 0x{err:04x}")
@@ -214,7 +215,8 @@ def _render_silu_inplace(args) -> "Gm45Tensor":
     gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
 
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("SiLU"):
+        operation_context.draw_fullscreen_quad()
     diagnostics.trace(f"gm45.opengl -> submitted SiLU fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()

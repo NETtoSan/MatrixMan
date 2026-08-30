@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .. import diagnostics, gpumatrix as gm, operation_context
+from .. import diagnostics, gpumatrix as gm, operation_context, profiling
 from ..storage import packed_atlas_size
 from ..tensor import Gm45Tensor
 
@@ -170,7 +170,8 @@ def _render_batch_norm(args):
         gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
         gm.glUniform1i(uniform, unit - gm.GL_TEXTURE0)
 
-    operation_context.draw_fullscreen_quad()
+    with profiling.gpu_timer("BatchNorm"):
+        operation_context.draw_fullscreen_quad()
     diagnostics.trace(f"gm45.opengl -> submitted BatchNorm fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -178,4 +179,3 @@ def _render_batch_norm(args):
         raise RuntimeError(f"gm45 OpenGL error after batch_norm: 0x{err:04x}")
     output = Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in input_tensor.shape))
     return output, torch.empty((0,), dtype=torch.float32), torch.empty((0,), dtype=torch.float32)
-

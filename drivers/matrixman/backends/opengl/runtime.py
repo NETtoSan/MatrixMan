@@ -37,6 +37,8 @@ class _GlRuntime:
     upsample_programs: dict[tuple, int]
     arange_programs: dict[tuple, int]
     softmax_programs: dict[tuple, int]
+    postprocess_programs: dict[tuple, int]
+    conv_spatial_programs: dict[tuple, int]
     add_uniforms: dict[int, tuple[int, int]]
     matmul_uniforms: dict[int, tuple[int, int]]
     conv_uniforms: dict[tuple, tuple[int, int, int]]
@@ -61,6 +63,8 @@ class _GlRuntime:
     upsample_uniforms: dict[tuple, int]
     arange_uniforms: dict[tuple, tuple]
     softmax_uniforms: dict[tuple, int]
+    postprocess_uniforms: dict[tuple, int]
+    conv_spatial_uniforms: dict[tuple, tuple[int, int, int]]
     scratch_texture_pool: dict[tuple[int, int], list[int]]
     parameter_cache: dict[tuple, object]
     parameter_cache_current: dict[tuple, tuple]
@@ -103,7 +107,7 @@ def init() -> None:
         packed_sigmoid_programs={}, scalar_add_programs={}, stack_programs={},
         fill_programs={}, cat_programs={}, cat_dim0_2d_programs={},
         cat_lastdim_programs={}, cat_dim1_3d_programs={}, maxpool_programs={},
-        upsample_programs={}, arange_programs={}, softmax_programs={},
+        upsample_programs={}, arange_programs={}, softmax_programs={}, postprocess_programs={}, conv_spatial_programs={},
         add_uniforms={}, matmul_uniforms={}, conv_uniforms={}, conv_tile_uniforms={},
         tile_copy_uniforms={}, batchnorm_uniforms={}, silu_uniforms={},
         packed_add_uniforms={}, packed_sub_uniforms={}, packed_strided_add_uniforms={},
@@ -111,9 +115,11 @@ def init() -> None:
         packed_sigmoid_uniforms={}, scalar_add_uniforms={}, stack_uniforms={},
         fill_uniforms={}, cat_uniforms={}, cat_dim0_2d_uniforms={},
         cat_lastdim_uniforms={}, cat_dim1_3d_uniforms={}, maxpool_uniforms={},
-        upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={},
+        upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={}, postprocess_uniforms={}, conv_spatial_uniforms={},
         scratch_texture_pool={}, parameter_cache={}, parameter_cache_current={},
     )
+    from . import profiling
+    profiling.initialize_gpu_timing()
 
 
 def shutdown() -> None:
@@ -123,6 +129,8 @@ def shutdown() -> None:
         return
 
     from .tensor import live_textures
+    from . import profiling
+    profiling.shutdown_gpu_timing()
 
     for owner in list(live_textures):
         if owner.texture:
@@ -150,6 +158,8 @@ def shutdown() -> None:
         + list(_runtime.cat_lastdim_programs.values()) + list(_runtime.cat_dim1_3d_programs.values())
         + list(_runtime.maxpool_programs.values()) + list(_runtime.upsample_programs.values())
         + list(_runtime.arange_programs.values()) + list(_runtime.softmax_programs.values())
+        + list(_runtime.postprocess_programs.values())
+        + list(_runtime.conv_spatial_programs.values())
     ):
         gm.glDeleteProgram(program)
     gm.glDeleteFramebuffers(1, ctypes.byref(_runtime.fbo))

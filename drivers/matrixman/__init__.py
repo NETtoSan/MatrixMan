@@ -2,6 +2,7 @@
 
 from .gm45_backend import (
     Gm45Tensor,
+    gpu_postprocess_detection,
     debug_enabled,
     init,
     install_tensor_method,
@@ -23,6 +24,7 @@ select_backend()
 
 __all__ = [
     "Gm45Tensor",
+    "gpu_postprocess_detection",
     "debug_enabled",
     "init",
     "install_tensor_method",
