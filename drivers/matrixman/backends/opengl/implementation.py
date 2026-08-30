@@ -46,6 +46,10 @@ from . import gpumatrix as gm
 from . import gpu_stress
 from . import convolution as _convolution
 from . import resources as _resources
+from . import metadata as _metadata
+from . import kernels as _kernels
+from . import render as _render
+from .tensor import Gm45Tensor, _TextureOwner
 from .runtime import (
     _GlRuntime,
     _MAX_PARAMETER_CACHE_ENTRIES,
@@ -66,6 +70,14 @@ _render_convolution_tiled = _convolution._render_convolution_tiled
 _tile_diagnostic_snapshots = _convolution._tile_diagnostic_snapshots
 _last_tile_geometry = _convolution._last_tile_geometry
 _last_tile_output_texture = None
+_is_contiguous_logical = _metadata.is_contiguous_logical
+_require_contiguous_logical = _metadata.require_contiguous_logical
+_normalize_shape = _metadata.normalize_shape
+_metadata_view = _metadata.metadata_view
+_metadata_transpose = _metadata.metadata_transpose
+_metadata_unsqueeze = _metadata.metadata_unsqueeze
+_metadata_squeeze = _metadata.metadata_squeeze
+_metadata_expand = _metadata.metadata_expand
 from .storage import (
     StorageLayout as _StorageLayout,
     contiguous_strides as _contiguous_strides,
@@ -261,20 +273,6 @@ def unsupported_report() -> dict[str, dict]:
     }
 
 
-class _TextureOwner:
-    def __init__(self, texture: int, layout: _StorageLayout):
-        self.texture = texture
-        self.layout = layout
-        _live_textures.add(self)
-
-    def __del__(self):
-        # Best-effort cleanup. Explicit process cleanup is handled by shutdown().
-        if _runtime is not None and self.texture:
-            tex = ctypes.c_uint(self.texture)
-            gm.glDeleteTextures(1, ctypes.byref(tex))
-            self.texture = 0
-
-
 @dataclass
 class _ParameterCacheEntry:
     owner: _TextureOwner
@@ -299,28 +297,7 @@ def _runtime_required():
 
 
 def _program(kind: str, n: int) -> tuple[int, int, int]:
-    rt = _runtime_required()
-    if kind == "add":
-        programs = rt.add_programs
-        uniforms = rt.add_uniforms
-        source = gpu_stress.shader_source(gpu_stress.ADD_SHADER, n)
-    elif kind == "matmul":
-        programs = rt.matmul_programs
-        uniforms = rt.matmul_uniforms
-        source = gpu_stress.shader_source(gpu_stress.MUL_SHADER, n)
-    else:
-        raise AssertionError(kind)
-
-    if n not in programs:
-        _trace(f"gm45.compile -> {kind} GLSL fragment shader for {n}x{n}")
-        program = gm.make_program(source)
-        programs[n] = program
-        uniforms[n] = (
-            gm.glGetUniformLocation(program, b"left_tex"),
-            gm.glGetUniformLocation(program, b"right_tex"),
-        )
-    left_loc, right_loc = uniforms[n]
-    return programs[n], left_loc, right_loc
+    return _kernels.program(kind, n)
 
 
 def _batchnorm_program(params: tuple) -> tuple[int, int, int, int, int, int]:
@@ -558,9 +535,7 @@ def _render_packed_sub(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm45Tensor":
         f"  right texture #{right._owner.texture} shape={list(right.shape)} offset={right._storage_offset} strides={list(right._logical_strides)}\n"
         f"  -> output texture #{out_owner.texture} shape={list(shape)} offset=0"
     )
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError("gm45 packed sub framebuffer incomplete")
     gm.glUseProgram(program)
@@ -570,12 +545,7 @@ def _render_packed_sub(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm45Tensor":
     gm.glActiveTexture(gm.GL_TEXTURE1)
     gm.glBindTexture(gm.GL_TEXTURE_2D, right._owner.texture)
     gm.glUniform1i(right_loc, 1)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after packed sub: 0x{err:04x}")
@@ -681,9 +651,7 @@ def _render_packed_strided_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: f
         f"  right texture #{right._owner.texture} shape={list(shape)} offset={right._storage_offset} strides={list(right._logical_strides)}\n"
         f"  alpha={float(alpha):.10g} -> output texture #{out_owner.texture} offset=0"
     )
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError("gm45 stride-aware packed add framebuffer incomplete")
     gm.glUseProgram(program)
@@ -693,10 +661,7 @@ def _render_packed_strided_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: f
     gm.glActiveTexture(gm.GL_TEXTURE1)
     gm.glBindTexture(gm.GL_TEXTURE_2D, right._owner.texture)
     gm.glUniform1i(right_loc, 1)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after stride-aware packed add: 0x{err:04x}")
@@ -785,19 +750,14 @@ def _render_packed_scalar_div(tensor: "Gm45Tensor", divisor: float) -> "Gm45Tens
         f"  input texture #{tensor._owner.texture} shape={list(tensor.shape)} offset={tensor._storage_offset} strides={list(tensor._logical_strides)}\n"
         f"  divisor={float(divisor):.10g} -> output texture #{out_owner.texture} offset=0"
     )
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError("gm45 scalar div framebuffer incomplete")
     gm.glUseProgram(program)
     gm.glActiveTexture(gm.GL_TEXTURE0)
     gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after scalar div: 0x{err:04x}")
@@ -909,9 +869,7 @@ def _render_packed_broadcast_mul(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm
         f"  right texture #{right._owner.texture} shape={list(right.shape)} offset={right._storage_offset} strides={list(right._logical_strides)}\n"
         f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0"
     )
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError("gm45 broadcast mul framebuffer incomplete")
     gm.glUseProgram(program)
@@ -919,10 +877,7 @@ def _render_packed_broadcast_mul(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm
         gm.glActiveTexture(unit)
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(uniform, unit - gm.GL_TEXTURE0)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after broadcast mul: 0x{err:04x}")
@@ -1021,19 +976,14 @@ def _render_packed_sigmoid(tensor: "Gm45Tensor") -> "Gm45Tensor":
         f"  input texture #{tensor._owner.texture} shape={list(tensor.shape)} offset={tensor._storage_offset} strides={list(tensor._logical_strides)}\n"
         f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0"
     )
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError("gm45 sigmoid framebuffer incomplete")
     gm.glUseProgram(program)
     gm.glActiveTexture(gm.GL_TEXTURE0)
     gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after sigmoid: 0x{err:04x}")
@@ -1851,9 +1801,7 @@ def _render_softmax(args) -> "Gm45Tensor":
         f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 softmax framebuffer incomplete: 0x{status:04x}")
@@ -1863,12 +1811,7 @@ def _render_softmax(args) -> "Gm45Tensor":
     gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted softmax fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -2005,11 +1948,11 @@ void main()
     return source.encode("ascii")
 
 
-def _is_contiguous_logical(tensor: "Gm45Tensor") -> bool:
+def _legacy_is_contiguous_logical(tensor: "Gm45Tensor") -> bool:
     return tensor._logical_strides == _contiguous_strides(tuple(int(v) for v in tensor.shape))
 
 
-def _require_contiguous_logical(tensor: "Gm45Tensor", op_name: str) -> None:
+def _legacy_require_contiguous_logical(tensor: "Gm45Tensor", op_name: str) -> None:
     if not _is_contiguous_logical(tensor):
         raise RuntimeError(
             f"gm45 {op_name} requires contiguous logical storage. "
@@ -2234,7 +2177,7 @@ def _read_texture(
     return result
 
 
-def _normalize_shape(shape_arg, old_numel: int) -> tuple[int, ...]:
+def _legacy_normalize_shape(shape_arg, old_numel: int) -> tuple[int, ...]:
     if isinstance(shape_arg, torch.Size):
         raw = list(shape_arg)
     elif isinstance(shape_arg, (list, tuple)):
@@ -2257,7 +2200,7 @@ def _normalize_shape(shape_arg, old_numel: int) -> tuple[int, ...]:
     return shape
 
 
-def _metadata_view(
+def _legacy_metadata_view(
     tensor: "Gm45Tensor",
     shape: tuple[int, ...],
     op_name: str,
@@ -2275,7 +2218,7 @@ def _metadata_view(
     return Gm45Tensor._from_owner(tensor._owner, shape, tensor._storage_offset, strides)
 
 
-def _metadata_transpose(args) -> "Gm45Tensor":
+def _legacy_metadata_transpose(args) -> "Gm45Tensor":
     tensor = args[0]
     dim0 = int(args[1])
     dim1 = int(args[2])
@@ -2303,7 +2246,7 @@ def _metadata_transpose(args) -> "Gm45Tensor":
     return Gm45Tensor._from_owner(tensor._owner, tuple(shape), tensor._storage_offset, tuple(strides))
 
 
-def _metadata_unsqueeze(tensor: "Gm45Tensor", dim: int) -> "Gm45Tensor":
+def _legacy_metadata_unsqueeze(tensor: "Gm45Tensor", dim: int) -> "Gm45Tensor":
     rank = len(tensor.shape)
     normalized_dim = dim + rank + 1 if dim < 0 else dim
     if normalized_dim < 0 or normalized_dim > rank:
@@ -2317,7 +2260,7 @@ def _metadata_unsqueeze(tensor: "Gm45Tensor", dim: int) -> "Gm45Tensor":
     return _metadata_view(tensor, new_shape, "unsqueeze", new_strides)
 
 
-def _metadata_squeeze(tensor: "Gm45Tensor", dim=None) -> "Gm45Tensor":
+def _legacy_metadata_squeeze(tensor: "Gm45Tensor", dim=None) -> "Gm45Tensor":
     shape = tuple(int(v) for v in tensor.shape)
     strides = tensor._logical_strides
     if dim is None:
@@ -2337,7 +2280,7 @@ def _metadata_squeeze(tensor: "Gm45Tensor", dim=None) -> "Gm45Tensor":
     return _metadata_view(tensor, new_shape, "squeeze", new_strides)
 
 
-def _metadata_expand(args, kwargs) -> "Gm45Tensor":
+def _legacy_metadata_expand(args, kwargs) -> "Gm45Tensor":
     input_tensor = args[0]
     requested = tuple(int(v) for v in args[1])
     implicit = bool(kwargs.get("implicit", args[2] if len(args) > 2 else False))
@@ -2528,9 +2471,7 @@ def _render_binary(kind: str, left: "Gm45Tensor", right: "Gm45Tensor", alpha: fl
         f"{symbol} texture #{right._owner.texture} -> texture #{out_owner.texture}"
     )
 
-    gm.glViewport(0, 0, n, n)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner, n, n)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 framebuffer incomplete: 0x{status:04x}")
@@ -2543,12 +2484,7 @@ def _render_binary(kind: str, left: "Gm45Tensor", right: "Gm45Tensor", alpha: fl
     gm.glBindTexture(gm.GL_TEXTURE_2D, right._owner.texture)
     gm.glUniform1i(right_loc, 1)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted fullscreen quad to GLSL fragment shader, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -2594,9 +2530,7 @@ def _render_scalar_add(tensor: "Gm45Tensor", scalar: float, alpha: float, *, ten
         f"  -> output texture #{out_owner.texture} shape={list(shape)} offset=0"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 scalar add framebuffer incomplete: 0x{status:04x}")
@@ -2606,12 +2540,7 @@ def _render_scalar_add(tensor: "Gm45Tensor", scalar: float, alpha: float, *, ten
     gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted scalar add fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -2651,9 +2580,7 @@ def _render_packed_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: float) ->
         f"  -> output texture #{out_owner.texture} shape={list(shape)}"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 packed add framebuffer incomplete: 0x{status:04x}")
@@ -2666,12 +2593,7 @@ def _render_packed_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: float) ->
     gm.glBindTexture(gm.GL_TEXTURE_2D, right._owner.texture)
     gm.glUniform1i(right_loc, 1)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted packed add fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -2730,9 +2652,7 @@ def _render_stack(args, kwargs) -> "Gm45Tensor":
         f"strides={list(_contiguous_strides(out_shape))} offset=0"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 stack framebuffer incomplete: 0x{status:04x}")
@@ -2743,12 +2663,7 @@ def _render_stack(args, kwargs) -> "Gm45Tensor":
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted stack fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -2794,20 +2709,13 @@ def _render_fill_scalar(args) -> "Gm45Tensor":
         "  note: fill_ updates the wrapper owner to avoid OpenGL FBO feedback hazards"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 fill_ framebuffer incomplete: 0x{status:04x}")
 
     gm.glUseProgram(program)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted fill_ fullscreen quad, replacement texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -2924,9 +2832,7 @@ def _render_cat_dim1_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
         f"  input 1: texture #{tensors[1]._owner.texture} shape={list(shapes[1])} offset={tensors[1]._storage_offset}\n"
         f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0"
     )
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError("gm45 3D dim-1 cat framebuffer incomplete")
     gm.glUseProgram(program)
@@ -2934,10 +2840,7 @@ def _render_cat_dim1_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
         gm.glActiveTexture(unit)
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(uniform, unit - gm.GL_TEXTURE0)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after 3D dim-1 cat: 0x{err:04x}")
@@ -3008,9 +2911,7 @@ def _render_cat(args, kwargs) -> "Gm45Tensor":
     lines.append(f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0")
     _trace("\n".join(lines))
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 cat framebuffer incomplete: 0x{status:04x}")
@@ -3022,12 +2923,7 @@ def _render_cat(args, kwargs) -> "Gm45Tensor":
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted cat fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3087,9 +2983,7 @@ def _render_cat_dim0_2d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
     lines.append(f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0")
     _trace("\n".join(lines))
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 2D dim-0 cat framebuffer incomplete: 0x{status:04x}")
@@ -3101,12 +2995,7 @@ def _render_cat_dim0_2d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted 2D dim-0 cat fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3167,9 +3056,7 @@ def _render_cat_lastdim_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor
     lines.append(f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0")
     _trace("\n".join(lines))
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 3D last-dim cat framebuffer incomplete: 0x{status:04x}")
@@ -3181,12 +3068,7 @@ def _render_cat_lastdim_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor
         gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
         gm.glUniform1i(input_locs[index], index)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted 3D last-dim cat fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3247,9 +3129,7 @@ def _render_max_pool2d_with_indices(args) -> tuple["Gm45Tensor", torch.Tensor]:
         "  indices: CPU empty int64 placeholder; YOLO MaxPool2d(return_indices=False) does not consume it"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 max_pool2d framebuffer incomplete: 0x{status:04x}")
@@ -3259,12 +3139,7 @@ def _render_max_pool2d_with_indices(args) -> tuple["Gm45Tensor", torch.Tensor]:
     gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted max_pool2d fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3326,9 +3201,7 @@ def _render_upsample_nearest2d(args) -> "Gm45Tensor":
         f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 upsample_nearest2d framebuffer incomplete: 0x{status:04x}")
@@ -3338,12 +3211,7 @@ def _render_upsample_nearest2d(args) -> "Gm45Tensor":
     gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted upsample_nearest2d fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3393,20 +3261,13 @@ def _render_arange(start, end, step, *, dtype=None, layout=None, device=None, pi
         f"  -> output texture #{out_owner.texture} shape={list(shape)} offset=0"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 arange framebuffer incomplete: 0x{status:04x}")
 
     gm.glUseProgram(program)
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted arange fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3494,9 +3355,7 @@ def _render_batch_norm(args):
         f"  -> output texture #{out_owner.texture} shape={list(input_tensor.shape)}"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 batch_norm framebuffer incomplete: 0x{status:04x}")
@@ -3513,12 +3372,7 @@ def _render_batch_norm(args):
         gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
         gm.glUniform1i(uniform, unit - gm.GL_TEXTURE0)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted BatchNorm fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3557,9 +3411,7 @@ def _render_silu_inplace(args) -> "Gm45Tensor":
         "  note: aten.silu_ is implemented with a new texture to avoid OpenGL FBO feedback hazards"
     )
 
-    gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
-    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+    _render.attach_output(rt, out_owner)
     status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
         raise RuntimeError(f"gm45 SiLU framebuffer incomplete: 0x{status:04x}")
@@ -3569,12 +3421,7 @@ def _render_silu_inplace(args) -> "Gm45Tensor":
     gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
     gm.glUniform1i(input_loc, 0)
 
-    gm.glBegin(gm.GL_QUADS)
-    gm.glVertex2f(-1.0, -1.0)
-    gm.glVertex2f(1.0, -1.0)
-    gm.glVertex2f(1.0, 1.0)
-    gm.glVertex2f(-1.0, 1.0)
-    gm.glEnd()
+    _render.draw_fullscreen_quad()
     _trace(f"gm45.opengl -> submitted SiLU fullscreen quad, output texture #{out_owner.texture}")
 
     err = gm.glGetError()
@@ -3586,7 +3433,7 @@ def _render_silu_inplace(args) -> "Gm45Tensor":
     return input_tensor
 
 
-class Gm45Tensor(torch.Tensor):
+class _DispatchBridge(torch.Tensor):
     """A strict tensor subclass whose payload is one OpenGL texture."""
 
     @staticmethod
