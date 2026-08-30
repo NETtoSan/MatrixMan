@@ -256,6 +256,25 @@ def _tile_limits() -> tuple[int, int]:
     return width, height
 
 
+def _tile_grid_order(tiles_x: int, tiles_y: int) -> list[tuple[int, int]]:
+    normal = [(tile_x, tile_y) for tile_y in range(tiles_y) for tile_x in range(tiles_x)]
+    if os.environ.get("MATRIXMAN_DIAGNOSTIC_RECT_TILES") != "1":
+        return normal
+    order = os.environ.get("MATRIXMAN_DIAG_TILE_ORDER", "normal").strip().lower() or "normal"
+    if order == "normal":
+        return normal
+    if order == "reverse":
+        return list(reversed(normal))
+    column = [(tile_x, tile_y) for tile_x in range(tiles_x) for tile_y in range(tiles_y)]
+    if order == "column":
+        return column
+    if order == "reverse_column":
+        return list(reversed(column))
+    raise RuntimeError(
+        "MATRIXMAN_DIAG_TILE_ORDER must be one of: normal, reverse, column, reverse_column"
+    )
+
+
 def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params):
     global _last_tile_output_texture
     b = _backend()
@@ -265,6 +284,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
     width_limit, height_limit = _tile_limits()
     tiles_x = math.ceil(full_w / width_limit)
     tiles_y = math.ceil(full_h / height_limit)
+    tile_order = _tile_grid_order(tiles_x, tiles_y)
     if b._profile_enabled:
         b._profile_counters["tiled_conv_calls"] += 1
         b._profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
@@ -281,48 +301,48 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         tile_render_started = time.perf_counter()
         finish_before_tiles = b._profile_counters["glFinish_seconds"]
         flush_before_tiles = b._profile_counters["glFlush_seconds"]
-        for tile_y in range(tiles_y):
+        for render_sequence_index, (tile_x, tile_y) in enumerate(tile_order):
             origin_y = tile_y * height_limit
             tile_h = min(height_limit, full_h - origin_y)
-            for tile_x in range(tiles_x):
-                origin_x = tile_x * width_limit
-                tile_w = min(width_limit, full_w - origin_x)
-                _last_tile_geometry.append({
-                    "grid": (tile_x, tile_y),
-                    "origin": (origin_x, origin_y),
-                    "width": tile_w,
-                    "height": tile_h,
-                    "logical_region": (origin_x, origin_y, tile_w, tile_h),
-                    "texture_size": (tile_w, tile_h),
-                })
-                tile = _new_physical_packed_owner(tile_w, tile_h)
-                tile_owners.append(tile)
-                _last_tile_geometry[-1]["texture"] = tile.texture
-                if b._profile_enabled:
-                    b._profile_counters["tiled_draw_calls"] += 1
-                program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
-                try:
-                    gm.glViewport(0, 0, tile_w, tile_h)
-                    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-                    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
-                    if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
-                        raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
-                    gm.glUseProgram(program)
-                    for unit, texture, uniform in ((gm.GL_TEXTURE0, input_tensor._owner.texture, b"input_tex"), (gm.GL_TEXTURE1, weight_owner.texture, b"weight_tex"), (gm.GL_TEXTURE2, bias_owner.texture, b"bias_tex")):
-                        gm.glActiveTexture(unit)
-                        gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
-                        gm.glUniform1i(gm.glGetUniformLocation(program, uniform), unit - gm.GL_TEXTURE0)
-                    gm.glBegin(gm.GL_QUADS)
-                    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-                    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
-                    if (err := gm.glGetError()):
-                        raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
-                    if sync_mode == "per_tile":
-                        gm.glFinish()
-                    elif sync_mode == "flush":
-                        gm.glFlush()
-                finally:
-                    gm.glDeleteProgram(program)
+            origin_x = tile_x * width_limit
+            tile_w = min(width_limit, full_w - origin_x)
+            _last_tile_geometry.append({
+                "render_sequence_index": render_sequence_index,
+                "grid": (tile_x, tile_y),
+                "origin": (origin_x, origin_y),
+                "width": tile_w,
+                "height": tile_h,
+                "logical_region": (origin_x, origin_y, tile_w, tile_h),
+                "texture_size": (tile_w, tile_h),
+            })
+            tile = _new_physical_packed_owner(tile_w, tile_h)
+            tile_owners.append(tile)
+            _last_tile_geometry[-1]["texture"] = tile.texture
+            if b._profile_enabled:
+                b._profile_counters["tiled_draw_calls"] += 1
+            program = gm.make_program(_conv_tile_shader_source(params, origin_x, origin_y))
+            try:
+                gm.glViewport(0, 0, tile_w, tile_h)
+                gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+                gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
+                if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
+                gm.glUseProgram(program)
+                for unit, texture, uniform in ((gm.GL_TEXTURE0, input_tensor._owner.texture, b"input_tex"), (gm.GL_TEXTURE1, weight_owner.texture, b"weight_tex"), (gm.GL_TEXTURE2, bias_owner.texture, b"bias_tex")):
+                    gm.glActiveTexture(unit)
+                    gm.glBindTexture(gm.GL_TEXTURE_2D, texture)
+                    gm.glUniform1i(gm.glGetUniformLocation(program, uniform), unit - gm.GL_TEXTURE0)
+                gm.glBegin(gm.GL_QUADS)
+                gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
+                gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+                if (err := gm.glGetError()):
+                    raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
+                if sync_mode == "per_tile":
+                    gm.glFinish()
+                elif sync_mode == "flush":
+                    gm.glFlush()
+            finally:
+                gm.glDeleteProgram(program)
         # Diagnostic readback is deliberately delayed until every production
         # tile render has completed. It cannot alter inter-tile scheduling.
         if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
@@ -353,39 +373,12 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         # experiment; the existing post-consolidation barrier remains.
         if sync_mode != "flush":
             gm.glFinish()
-        index = 0
+        tiles_by_grid = {
+            geometry["grid"]: tile
+            for geometry, tile in zip(_last_tile_geometry, tile_owners)
+        }
         consolidation_started = time.perf_counter()
-        for tile_y in range(tiles_y):
-            origin_y = tile_y * height_limit
-            tile_h = min(height_limit, full_h - origin_y)
-            for tile_x in range(tiles_x):
-                origin_x = tile_x * width_limit
-                tile_w = min(width_limit, full_w - origin_x)
-                tile = tile_owners[index]
-                index += 1
-                program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
-                if b._profile_enabled:
-                    b._profile_counters["consolidation_draw_calls"] += 1
-                try:
-                    gm.glViewport(0, 0, full_w, full_h)
-                    gm.gl.glEnable(_GL_SCISSOR_TEST)
-                    gm.gl.glScissor(origin_x, origin_y, tile_w, tile_h)
-                    gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
-                    gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
-                    if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
-                        raise RuntimeError("gm45 tiled convolution output framebuffer incomplete")
-                    gm.glUseProgram(program)
-                    gm.glActiveTexture(gm.GL_TEXTURE0)
-                    gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
-                    gm.glUniform1i(gm.glGetUniformLocation(program, b"tile_tex"), 0)
-                    gm.glBegin(gm.GL_QUADS)
-                    gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
-                    gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
-                    gm.gl.glDisable(_GL_SCISSOR_TEST)
-                    if (err := gm.glGetError()):
-                        raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
-                finally:
-                    gm.glDeleteProgram(program)
+        _consolidate_tiles(tile_owners, _last_tile_geometry, out_owner, full_w, full_h, width_limit, height_limit, rt)
         gm.glFinish()
         if b._profile_enabled:
             b._profile_conv["consolidation"] += time.perf_counter() - consolidation_started
@@ -395,6 +388,44 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
             if tile.texture:
                 texture = ctypes.c_uint(tile.texture)
                 gm.glDeleteTextures(1, ctypes.byref(texture))
+
+
+def _consolidate_tiles(tile_owners, geometries, out_owner, full_w, full_h, width_limit, height_limit, rt):
+    """Run the existing GPU tile-copy pass for production and diagnostics."""
+    b = _backend()
+    tiles_x = math.ceil(full_w / width_limit)
+    tiles_y = math.ceil(full_h / height_limit)
+    tiles_by_grid = {geometry["grid"]: tile for geometry, tile in zip(geometries, tile_owners)}
+    for tile_y in range(tiles_y):
+        origin_y = tile_y * height_limit
+        tile_h = min(height_limit, full_h - origin_y)
+        for tile_x in range(tiles_x):
+            origin_x = tile_x * width_limit
+            tile_w = min(width_limit, full_w - origin_x)
+            tile = tiles_by_grid[(tile_x, tile_y)]
+            program = gm.make_program(_tile_copy_shader_source(tile_w, tile_h, origin_x, origin_y))
+            if b._profile_enabled:
+                b._profile_counters["consolidation_draw_calls"] += 1
+            try:
+                gm.glViewport(0, 0, full_w, full_h)
+                gm.gl.glEnable(_GL_SCISSOR_TEST)
+                gm.gl.glScissor(origin_x, origin_y, tile_w, tile_h)
+                gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+                gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
+                if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError("gm45 tiled convolution output framebuffer incomplete")
+                gm.glUseProgram(program)
+                gm.glActiveTexture(gm.GL_TEXTURE0)
+                gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
+                gm.glUniform1i(gm.glGetUniformLocation(program, b"tile_tex"), 0)
+                gm.glBegin(gm.GL_QUADS)
+                gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
+                gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
+                gm.gl.glDisable(_GL_SCISSOR_TEST)
+                if (err := gm.glGetError()):
+                    raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
+            finally:
+                gm.glDeleteProgram(program)
 
 
 def execute(args):

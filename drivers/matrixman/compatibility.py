@@ -15,12 +15,14 @@ import sys
 import time
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from .storage import pack_linear_rgba
 
 from . import gm45_backend as backend
 from . import gpumatrix as gm
+from .ops import convolution
+from .storage import StorageLayout, pack_linear_rgba, packed_atlas_size
 
 
 GL_VENDOR = 0x1F00
@@ -176,17 +178,42 @@ def _report_physical_tiles(expected: torch.Tensor) -> None:
     print(f"  physical tiles overall: {'PASS' if all_passed else 'FAIL'}")
 
 
-def _large_conv(size: int, *, report_tiles: bool = False) -> bool:
-    torch.manual_seed(453 + size)
-    source = torch.randn((1, 64, size, size), dtype=torch.float32) * 0.05
-    weight = torch.randn((64, 64, 3, 3), dtype=torch.float32) * 0.05
-    expected = F.conv2d(source, weight, padding=1)
-    actual = F.conv2d(backend.to_gm45(source), weight, padding=1).cpu()
+def _large_conv(
+    size: int,
+    *,
+    cin: int = 64,
+    cout: int = 64,
+    kernel: int = 3,
+    report_tiles: bool = False,
+) -> bool:
+    torch.manual_seed(453 + size + cin + cout + kernel)
+    source = torch.randn((1, cin, size, size), dtype=torch.float32) * 0.05
+    weight = torch.randn((cout, cin, kernel, kernel), dtype=torch.float32) * 0.05
+    padding = 1 if kernel == 3 else 0
+    expected = F.conv2d(source, weight, padding=padding)
+    actual = F.conv2d(backend.to_gm45(source), weight, padding=padding).cpu()
     if report_tiles:
         _report_physical_tiles(expected)
-    atlas = size * 4
-    label = f"Consolidated conv atlas {atlas}x{atlas}" if report_tiles else f"Conv atlas {atlas}x{atlas}"
+    atlas = packed_atlas_size(expected.numel())[0]
+    atlas_height = packed_atlas_size(expected.numel())[1]
+    label = f"Consolidated conv atlas {atlas}x{atlas_height}" if report_tiles else f"Conv atlas {atlas}x{atlas_height}"
     return _report_metrics(label, actual, expected)
+
+
+def _diagnostic_workload(name: str) -> dict[str, int]:
+    workloads = {
+        "heavy": {"cin": 64, "cout": 64, "kernel": 3, "spatial": 128},
+        "medium": {"cin": 32, "cout": 32, "kernel": 3, "spatial": 181},
+        "light": {"cin": 16, "cout": 16, "kernel": 3, "spatial": 256},
+        "one_by_one": {"cin": 64, "cout": 64, "kernel": 1, "spatial": 128},
+    }
+    try:
+        return workloads[name]
+    except KeyError as exc:
+        raise RuntimeError(
+            "MATRIXMAN_DIAG_CONV_WORKLOAD must be one of: "
+            "heavy, medium, light, one_by_one"
+        ) from exc
 
 
 def _isolated_one_shot() -> bool:
@@ -244,11 +271,105 @@ def _print_tile_geometry(width_limit: int, height_limit: int, atlas: int = 512) 
         width, height = tile["width"], tile["height"]
         areas.append(width * height)
         print(
-            f"tile {index}: grid={tile['grid']} origin={tile['origin']} "
+            f"render #{tile['render_sequence_index']}: grid={tile['grid']} "
+            f"origin={tile['origin']} "
             f"physical_size={width}x{height} "
             f"logical/output region={tile['logical_region']} "
             f"texture=#{tile.get('texture', 'unknown')} size={tile['texture_size']}"
         )
+
+
+def _consolidation_pattern(atlas: int) -> np.ndarray:
+    """Create a deterministic packed RGBA atlas with coordinate-coded values."""
+    y, x, component = np.indices((atlas, atlas, 4), dtype=np.float32)
+    return y * 0.001 + x * 0.000001 + component * 0.1
+
+
+def _consolidation_metrics(actual: np.ndarray, expected: np.ndarray) -> tuple[float, float, float, bool]:
+    error = torch.from_numpy(actual - expected).to(torch.float64)
+    max_abs = float(error.abs().max()) if error.numel() else 0.0
+    mean_abs = float(error.abs().mean()) if error.numel() else 0.0
+    rmse = float(error.square().mean().sqrt()) if error.numel() else 0.0
+    passed = bool(torch.allclose(torch.from_numpy(actual), torch.from_numpy(expected), rtol=1e-6, atol=1e-6))
+    return max_abs, mean_abs, rmse, passed
+
+
+def _test_consolidation() -> bool:
+    atlas = 512
+    width_limit = int(os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH", 256))
+    height_limit = int(os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT", 256))
+    if width_limit <= 0 or height_limit <= 0:
+        raise RuntimeError("diagnostic tile dimensions must be positive")
+    tiles_x = (atlas + width_limit - 1) // width_limit
+    tiles_y = (atlas + height_limit - 1) // height_limit
+    pattern = _consolidation_pattern(atlas)
+    tile_owners = []
+    destination = None
+    geometries = []
+    print("MatrixMan standalone consolidation test")
+    print(f"atlas: {atlas}x{atlas}")
+    print(f"tile limits: {width_limit}x{height_limit}")
+    print(f"tile grid: {tiles_x}x{tiles_y} ({tiles_x * tiles_y} tiles)")
+    try:
+        for tile_y in range(tiles_y):
+            origin_y = tile_y * height_limit
+            tile_h = min(height_limit, atlas - origin_y)
+            for tile_x in range(tiles_x):
+                origin_x = tile_x * width_limit
+                tile_w = min(width_limit, atlas - origin_x)
+                tile_data = np.ascontiguousarray(pattern[origin_y:origin_y + tile_h, origin_x:origin_x + tile_w])
+                texture = backend._create_rgba32f_texture(tile_w, tile_h, tile_data)
+                owner = backend._TextureOwner(
+                    texture, StorageLayout("packed_rgba", tile_w, tile_h, tile_w * tile_h * 4)
+                )
+                tile_owners.append(owner)
+                geometries.append({
+                    "grid": (tile_x, tile_y),
+                    "origin": (origin_x, origin_y),
+                    "width": tile_w,
+                    "height": tile_h,
+                    "texture": texture,
+                })
+        for geometry, owner in zip(geometries, tile_owners):
+            uploaded = backend._read_texture(
+                owner, (1, 1, geometry["height"], geometry["width"] * 4)
+            ).reshape(geometry["height"], geometry["width"], 4).numpy()
+            expected = pattern[
+                geometry["origin"][1]:geometry["origin"][1] + geometry["height"],
+                geometry["origin"][0]:geometry["origin"][0] + geometry["width"],
+            ]
+            _, _, _, passed = _consolidation_metrics(uploaded, expected)
+            print(f"source tile grid={geometry['grid']} texture=#{owner.texture} upload={'PASS' if passed else 'FAIL'}")
+            if not passed:
+                return False
+
+        destination_texture = backend._create_rgba32f_texture(atlas, atlas)
+        destination = backend._TextureOwner(
+            destination_texture,
+            StorageLayout("packed_rgba", atlas, atlas, atlas * atlas * 4),
+        )
+        runtime = backend._runtime_required()
+        gm.glFinish()
+        convolution._consolidate_tiles(
+            tile_owners, geometries, destination, atlas, atlas,
+            width_limit, height_limit, runtime,
+        )
+        gm.glFinish()
+        actual = backend._read_texture(
+            destination, (1, 1, atlas, atlas * 4)
+        ).reshape(atlas, atlas, 4).numpy()
+        max_abs, mean_abs, rmse, passed = _consolidation_metrics(actual, pattern)
+        print(f"destination texture=#{destination.texture}")
+        print(f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} rmse={rmse:.6g}")
+        print(f"consolidation: {'PASS' if passed else 'FAIL'}")
+        return passed
+    finally:
+        for owner in tile_owners:
+            texture = ctypes.c_uint(owner.texture)
+            gm.glDeleteTextures(1, ctypes.byref(texture))
+        if destination is not None:
+            texture = ctypes.c_uint(destination.texture)
+            gm.glDeleteTextures(1, ctypes.byref(texture))
     widths = [tile["width"] for tile in tiles]
     heights = [tile["height"] for tile in tiles]
     remainder_width = atlas % width_limit or width_limit
@@ -403,11 +524,36 @@ def main() -> int:
                 return 1
             tiles_x = (atlas + diag_width - 1) // diag_width
             tiles_y = (atlas + diag_height - 1) // diag_height
+            workload_name = os.environ.get("MATRIXMAN_DIAG_CONV_WORKLOAD", "heavy").strip().lower() or "heavy"
+            try:
+                workload = _diagnostic_workload(workload_name)
+            except RuntimeError as exc:
+                print(str(exc))
+                return 1
+            macs = workload["cin"] * workload["kernel"] * workload["kernel"]
             print(f"MATRIXMAN_TILE_LIMIT: {limit}")
             print(f"MATRIXMAN_DIAG_TILE_WIDTH/HEIGHT: {diag_width}x{diag_height}")
+            print(f"MATRIXMAN_DIAG_TILE_ORDER: {os.environ.get('MATRIXMAN_DIAG_TILE_ORDER', 'normal')}")
+            print(f"MATRIXMAN_DIAG_CONV_WORKLOAD: {workload_name}")
+            print(
+                f"Conv2D: input=[1,{workload['cin']},{workload['spatial']},{workload['spatial']}] "
+                f"weight=[{workload['cout']},{workload['cin']},{workload['kernel']},{workload['kernel']}] "
+                f"kernel={workload['kernel']}x{workload['kernel']} groups=1 "
+                f"stride=1 padding={1 if workload['kernel'] == 3 else 0} "
+                f"MACs/output={macs} texture_samples/output={macs}"
+            )
             print(f"physical tile grid: {tiles_x}x{tiles_y} ({tiles_x * tiles_y} tiles)")
             started = time.perf_counter()
-            passed = _check("512x512 production tiled", lambda: _large_conv(128, report_tiles=True))
+            passed = _check(
+                "512x512 production tiled",
+                lambda: _large_conv(
+                    workload["spatial"],
+                    cin=workload["cin"],
+                    cout=workload["cout"],
+                    kernel=workload["kernel"],
+                    report_tiles=True,
+                ),
+            )
             print(f"elapsed: {time.perf_counter() - started:.3f}s")
             _print_tile_geometry(diag_width, diag_height, atlas)
             if backend.profile_enabled():
@@ -420,6 +566,12 @@ def main() -> int:
                 print("glFinish counters: unavailable (set MATRIXMAN_PROFILE=1)")
             print(f"Result: {'PASS' if passed else 'FAIL'}")
             return 0 if passed else 1
+        finally:
+            backend.shutdown()
+    if "--test-consolidation" in sys.argv:
+        backend.set_trace(False)
+        try:
+            return 0 if _test_consolidation() else 1
         finally:
             backend.shutdown()
     backend.set_trace(False)
