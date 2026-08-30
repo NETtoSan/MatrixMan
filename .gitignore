@@ -27,6 +27,7 @@ output/
 outputs/
 runs/
 *.log
+textlogs/*.txt
 
 # OS
 .DS_Store

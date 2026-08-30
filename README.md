@@ -116,6 +116,10 @@ MatrixMan status: COMPATIBLE
 An optional fast path can fail while MatrixMan remains compatible when its
 validated fallback passes.
 
+See [Compatibility and diagnostics](drivers/matrixman/COMPATIBILITY.md) for
+verified hardware, diagnostic modes, and the GM45 findings behind these
+defaults.
+
 ## Basic PyTorch Usage
 
 Application code only needs the public package entry point:

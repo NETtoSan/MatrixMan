@@ -19,6 +19,7 @@ from .. import gpumatrix as gm
 from ..storage import StorageLayout, packed_atlas_size
 
 
+# Conservative GM45-validated default; larger physical draws may be unstable.
 CONV_PHYSICAL_TILE_LIMIT = 256
 _tile_diagnostic_snapshots: list[dict] = []
 _last_tile_geometry: list[dict] = []
