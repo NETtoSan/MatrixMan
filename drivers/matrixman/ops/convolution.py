@@ -230,7 +230,7 @@ void main() {{
 
 def _new_physical_packed_owner(width: int, height: int):
     b = _backend()
-    texture = b._create_rgba32f_texture(width, height)
+    texture = b._acquire_scratch_texture(width, height)
     return b._TextureOwner(texture, StorageLayout("packed_rgba", width, height, width * height * 4))
 
 
@@ -418,9 +418,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         return b.Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
     finally:
         for tile in tile_owners:
-            if tile.texture:
-                texture = ctypes.c_uint(tile.texture)
-                gm.glDeleteTextures(1, ctypes.byref(texture))
+            b._release_scratch_texture(tile)
 
 
 def _consolidate_tiles(tile_owners, geometries, out_owner, full_w, full_h, width_limit, height_limit, rt):

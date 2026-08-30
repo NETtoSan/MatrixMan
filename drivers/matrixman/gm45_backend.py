@@ -170,10 +170,12 @@ class _GlRuntime:
     upsample_uniforms: dict[tuple, int]
     arange_uniforms: dict[tuple, tuple]
     softmax_uniforms: dict[tuple, int]
+    scratch_texture_pool: dict[tuple[int, int], list[int]]
 
 
 _runtime: _GlRuntime | None = None
 _live_textures: weakref.WeakSet["_TextureOwner"] = weakref.WeakSet()
+_MAX_SCRATCH_TEXTURES = 32
 
 
 def _env_flag(name: str) -> bool:
@@ -380,6 +382,7 @@ def init() -> None:
         upsample_uniforms={},
         arange_uniforms={},
         softmax_uniforms={},
+        scratch_texture_pool={},
     )
 
 
@@ -393,6 +396,11 @@ def shutdown() -> None:
             tex = ctypes.c_uint(owner.texture)
             gm.glDeleteTextures(1, ctypes.byref(tex))
             owner.texture = 0
+    for textures in _runtime.scratch_texture_pool.values():
+        for texture in textures:
+            texture_id = ctypes.c_uint(texture)
+            gm.glDeleteTextures(1, ctypes.byref(texture_id))
+    _runtime.scratch_texture_pool.clear()
     for program in (
         list(_runtime.add_programs.values())
         + list(_runtime.matmul_programs.values())
@@ -2182,6 +2190,42 @@ def _create_rgba32f_texture(width: int, height: int, data: np.ndarray | None = N
     if _profile_enabled and data is not None:
         _profile_counters["texture_upload_seconds"] += time.perf_counter() - upload_started
     return texture.value
+
+
+def _acquire_scratch_texture(width: int, height: int) -> int:
+    """Acquire a context-local, empty RGBA32F texture for temporary work."""
+    rt = _runtime_required()
+    key = (int(width), int(height))
+    pooled = rt.scratch_texture_pool.get(key)
+    if pooled:
+        texture = pooled.pop()
+        if _profile_enabled:
+            _profile_counters["scratch_texture_reuses"] += 1
+        return texture
+    if _profile_enabled:
+        _profile_counters["scratch_texture_allocations"] += 1
+    return _create_rgba32f_texture(width, height)
+
+
+def _release_scratch_texture(owner: _TextureOwner) -> None:
+    """Return a no-longer-live scratch owner to this runtime's bounded pool."""
+    texture = owner.texture
+    owner.texture = 0
+    if not texture or _runtime is None:
+        return
+    rt = _runtime
+    key = (owner.layout.texture_width, owner.layout.texture_height)
+    pooled = rt.scratch_texture_pool.setdefault(key, [])
+    pooled_count = sum(len(textures) for textures in rt.scratch_texture_pool.values())
+    if pooled_count >= _MAX_SCRATCH_TEXTURES:
+        texture_id = ctypes.c_uint(texture)
+        gm.glDeleteTextures(1, ctypes.byref(texture_id))
+        if _profile_enabled:
+            _profile_counters["scratch_texture_evictions"] += 1
+        return
+    pooled.append(texture)
+    if _profile_enabled:
+        _profile_counters["scratch_texture_releases"] += 1
 
 
 def _upload_array_to_texture(array: np.ndarray) -> _TextureOwner:
