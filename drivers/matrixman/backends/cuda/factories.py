@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -127,6 +129,62 @@ def empty_strided_cuda(
         raise
 
 
+def _arange_count(start: float, end: float, step: float) -> int:
+    if step == 0:
+        raise ValueError("MatrixMan/CUDA: torch.arange step must be nonzero")
+    distance = (end - start) / step
+    return max(0, int(math.ceil(distance))) if distance > 0 else 0
+
+
+def _arange_cuda(start, end, step=1, *, dtype=None, layout=None, device=None, pin_memory=False):
+    _validate_options("torch.arange", dtype, layout, device, pin_memory)
+    dtype = _dtype_or_default(dtype)
+    if dtype != torch.float32:
+        raise NotImplementedError(
+            f"MatrixMan/CUDA: torch.arange supports float32 only, got {dtype}"
+        )
+    start = float(start)
+    end = float(end)
+    step = float(step)
+    count = _arange_count(start, end, step)
+    output = empty_strided_cuda(
+        (count,),
+        (1,),
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+    )
+    if count:
+        backend = _cuda_context()
+        try:
+            backend.execution.arange(output._owner.pointer, start, step, count)
+        except Exception:
+            output._owner.release()
+            raise
+    return output
+
+
+def arange_cuda(end, *, dtype=None, layout=None, device=None, pin_memory=False):
+    return _arange_cuda(
+        0, end, 1, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+def arange_start_cuda(start, end, *, dtype=None, layout=None, device=None, pin_memory=False):
+    return _arange_cuda(
+        start, end, 1, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+def arange_start_step_cuda(
+    start, end, step=1, *, dtype=None, layout=None, device=None, pin_memory=False
+):
+    return _arange_cuda(
+        start, end, step, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
 def install_privateuse1_factory_kernels() -> None:
     global _aten_privateuse1_lib
     if _aten_privateuse1_lib is not None:
@@ -135,7 +193,7 @@ def install_privateuse1_factory_kernels() -> None:
     lib = torch.library.Library("aten", "IMPL", "PrivateUse1")
     lib.impl("empty.memory_format", empty_cuda)
     lib.impl("empty_strided", empty_strided_cuda)
-    lib.impl("arange", _unsupported("torch.arange"))
-    lib.impl("arange.start", _unsupported("torch.arange"))
-    lib.impl("arange.start_step", _unsupported("torch.arange"))
+    lib.impl("arange", arange_cuda)
+    lib.impl("arange.start", arange_start_cuda)
+    lib.impl("arange.start_step", arange_start_step_cuda)
     _aten_privateuse1_lib = lib

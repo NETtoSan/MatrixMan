@@ -19,6 +19,8 @@ class BackendCapability:
     available: bool
     enabled: bool
     implemented: bool
+    probed: bool = True
+    probe_reason: str | None = None
     backend: type[Backend] | None = None
     device: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
@@ -51,6 +53,7 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
             available=cuda_info is not None,
             enabled=True,
             implemented=True,
+            probed=True,
             backend=CudaBackend,
             device=cuda_info["name"] if cuda_info else None,
             metadata={"compute_capability": cuda_info["compute_capability"]}
@@ -62,6 +65,12 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
             available=opengl_available,
             enabled=True,
             implemented=True,
+            probed=opengl_backend is not None,
+            probe_reason=(
+                "CUDA selected before OpenGL probe"
+                if opengl_backend is None and cuda_info is not None and requested != "opengl"
+                else None
+            ),
             backend=opengl_backend,
         ),
         "opencl": BackendCapability(
@@ -73,6 +82,8 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
 def _status(capability: BackendCapability) -> str:
     if capability.name == "opencl" and not capability.implemented:
         return "not implemented"
+    if not capability.probed:
+        return "skipped"
     return "available" if capability.available else "unavailable"
 
 
@@ -86,6 +97,8 @@ def _print_probe(capabilities: dict[str, BackendCapability]) -> None:
             print(f"    device: {capability.device}")
         if capability.metadata.get("compute_capability"):
             print(f"    compute capability: {capability.metadata['compute_capability']}")
+        if capability.probe_reason:
+            print(f"    reason: {capability.probe_reason}")
 
 
 def name_label(name: str) -> str:

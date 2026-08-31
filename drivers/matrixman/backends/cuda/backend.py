@@ -5,7 +5,9 @@ from dataclasses import dataclass
 import torch
 
 from ...backend import Backend
+from ...tensor import contiguous_strides
 from . import factories
+from . import profiling
 from .gpumatrix import CudaExecutionBackend, check as check_cuda, detect_device
 
 
@@ -79,6 +81,7 @@ def upload_tensor(data: torch.Tensor, execution: CudaExecutionBackend) -> CudaTe
         raise RuntimeError("MatrixMan/CUDA: tensor upload requires a contiguous tensor")
     array = data.detach().numpy()
     pointer = execution.to_device(array)
+    profiling.count_activation("uploads", array.nbytes)
     return CudaTensorOwner(execution, pointer, tuple(data.shape), tuple(data.stride()))
 
 
@@ -90,6 +93,9 @@ class CudaBackend(Backend):
     def __init__(self):
         factories.install_privateuse1_factory_kernels()
         self.execution = CudaExecutionBackend()
+        # Raw parameter pointers are owned by this backend for its lifetime;
+        # activation/output owners remain independently managed by tensors.
+        self._parameter_cache = {}
 
     def device_info(self) -> dict[str, str]:
         return {
@@ -105,6 +111,46 @@ class CudaBackend(Backend):
             self.execution.driver.cuCtxSynchronize(),
             "cuCtxSynchronize",
         )
+
+    @staticmethod
+    def _parameter_cache_key(value: torch.Tensor):
+        try:
+            storage_pointer = int(value.untyped_storage().data_ptr())
+        except AttributeError:
+            storage_pointer = int(value.storage().data_ptr())
+        return (
+            storage_pointer,
+            int(value.storage_offset()),
+            tuple(int(item) for item in value.shape),
+            tuple(int(item) for item in value.stride()),
+            str(value.dtype),
+            value.device.type,
+        )
+
+    def _cached_parameter(self, value: torch.Tensor):
+        """Return a persistent device pointer and whether it was uploaded."""
+        key = self._parameter_cache_key(value)
+        version = int(value._version)
+        entry = self._parameter_cache.get(key)
+        if entry is not None and entry[1] == version:
+            profiling.parameter_cache_event("hits")
+            return entry[2], False
+
+        if entry is not None:
+            self.execution.free(entry[2])
+            profiling.parameter_cache_adjust("retained_allocations", -1)
+            profiling.parameter_cache_adjust("retained_bytes", -entry[3])
+
+        pointer = self.execution.to_device(value.detach().numpy())
+        nbytes = int(value.numel() * value.element_size())
+        # Keep the source tensor alive while its storage identity is cached.
+        # This prevents a later CPU allocation from reusing the same data_ptr
+        # and accidentally matching a stale cache entry.
+        self._parameter_cache[key] = (value, version, pointer, nbytes)
+        profiling.parameter_cache_event("misses")
+        profiling.parameter_cache_adjust("retained_allocations", 1)
+        profiling.parameter_cache_adjust("retained_bytes", nbytes)
+        return pointer, True
 
     def convolution(self, input_tensor, weight, bias, stride, padding, dilation, groups):
         """Execute a float32 NCHW convolution entirely through CUDA storage."""
@@ -141,21 +187,32 @@ class CudaBackend(Backend):
         out_w = (w + 2 * pad_w - dilation_w * (s - 1) - 1) // stride_w + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError("MatrixMan/CUDA: convolution output dimensions must be positive")
+        specialized = (
+            c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
 
-        weight_pointer = self.execution.to_device(weight.detach().numpy())
+        weight_pointer, weight_uploaded = self._cached_parameter(weight)
+        if weight_uploaded:
+            profiling.count_conv2d("weight_uploads", weight.numel() * weight.element_size())
         bias_pointer = None
         output_pointer = None
         try:
-            bias_pointer = (
-                self.execution.to_device(bias.detach().numpy())
-                if bias is not None
-                else type(input_tensor._owner.pointer)()
-            )
+            if bias is not None:
+                bias_pointer, bias_uploaded = self._cached_parameter(bias)
+                if bias_uploaded:
+                    profiling.count_conv2d("bias_uploads", bias.numel() * bias.element_size())
+            else:
+                bias_pointer = type(input_tensor._owner.pointer)()
             output_pointer = self.execution.allocate(n * k * out_h * out_w * 4)
+            profiling.count_conv2d("output_allocations", n * k * out_h * out_w * 4)
             self.execution.convolution(
                 input_tensor._owner.pointer, weight_pointer, bias_pointer, output_pointer,
                 n, c, h, w, k, r, s, out_h, out_w,
                 stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
+                specialized=specialized,
             )
             strides = (k * out_h * out_w, out_h * out_w, out_w, 1)
             return CudaTensorOwner(
@@ -168,10 +225,6 @@ class CudaBackend(Backend):
             if output_pointer is not None:
                 self.execution.free(output_pointer)
             raise
-        finally:
-            self.execution.free(weight_pointer)
-            if bias_pointer is not None and bias_pointer.value:
-                self.execution.free(bias_pointer)
 
     def batch_norm(self, input_tensor, weight, bias, running_mean, running_var, training, eps):
         """Execute inference-only float32 NCHW BatchNorm in CUDA storage."""
@@ -206,13 +259,12 @@ class CudaBackend(Backend):
             raise ValueError("MatrixMan/CUDA: BatchNorm epsilon must be non-negative")
 
         parameter_pointers = []
-        try:
-            for value in (running_mean, running_var, weight, bias):
-                parameter_pointers.append(self.execution.to_device(value.numpy()))
-        except Exception:
-            for pointer in parameter_pointers:
-                self.execution.free(pointer)
-            raise
+        profiling.count_batch_norm("invocations")
+        for value in (running_mean, running_var, weight, bias):
+            pointer, uploaded = self._cached_parameter(value)
+            parameter_pointers.append(pointer)
+            if uploaded:
+                profiling.count_batch_norm("parameter_uploads", value.numel() * value.element_size())
         output_pointer = None
         try:
             output_pointer = self.execution.allocate(n * channels * height * width * 4)
@@ -239,9 +291,36 @@ class CudaBackend(Backend):
             if output_pointer is not None:
                 self.execution.free(output_pointer)
             raise
-        finally:
-            for pointer in parameter_pointers:
-                self.execution.free(pointer)
+
+    def sigmoid(self, input_tensor):
+        """Execute float32 sigmoid on a readable CUDA logical layout."""
+        if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
+            raise RuntimeError("MatrixMan/CUDA: sigmoid requires a CUDA-backed MatrixManTensor")
+        if input_tensor.dtype != torch.float32:
+            raise NotImplementedError("MatrixMan/CUDA: sigmoid supports float32 tensors only")
+        shape = tuple(int(value) for value in input_tensor.shape)
+        if not 1 <= len(shape) <= 4:
+            raise NotImplementedError("MatrixMan/CUDA: sigmoid supports tensor ranks 1 through 4")
+        strides = tuple(int(value) for value in input_tensor._logical_strides)
+        if any(value < 0 for value in strides):
+            raise NotImplementedError("MatrixMan/CUDA: sigmoid does not support negative logical strides")
+        if input_tensor._owner.execution is not self.execution:
+            raise RuntimeError("MatrixMan/CUDA: sigmoid tensor uses a different CUDA execution context")
+        padding = 4 - len(shape)
+        output_pointer = self.execution.allocate(_numel(shape) * 4)
+        try:
+            self.execution.sigmoid(
+                input_tensor._owner.pointer,
+                output_pointer,
+                _numel(shape),
+                (1,) * padding + shape,
+                (0,) * padding + strides,
+                int(input_tensor._storage_offset),
+            )
+            return CudaTensorOwner(self.execution, output_pointer, shape, contiguous_strides(shape))
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
 
     def silu(self, input_tensor, inplace=False):
         """Execute float32 SiLU, optionally mutating the existing CUDA storage."""
@@ -286,13 +365,11 @@ class CudaBackend(Backend):
         rank = len(shape)
         if rank < 1 or rank > 4:
             raise NotImplementedError("MatrixMan/CUDA: split supports tensor ranks 1 through 4")
-        expected_strides = []
-        stride = 1
-        for size in reversed(shape):
-            expected_strides.insert(0, stride)
-            stride *= size
-        if tuple(input_tensor._owner.strides) != tuple(expected_strides):
-            raise NotImplementedError("MatrixMan/CUDA: split requires contiguous tensors")
+        input_strides = tuple(int(value) for value in input_tensor._logical_strides)
+        if len(input_strides) != rank or any(value < 0 for value in input_strides):
+            raise NotImplementedError("MatrixMan/CUDA: split requires non-negative logical strides")
+        if input_tensor._owner.execution is not self.execution:
+            raise RuntimeError("MatrixMan/CUDA: split tensor uses a different CUDA execution context")
         split_size = int(split_size)
         if split_size <= 0:
             raise ValueError("MatrixMan/CUDA: split size must be positive")
@@ -308,6 +385,7 @@ class CudaBackend(Backend):
             for start in range(0, split_axis_size, split_size)
         ]
         padded_input = (1,) * (4 - rank) + shape
+        padded_input_strides = (0,) * (4 - rank) + input_strides
         padded_dimension = dimension + 4 - rank
         owners = []
         offset = 0
@@ -317,13 +395,18 @@ class CudaBackend(Backend):
                 padded_output = (1,) * (4 - rank) + output_shape
                 output_pointer = self.execution.allocate(_numel(output_shape) * 4)
                 try:
+                    input_pointer = type(input_tensor._owner.pointer)(
+                        input_tensor._owner.pointer.value
+                        + int(input_tensor._storage_offset) * 4
+                    )
                     self.execution.split_copy(
-                        input_tensor._owner.pointer,
+                        input_pointer,
                         output_pointer,
                         _numel(output_shape),
                         padded_dimension,
                         offset,
                         padded_input,
+                        padded_input_strides,
                         padded_output,
                     )
                 except Exception:
@@ -345,46 +428,232 @@ class CudaBackend(Backend):
         return owners
 
     def add(self, left, right, alpha=1):
-        """Execute contiguous float32 tensor addition through matrix_add."""
-        for name, tensor in (("left", left), ("right", right)):
-            if not hasattr(tensor, "_owner") or tensor._owner.layout.kind != "cuda_linear":
-                raise RuntimeError(f"MatrixMan/CUDA: add {name} must be CUDA-backed")
-            if tensor.dtype != torch.float32:
-                raise NotImplementedError("MatrixMan/CUDA: add supports float32 tensors only")
-            if not isinstance(tensor.shape, torch.Size):
-                raise RuntimeError("MatrixMan/CUDA: add received invalid tensor metadata")
-        if tuple(left.shape) != tuple(right.shape):
-            raise NotImplementedError("MatrixMan/CUDA: add broadcasting is not implemented; shapes must match")
-        shape = tuple(int(value) for value in left.shape)
-        left_strides = tuple(int(value) for value in left._owner.strides)
-        right_strides = tuple(int(value) for value in right._owner.strides)
+        """Execute float32 tensor or scalar addition on CUDA."""
+        left_is_tensor = hasattr(left, "_owner")
+        right_is_tensor = hasattr(right, "_owner")
+        if left_is_tensor and right_is_tensor:
+            tensor = left
+            other = right
+        elif left_is_tensor:
+            tensor = left
+            other = right
+        elif right_is_tensor:
+            tensor = right
+            other = left
+        else:
+            raise RuntimeError("MatrixMan/CUDA: add requires a MatrixMan tensor operand")
+        if tensor._owner.layout.kind != "cuda_linear":
+            raise RuntimeError("MatrixMan/CUDA: add tensor must be CUDA-backed")
+        if tensor.dtype != torch.float32:
+            raise NotImplementedError("MatrixMan/CUDA: add supports float32 tensors only")
+        if not isinstance(tensor.shape, torch.Size):
+            raise RuntimeError("MatrixMan/CUDA: add received invalid tensor metadata")
+        shape = tuple(int(value) for value in tensor.shape)
         expected_strides = []
         stride = 1
         for size in reversed(shape):
             expected_strides.insert(0, stride)
             stride *= size
-        if left_strides != tuple(expected_strides) or right_strides != tuple(expected_strides):
-            raise NotImplementedError("MatrixMan/CUDA: add requires contiguous tensors")
         try:
             alpha = float(alpha)
         except (TypeError, ValueError) as exc:
             raise NotImplementedError("MatrixMan/CUDA: add alpha must be a scalar") from exc
-        if alpha != 1.0:
-            raise NotImplementedError("MatrixMan/CUDA: add currently supports alpha=1 only")
 
         output_pointer = self.execution.allocate(_numel(shape) * 4)
         try:
-            self.execution.add(
-                left._owner.pointer,
-                right._owner.pointer,
-                output_pointer,
-                _numel(shape),
-            )
+            if left_is_tensor and right_is_tensor:
+                if right._owner.layout.kind != "cuda_linear" or right.dtype != torch.float32:
+                    raise NotImplementedError("MatrixMan/CUDA: add supports CUDA float32 tensors only")
+                if tuple(left.shape) != tuple(right.shape):
+                    raise NotImplementedError("MatrixMan/CUDA: add broadcasting is not implemented; shapes must match")
+                if not 1 <= len(shape) <= 4:
+                    raise NotImplementedError("MatrixMan/CUDA: add supports tensor ranks 1 through 4")
+                left_strides = tuple(int(value) for value in left._logical_strides)
+                right_strides = tuple(int(value) for value in right._logical_strides)
+                if left._owner.execution is not self.execution or right._owner.execution is not self.execution:
+                    raise RuntimeError("MatrixMan/CUDA: add tensors use different CUDA execution contexts")
+                if any(stride < 0 for stride in left_strides + right_strides):
+                    raise NotImplementedError("MatrixMan/CUDA: add does not support negative logical strides")
+                padding = 4 - len(shape)
+                self.execution.add(
+                    left._owner.pointer,
+                    right._owner.pointer,
+                    output_pointer,
+                    _numel(shape),
+                    (1,) * padding + shape,
+                    (0,) * padding + left_strides,
+                    (0,) * padding + right_strides,
+                    int(left._storage_offset),
+                    int(right._storage_offset),
+                    alpha,
+                )
+            else:
+                tensor_strides = tuple(int(value) for value in tensor._logical_strides)
+                if tensor_strides != tuple(expected_strides):
+                    raise NotImplementedError("MatrixMan/CUDA: scalar add requires contiguous tensors")
+                if not isinstance(other, (int, float)):
+                    raise NotImplementedError("MatrixMan/CUDA: scalar add requires a numeric scalar")
+                if not left_is_tensor and alpha != 1.0:
+                    raise NotImplementedError("MatrixMan/CUDA: scalar-left add alpha is unsupported")
+                self.execution.add_scalar(
+                    tensor._owner.pointer,
+                    float(other) * alpha if left_is_tensor else float(other),
+                    output_pointer,
+                    _numel(shape),
+                )
             return CudaTensorOwner(
                 self.execution,
                 output_pointer,
                 shape,
                 tuple(expected_strides),
+            )
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
+
+    def mul(self, left, right):
+        """Multiply float32 CUDA tensors with aligned singleton broadcasting."""
+        if not hasattr(left, "_owner") or not hasattr(right, "_owner"):
+            raise RuntimeError("MatrixMan/CUDA: mul requires two CUDA-backed MatrixMan tensors")
+        for name, tensor in (("left", left), ("right", right)):
+            if tensor._owner.layout.kind != "cuda_linear":
+                raise RuntimeError(f"MatrixMan/CUDA: mul {name} must be CUDA-backed")
+            if tensor.dtype != torch.float32:
+                raise NotImplementedError("MatrixMan/CUDA: mul supports float32 tensors only")
+            if tensor._owner.execution is not self.execution:
+                raise RuntimeError("MatrixMan/CUDA: mul tensors use different CUDA execution contexts")
+            if any(int(value) < 0 for value in tensor._logical_strides):
+                raise NotImplementedError("MatrixMan/CUDA: mul does not support negative logical strides")
+        left_shape = tuple(int(value) for value in left.shape)
+        right_shape = tuple(int(value) for value in right.shape)
+        if not 1 <= len(left_shape) <= 4 or not 1 <= len(right_shape) <= 4:
+            raise NotImplementedError("MatrixMan/CUDA: mul supports tensor ranks 1 through 4")
+        rank = max(len(left_shape), len(right_shape))
+        left_shape = (1,) * (rank - len(left_shape)) + left_shape
+        right_shape = (1,) * (rank - len(right_shape)) + right_shape
+        left_strides = (0,) * (rank - len(left._logical_strides)) + tuple(int(value) for value in left._logical_strides)
+        right_strides = (0,) * (rank - len(right._logical_strides)) + tuple(int(value) for value in right._logical_strides)
+        output_shape = []
+        for axis, (left_size, right_size) in enumerate(zip(left_shape, right_shape)):
+            if left_size == right_size:
+                output_shape.append(left_size)
+            elif left_size == 1:
+                output_shape.append(right_size)
+                left_strides = left_strides[:axis] + (0,) + left_strides[axis + 1:]
+            elif right_size == 1:
+                output_shape.append(left_size)
+                right_strides = right_strides[:axis] + (0,) + right_strides[axis + 1:]
+            else:
+                raise NotImplementedError("MatrixMan/CUDA: mul shapes are not broadcast-compatible")
+        padding = 4 - rank
+        padded_shape = (1,) * padding + tuple(output_shape)
+        padded_left_strides = (0,) * padding + left_strides
+        padded_right_strides = (0,) * padding + right_strides
+        output_shape = tuple(output_shape)
+        output_pointer = self.execution.allocate(_numel(output_shape) * 4)
+        try:
+            self.execution.mul_elementwise(
+                left._owner.pointer,
+                right._owner.pointer,
+                output_pointer,
+                _numel(output_shape),
+                padded_shape,
+                padded_left_strides,
+                padded_right_strides,
+                int(left._storage_offset),
+                int(right._storage_offset),
+            )
+            return CudaTensorOwner(self.execution, output_pointer, output_shape, contiguous_strides(output_shape))
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
+
+    def div(self, input_tensor, divisor):
+        """Divide a readable float32 CUDA tensor by a scalar on CUDA."""
+        if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
+            raise RuntimeError("MatrixMan/CUDA: div input must be CUDA-backed")
+        if input_tensor.dtype != torch.float32:
+            raise NotImplementedError("MatrixMan/CUDA: div supports float32 tensors only")
+        try:
+            divisor = float(divisor)
+        except (TypeError, ValueError) as exc:
+            raise NotImplementedError("MatrixMan/CUDA: div requires a scalar divisor") from exc
+        shape = tuple(int(value) for value in input_tensor.shape)
+        if not 1 <= len(shape) <= 4:
+            raise NotImplementedError("MatrixMan/CUDA: div supports tensor ranks 1 through 4")
+        strides = tuple(int(value) for value in input_tensor._logical_strides)
+        if any(value < 0 for value in strides):
+            raise NotImplementedError("MatrixMan/CUDA: div does not support negative logical strides")
+        if input_tensor._owner.execution is not self.execution:
+            raise RuntimeError("MatrixMan/CUDA: div tensor uses a different CUDA execution context")
+        padding = 4 - len(shape)
+        output_pointer = self.execution.allocate(_numel(shape) * 4)
+        try:
+            self.execution.div_scalar(
+                input_tensor._owner.pointer,
+                output_pointer,
+                _numel(shape),
+                (1,) * padding + shape,
+                (0,) * padding + strides,
+                int(input_tensor._storage_offset),
+                divisor,
+            )
+            return CudaTensorOwner(
+                self.execution,
+                output_pointer,
+                shape,
+                contiguous_strides(shape),
+            )
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
+
+    def sub(self, left, right, alpha=1):
+        """Subtract matching float32 CUDA tensors using logical view strides."""
+        if not hasattr(left, "_owner") or not hasattr(right, "_owner"):
+            raise RuntimeError("MatrixMan/CUDA: sub requires two CUDA-backed MatrixMan tensors")
+        for name, tensor in (("left", left), ("right", right)):
+            if tensor._owner.layout.kind != "cuda_linear":
+                raise RuntimeError(f"MatrixMan/CUDA: sub {name} must be CUDA-backed")
+            if tensor.dtype != torch.float32:
+                raise NotImplementedError("MatrixMan/CUDA: sub supports float32 tensors only")
+            if tensor._owner.execution is not self.execution:
+                raise RuntimeError("MatrixMan/CUDA: sub tensors use different CUDA execution contexts")
+            if any(int(stride) < 0 for stride in tensor._logical_strides):
+                raise NotImplementedError("MatrixMan/CUDA: sub does not support negative logical strides")
+        if tuple(left.shape) != tuple(right.shape):
+            raise NotImplementedError("MatrixMan/CUDA: sub requires matching tensor shapes")
+        try:
+            alpha = float(alpha)
+        except (TypeError, ValueError) as exc:
+            raise NotImplementedError("MatrixMan/CUDA: sub alpha must be a scalar") from exc
+
+        shape = tuple(int(value) for value in left.shape)
+        if not 1 <= len(shape) <= 4:
+            raise NotImplementedError("MatrixMan/CUDA: sub supports tensor ranks 1 through 4")
+        padding = 4 - len(shape)
+        padded_shape = (1,) * padding + shape
+        padded_left_strides = (0,) * padding + tuple(int(value) for value in left._logical_strides)
+        padded_right_strides = (0,) * padding + tuple(int(value) for value in right._logical_strides)
+        output_pointer = self.execution.allocate(_numel(shape) * 4)
+        try:
+            self.execution.sub(
+                left._owner.pointer,
+                right._owner.pointer,
+                output_pointer,
+                _numel(shape),
+                padded_shape,
+                padded_left_strides,
+                padded_right_strides,
+                int(left._storage_offset),
+                int(right._storage_offset),
+                alpha,
+            )
+            return CudaTensorOwner(
+                self.execution,
+                output_pointer,
+                shape,
+                tuple(_numel(shape[index + 1:]) for index in range(len(shape))),
             )
         except Exception:
             self.execution.free(output_pointer)
@@ -423,7 +692,7 @@ class CudaBackend(Backend):
             shape = tuple(int(value) for value in tensor.shape)
             if len(shape) != rank:
                 raise NotImplementedError("MatrixMan/CUDA: cat inputs must have matching ranks")
-            if tuple(tensor._owner.strides) != tuple(
+            if tuple(tensor._logical_strides) != tuple(
                 _numel(shape[index + 1:]) for index in range(rank)
             ):
                 raise NotImplementedError("MatrixMan/CUDA: cat requires contiguous tensors")
@@ -444,8 +713,11 @@ class CudaBackend(Backend):
             for tensor in tensors:
                 shape = tuple(int(value) for value in tensor.shape)
                 padded_input = (1,) * (4 - rank) + shape
+                input_pointer = type(tensor._owner.pointer)(
+                    tensor._owner.pointer.value + int(tensor._storage_offset) * 4
+                )
                 self.execution.cat_copy(
-                    tensor._owner.pointer,
+                    input_pointer,
                     output_pointer,
                     _numel(output_shape),
                     dimension + 4 - rank,
@@ -460,6 +732,152 @@ class CudaBackend(Backend):
                 output_shape,
                 output_strides,
             )
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
+
+    def stack(self, tensors, dimension):
+        """Stack matching float32 tensors through a stride-aware CUDA copy."""
+        tensors = tuple(tensors)
+        if not tensors:
+            raise ValueError("MatrixMan/CUDA: stack requires at least one tensor")
+        first_shape = tuple(int(value) for value in tensors[0].shape)
+        rank = len(first_shape)
+        if rank < 1 or rank > 4:
+            raise NotImplementedError("MatrixMan/CUDA: stack supports tensor ranks 1 through 4")
+        dimension = int(dimension)
+        if dimension < 0:
+            dimension += rank + 1
+        if dimension < 0 or dimension > rank:
+            raise ValueError("MatrixMan/CUDA: stack dimension is out of range")
+        for index, tensor in enumerate(tensors):
+            if (
+                not hasattr(tensor, "_owner")
+                or tensor._owner.layout.kind != "cuda_linear"
+                or tensor.dtype != torch.float32
+            ):
+                raise RuntimeError(
+                    f"MatrixMan/CUDA: stack input {index} must be a CUDA-backed float32 tensor"
+                )
+            if tuple(int(value) for value in tensor.shape) != first_shape:
+                raise ValueError("MatrixMan/CUDA: stack inputs must have matching shapes")
+            if tensor._owner.execution is not self.execution:
+                raise RuntimeError("MatrixMan/CUDA: stack inputs must share one CUDA execution context")
+
+        output_shape = first_shape[:dimension] + (len(tensors),) + first_shape[dimension:]
+        output_strides = tuple(_numel(output_shape[index + 1:]) for index in range(rank + 1))
+        output_pointer = self.execution.allocate(_numel(output_shape) * 4)
+        suffix = _numel(first_shape[dimension:])
+        padded_shape = (1,) * (4 - rank) + first_shape
+        try:
+            for stack_index, tensor in enumerate(tensors):
+                padded_strides = (0,) * (4 - rank) + tuple(
+                    int(value) for value in tensor._logical_strides
+                )
+                input_pointer = type(tensor._owner.pointer)(
+                    tensor._owner.pointer.value + int(tensor._storage_offset) * 4
+                )
+                self.execution.stack_copy(
+                    input_pointer,
+                    output_pointer,
+                    _numel(first_shape),
+                    suffix,
+                    len(tensors),
+                    stack_index,
+                    padded_shape,
+                    padded_strides,
+                )
+            return CudaTensorOwner(self.execution, output_pointer, output_shape, output_strides)
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
+
+    def fill(self, tensor, value):
+        """Fill a CUDA-backed float32 tensor in place using logical strides."""
+        if not hasattr(tensor, "_owner") or tensor._owner.layout.kind != "cuda_linear":
+            raise RuntimeError("MatrixMan/CUDA: fill requires a CUDA-backed MatrixManTensor")
+        if tensor.dtype != torch.float32:
+            raise NotImplementedError("MatrixMan/CUDA: fill supports float32 tensors only")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise NotImplementedError("MatrixMan/CUDA: fill value must be a scalar") from exc
+        shape = tuple(int(item) for item in tensor.shape)
+        strides = tuple(int(item) for item in tensor._logical_strides)
+        if len(shape) != len(strides) or len(shape) < 1 or len(shape) > 4:
+            raise NotImplementedError("MatrixMan/CUDA: fill supports ranks 1 through 4")
+        if any(stride < 0 for stride in strides):
+            raise NotImplementedError("MatrixMan/CUDA: fill does not support negative strides")
+        if any(size > 1 and stride == 0 for size, stride in zip(shape, strides)):
+            raise NotImplementedError("MatrixMan/CUDA: fill rejects overlapping zero-stride views")
+        if tensor._owner.execution is not self.execution:
+            raise RuntimeError("MatrixMan/CUDA: fill tensor uses a different CUDA execution context")
+        if not _numel(shape):
+            return tensor
+        padded_shape = (1,) * (4 - len(shape)) + shape
+        padded_strides = (0,) * (4 - len(strides)) + strides
+        pointer = type(tensor._owner.pointer)(
+            tensor._owner.pointer.value + int(tensor._storage_offset) * 4
+        )
+        self.execution.fill(pointer, value, _numel(shape), padded_shape, padded_strides)
+        return tensor
+
+    def softmax(self, tensor, dimension, half_to_float=False):
+        """Execute stable float32 softmax while honoring logical input strides."""
+        if not hasattr(tensor, "_owner") or tensor._owner.layout.kind != "cuda_linear":
+            raise RuntimeError("MatrixMan/CUDA: softmax requires a CUDA-backed MatrixManTensor")
+        if tensor.dtype != torch.float32:
+            raise NotImplementedError("MatrixMan/CUDA: softmax supports float32 tensors only")
+        shape = tuple(int(item) for item in tensor.shape)
+        strides = tuple(int(item) for item in tensor._logical_strides)
+        rank = len(shape)
+        if rank < 1 or rank > 4:
+            raise NotImplementedError("MatrixMan/CUDA: softmax supports ranks 1 through 4")
+        dimension = int(dimension)
+        if dimension < 0:
+            dimension += rank
+        if dimension < 0 or dimension >= rank:
+            raise IndexError("MatrixMan/CUDA: softmax dimension is out of range")
+        if len(strides) != rank or any(stride < 0 for stride in strides):
+            raise NotImplementedError("MatrixMan/CUDA: softmax requires non-negative logical strides")
+        if tensor._owner.execution is not self.execution:
+            raise RuntimeError("MatrixMan/CUDA: softmax tensor uses a different CUDA execution context")
+        if shape[dimension] <= 0:
+            raise NotImplementedError("MatrixMan/CUDA: softmax does not support empty dimensions")
+        if not _numel(shape):
+            raise NotImplementedError("MatrixMan/CUDA: softmax does not support empty tensors")
+        output_strides = tuple(_numel(shape[index + 1:]) for index in range(rank))
+        outer_strides = []
+        for index in range(rank):
+            product = 1
+            for following in range(index + 1, rank):
+                if following != dimension:
+                    product *= shape[following]
+            outer_strides.append(product)
+        padded_shape = (1,) * (4 - rank) + shape
+        padded_strides = (0,) * (4 - rank) + strides
+        padded_output_strides = (0,) * (4 - rank) + output_strides
+        padded_outer_strides = (0,) * (4 - rank) + tuple(outer_strides)
+        output_shape = shape
+        output_pointer = self.execution.allocate(_numel(output_shape) * 4)
+        input_pointer = type(tensor._owner.pointer)(
+            tensor._owner.pointer.value + int(tensor._storage_offset) * 4
+        )
+        try:
+            self.execution.softmax(
+                input_pointer,
+                output_pointer,
+                _numel(shape) // shape[dimension],
+                shape[dimension],
+                dimension + 4 - rank,
+                padded_strides[dimension + 4 - rank],
+                padded_output_strides[dimension + 4 - rank],
+                padded_shape,
+                padded_strides,
+                padded_output_strides,
+                padded_outer_strides,
+            )
+            return CudaTensorOwner(self.execution, output_pointer, output_shape, output_strides)
         except Exception:
             self.execution.free(output_pointer)
             raise
@@ -527,7 +945,16 @@ class CudaBackend(Backend):
             raise
 
     def close(self) -> None:
+        for _, (_, _, pointer, _) in list(self._parameter_cache.items()):
+            self.execution.free(pointer)
+        self._parameter_cache.clear()
         self.execution.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @classmethod
     def probe(cls) -> bool:

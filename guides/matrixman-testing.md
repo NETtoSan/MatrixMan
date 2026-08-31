@@ -36,13 +36,53 @@ numerical MatrixMan result.
 The public demo deliberately does not expose benchmark warm-up, profiling
 internals, GPU tuning, or diagnostic checkpoint options.
 
+### Backend versus frontend diagnostics
+
+Diagnostic location describes the layer being tested; it does not imply that
+every operator needs two copies of a test.
+
+Directory placement describes the layer actually tested, not merely the
+backend eventually selected.
+
+- `drivers/matrixman/backends/cuda/<op>.py` is a CUDA backend diagnostic when
+  it is run as an executable module. It may inspect `CudaExecutionBackend`,
+  embedded PTX, CUDA pointers, allocation ownership, logical strides, storage
+  offsets, and explicit CUDA Driver API readback.
+- `drivers/matrixman/diagnostics/matrixman_<op>_demo.py` is a frontend
+  diagnostic. It exercises the public PyTorch/ATen operation through
+  PrivateUse1, `MatrixManTensor`, dispatch, and the selected backend. It should
+  remain backend-neutral unless its purpose is explicitly backend-specific;
+  backend metadata may be displayed conditionally.
+
+The current placement is intentional. CUDA-focused checks remain beside the
+CUDA implementation, while the recently renamed `matrixman_div_demo.py` and
+`matrixman_mul_demo.py` are frontend checks inherited from the former generic
+operator demo family. Do not move them or add duplicate CUDA copies merely for
+directory symmetry during CUDA bring-up. Revisit duplication and possible
+diagnostics subdirectories in a separate layering audit after the YOLO forward
+path reaches a stable endpoint.
+
+The direct CUDA backend diagnostics currently include `add.py`, `sub.py`,
+`mul.py`, `div.py`, `batch_norm.py`, `cat.py`, `conv2d.py`, `split.py`,
+`silu.py`, and `upsample.py`; `gpumatrix.py` also retains the low-level
+matmul diagnostic. These scripts call `CudaExecutionBackend` and use explicit
+Driver API readback. The corresponding `matrixman_*_demo.py` scripts exercise
+the frontend where present.
+
+Temporary placement exceptions are intentional: `expand.py`, `transpose.py`,
+and `unsqueeze.py` validate metadata-only frontend operations; `stack.py`,
+`fill.py`, `arange.py`, and `softmax.py` validate their ATen/MatrixMan paths;
+and `split_views.py` is a specialized frontend view-layout regression. They
+do not claim to be raw CUDA kernel diagnostics and should not be duplicated
+solely to satisfy directory symmetry.
+
 ## Compatibility and core checks
 
 ```bash
 python3 -m drivers.matrixman.compatibility
 python3 -m drivers.matrixman --check
-python3 -m drivers.matrixman.diagnostics.gm45_pytorch_demo
-python3 -m drivers.matrixman.diagnostics.gm45_pytorch_demo --trace
+python3 -m drivers.matrixman.diagnostics.matrixman_pytorch_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_pytorch_demo --trace
 ```
 
 The compatibility commands report the active renderer, OpenGL limits,
@@ -52,15 +92,15 @@ MatrixMan tensor upload, matmul, addition, and explicit readback.
 Focused operation checks include:
 
 ```bash
-python3 -m drivers.matrixman.diagnostics.gm45_add_demo
-python3 -m drivers.matrixman.diagnostics.gm45_batchnorm_demo
-python3 -m drivers.matrixman.diagnostics.gm45_cat_demo
-python3 -m drivers.matrixman.diagnostics.gm45_grouped_conv_demo
-python3 -m drivers.matrixman.diagnostics.gm45_silu_demo
-python3 -m drivers.matrixman.diagnostics.gm45_softmax_demo
-python3 -m drivers.matrixman.diagnostics.gm45_maxpool_demo
-python3 -m drivers.matrixman.diagnostics.gm45_upsample_demo
-python3 -m drivers.matrixman.diagnostics.gm45_storage_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_add_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_batchnorm_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_cat_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_grouped_conv_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_silu_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_softmax_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_maxpool_demo
+python3 -m drivers.matrixman.diagnostics.matrixman_upsample_demo
+python3 -m drivers.matrixman.diagnostics.opengl_storage_demo
 ```
 
 Additional address, split, transpose, arithmetic, sigmoid, and concatenation
@@ -100,12 +140,12 @@ python3 -m drivers.matrixman.benchmarks.yolo_benchmark \
 ## Convolution and specialized diagnostics
 
 ```bash
-python3 -m drivers.matrixman.diagnostics.gm45_conv_demo
-python3 -m drivers.matrixman.diagnostics.gm45_conv_target_diagnostic
-python3 -m drivers.matrixman.diagnostics.gm45_conv_target_diagnostic --production-tiles
-python3 -m drivers.matrixman.diagnostics.gm45_conv_isolation
-python3 -m drivers.matrixman.diagnostics.gm45_conv_10a_diagnostic
-python3 -m drivers.matrixman.diagnostics.gm45_address_diagnostic
+python3 -m drivers.matrixman.diagnostics.matrixman_conv_demo
+python3 -m drivers.matrixman.diagnostics.opengl_conv_target_diagnostic
+python3 -m drivers.matrixman.diagnostics.opengl_conv_target_diagnostic --production-tiles
+python3 -m drivers.matrixman.diagnostics.matrixman_conv_isolation
+python3 -m drivers.matrixman.diagnostics.matrixman_conv_10a_diagnostic
+python3 -m drivers.matrixman.diagnostics.opengl_address_diagnostic
 ```
 
 The Step 10B diagnostic compares baseline GPU Conv with the opt-in spatial

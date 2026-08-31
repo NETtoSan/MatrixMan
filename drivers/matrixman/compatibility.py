@@ -20,9 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from . import gm45_backend as backend
-from . import gpumatrix as gm
-from .backends.opengl import convolution, profiling, resources, runtime as runtime_module, tensor
-from .backends.opengl.storage import StorageLayout, pack_linear_rgba, packed_atlas_size
+from .backend import get_backend
 
 
 GL_VENDOR = 0x1F00
@@ -36,12 +34,49 @@ GL_MAX_RENDERBUFFER_SIZE = 0x84E8
 GL_MAX_TEXTURE_IMAGE_UNITS = 0x8872
 GL_MAX_FRAGMENT_UNIFORM_COMPONENTS = 0x8B49
 
-_gl_get_integerv = gm.gl_proc(
-    "glGetIntegerv", None, ctypes.c_uint, ctypes.POINTER(ctypes.c_int)
-)
+gm = None
+convolution = None
+profiling = None
+resources = None
+runtime_module = None
+tensor = None
+StorageLayout = None
+pack_linear_rgba = None
+packed_atlas_size = None
 
 SELFTEST_RTOL = 1e-4
 SELFTEST_ATOL = 1e-4
+
+
+def _load_opengl_compatibility_modules() -> None:
+    """Load OpenGL diagnostics only when OpenGL is the selected backend."""
+    global gm, convolution, profiling, resources, runtime_module, tensor
+    global StorageLayout, pack_linear_rgba, packed_atlas_size, _gl_get_integerv
+    if gm is not None:
+        return
+    from . import gpumatrix as gm_module
+    from .backends.opengl import convolution as convolution_module
+    from .backends.opengl import profiling as profiling_module
+    from .backends.opengl import resources as resources_module
+    from .backends.opengl import runtime as runtime_module_import
+    from .backends.opengl import tensor as tensor_module
+    from .backends.opengl.storage import (
+        StorageLayout as storage_layout,
+        pack_linear_rgba as pack_linear_rgba_fn,
+        packed_atlas_size as packed_atlas_size_fn,
+    )
+    gm = gm_module
+    convolution = convolution_module
+    profiling = profiling_module
+    resources = resources_module
+    runtime_module = runtime_module_import
+    tensor = tensor_module
+    StorageLayout = storage_layout
+    pack_linear_rgba = pack_linear_rgba_fn
+    packed_atlas_size = packed_atlas_size_fn
+    _gl_get_integerv = gm.gl_proc(
+        "glGetIntegerv", None, ctypes.c_uint, ctypes.POINTER(ctypes.c_int)
+    )
 
 
 @dataclass
@@ -218,6 +253,7 @@ def _diagnostic_workload(name: str) -> dict[str, int]:
 
 def _isolated_one_shot() -> bool:
     """Probe the known-unsafe large render in a disposable GL context."""
+    _load_opengl_compatibility_modules()
     configured_limit = convolution.CONV_PHYSICAL_TILE_LIMIT
     convolution.CONV_PHYSICAL_TILE_LIMIT = 1 << 30
     try:
@@ -390,6 +426,18 @@ def _test_consolidation() -> bool:
 
 
 def report() -> int:
+    selected = get_backend()
+    if selected.name != "opengl":
+        print("MatrixMan Compatibility Report")
+        print(f"Selected backend: {selected.name.upper()}")
+        info = selected.device_info()
+        if info.get("device"):
+            print(f"  device: {info['device']}")
+        if info.get("compute_capability"):
+            print(f"  compute capability: {info['compute_capability']}")
+        print("OpenGL compatibility checks: skipped (OpenGL is not selected)")
+        return 0
+    _load_opengl_compatibility_modules()
     renderer = _string(GL_RENDERER)
     vendor = _string(GL_VENDOR)
     version = _string(GL_VERSION)
@@ -494,13 +542,20 @@ def report() -> int:
 
 
 def main() -> int:
+    selected = get_backend()
     if "--internal-large-one-shot" in sys.argv:
+        if selected.name != "opengl":
+            print("MatrixMan compatibility: OpenGL one-shot test skipped (OpenGL is not selected)")
+            return 0
         backend.set_trace(False)
         try:
             return 0 if _isolated_one_shot() else 2
         finally:
             backend.shutdown()
     if "--test-large-tiled" in sys.argv:
+        if selected.name != "opengl":
+            print("MatrixMan compatibility: OpenGL tiled test skipped (OpenGL is not selected)")
+            return 0
         backend.set_trace(False)
         try:
             os.environ["MATRIXMAN_DIAGNOSTIC_TILES"] = "1"
@@ -577,12 +632,16 @@ def main() -> int:
         finally:
             backend.shutdown()
     if "--test-consolidation" in sys.argv:
+        if selected.name != "opengl":
+            print("MatrixMan compatibility: OpenGL consolidation test skipped (OpenGL is not selected)")
+            return 0
         backend.set_trace(False)
         try:
             return 0 if _test_consolidation() else 1
         finally:
             backend.shutdown()
-    backend.set_trace(False)
+    if selected.name == "opengl":
+        backend.set_trace(False)
     try:
         return report()
     finally:

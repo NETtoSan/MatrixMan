@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CPU vs GM45/GMA 4500MHD fragment-shader matrix multiplication benchmark.
+OpenGL-only fragment-shader matrix multiplication benchmark.
 
 This compares the same operation on the same float32 inputs:
 
@@ -9,7 +9,7 @@ This compares the same operation on the same float32 inputs:
 CPU path:
     NumPy A @ B, used as both benchmark and correctness reference.
 
-GPU path:
+OpenGL path:
     CPU matrices -> OpenGL RGBA32F textures -> GLSL 1.20 fragment shader
     -> framebuffer texture -> optional glReadPixels validation.
 
@@ -27,8 +27,23 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from drivers.matrixman import gpumatrix as gm
-from drivers.matrixman import gpu_stress
+from drivers.matrixman.backend import get_backend
+
+
+gm = None
+gpu_stress = None
+
+
+def _load_opengl_benchmark_modules() -> None:
+    """Load the legacy OpenGL benchmark implementation after backend gating."""
+    global gm, gpu_stress
+    if gm is not None:
+        return
+    from drivers.matrixman import gpumatrix as gm_module
+    from drivers.matrixman import gpu_stress as stress_module
+
+    gm = gm_module
+    gpu_stress = stress_module
 
 
 @dataclass
@@ -44,7 +59,7 @@ class BenchResult:
 
 
 class GpuMatmulBench:
-    """Reusable single-matmul GLSL benchmark state for one matrix size."""
+    """Reusable single-matmul OpenGL GLSL benchmark state for one matrix size."""
 
     def __init__(self, n: int, a: np.ndarray, b: np.ndarray):
         self.n = n
@@ -147,7 +162,7 @@ def benchmark_gpu_compute_only(bench: GpuMatmulBench, n: int, min_seconds: float
         gm.glFinish()
         count += 1
     elapsed = time.perf_counter() - started
-    return result_from_total("GPU shader only", n, elapsed, max(count, 1))
+    return result_from_total("OpenGL shader only", n, elapsed, max(count, 1))
 
 
 def benchmark_gpu_with_transfers(
@@ -167,7 +182,7 @@ def benchmark_gpu_with_transfers(
         _ = bench.read_result()
         count += 1
     elapsed = time.perf_counter() - started
-    return result_from_total("GPU incl upload/readback", n, elapsed, max(count, 1))
+    return result_from_total("OpenGL incl upload/readback", n, elapsed, max(count, 1))
 
 
 def verify_gpu(bench: GpuMatmulBench, reference: np.ndarray) -> tuple[float, bool]:
@@ -200,14 +215,14 @@ def print_comparison_table(results: list[BenchResult]) -> None:
     print("\nFaster path by size:")
     for n in sorted({r.size for r in results}):
         cpu = next((r for r in results if r.size == n and r.label == "CPU NumPy" and not r.error), None)
-        gpu = next((r for r in results if r.size == n and r.label == "GPU shader only" and not r.error), None)
-        gpu_total = next((r for r in results if r.size == n and r.label == "GPU incl upload/readback" and not r.error), None)
+        gpu = next((r for r in results if r.size == n and r.label == "OpenGL shader only" and not r.error), None)
+        gpu_total = next((r for r in results if r.size == n and r.label == "OpenGL incl upload/readback" and not r.error), None)
         if cpu and gpu:
-            winner = "CPU" if cpu.avg_seconds < gpu.avg_seconds else "GPU shader only"
+            winner = "CPU" if cpu.avg_seconds < gpu.avg_seconds else "OpenGL shader only"
             factor = max(cpu.avg_seconds, gpu.avg_seconds) / min(cpu.avg_seconds, gpu.avg_seconds)
             print(f"  {n}x{n}: {winner} is {factor:.2f}x faster than the other compute-only path")
         if cpu and gpu_total:
-            winner = "CPU" if cpu.avg_seconds < gpu_total.avg_seconds else "GPU total"
+            winner = "CPU" if cpu.avg_seconds < gpu_total.avg_seconds else "OpenGL total"
             factor = max(cpu.avg_seconds, gpu_total.avg_seconds) / min(cpu.avg_seconds, gpu_total.avg_seconds)
             print(f"  {n}x{n}: {winner} is {factor:.2f}x faster when GPU transfers/readback are included")
 
@@ -232,7 +247,7 @@ def run_size(n: int, seconds_per_bench: float, seed: int) -> list[BenchResult]:
             gpu_compute.error = f"OpenGL error after benchmark: 0x{gl_error:04x}"
         return [cpu, gpu_compute, gpu_total]
     except Exception as exc:
-        return [cpu, BenchResult("GPU shader only", n, math.nan, math.nan, math.nan, error=str(exc))]
+        return [cpu, BenchResult("OpenGL shader only", n, math.nan, math.nan, math.nan, error=str(exc))]
     finally:
         if bench is not None:
             bench.cleanup()
@@ -332,11 +347,20 @@ def run_512_stress(seconds: float) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CPU vs legacy OpenGL GLSL matmul benchmark")
+    parser = argparse.ArgumentParser(description="CPU vs OpenGL GLSL matmul benchmark (OpenGL only)")
     parser.add_argument("--seconds-per-bench", type=float, default=3.0)
     parser.add_argument("--skip-stress", action="store_true")
     parser.add_argument("--stress-seconds", type=float, default=60.0)
     args = parser.parse_args()
+
+    selected = get_backend()
+    if selected.name != "opengl":
+        print("cpu_gpu_benchmark currently implements the OpenGL benchmark only.")
+        print(f"Selected backend: {selected.name.upper()}")
+        print("No benchmark was run.")
+        return 0
+
+    _load_opengl_benchmark_modules()
 
     gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
     window = None

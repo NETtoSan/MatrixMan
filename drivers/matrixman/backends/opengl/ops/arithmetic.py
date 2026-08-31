@@ -404,7 +404,8 @@ def _packed_scalar_div_program(params: tuple) -> tuple[int, int]:
     return rt.packed_scalar_div_programs[params], rt.packed_scalar_div_uniforms[params]
 
 def _packed_scalar_div_shader_source(params: tuple) -> bytes:
-    numel, input_offset, input_tex_w, input_tex_h, out_tex_w, divisor = params
+    numel, input_offset, input_strides, input_tex_w, input_tex_h, out_tex_w, divisor = params
+    input_stride0, input_stride1, input_stride2 = input_strides
     source = """
 #version 120
 uniform sampler2D input_tex;
@@ -431,7 +432,12 @@ float read_packed(int linear_index)
 float divide_at(int linear_index)
 {
     if (linear_index >= NUMEL) return 0.0;
-    return read_packed(linear_index + INPUT_OFFSET) / DIVISOR;
+    int anchor = linear_index - (linear_index / ANCHORS) * ANCHORS;
+    int channel = (linear_index / ANCHORS) - ((linear_index / ANCHORS) / CHANNELS) * CHANNELS;
+    int batch = (linear_index / ANCHORS) / CHANNELS;
+    int input_index = INPUT_OFFSET + batch * INPUT_STRIDE0
+        + channel * INPUT_STRIDE1 + anchor * INPUT_STRIDE2;
+    return read_packed(input_index) / DIVISOR;
 }
 
 void main()
@@ -444,6 +450,8 @@ void main()
 """
     replacements = {
         "NUMEL": int(numel), "INPUT_OFFSET": int(input_offset),
+        "INPUT_STRIDE0": int(input_stride0), "INPUT_STRIDE1": int(input_stride1),
+        "INPUT_STRIDE2": int(input_stride2), "CHANNELS": 2, "ANCHORS": int(numel) // 2,
         "INPUT_TEX_W": int(input_tex_w), "INPUT_TEX_H": int(input_tex_h),
         "OUT_TEX_W": int(out_tex_w), "DIVISOR": kernels.glsl_float(divisor),
     }
@@ -463,7 +471,7 @@ def _render_packed_scalar_div(tensor: "MatrixManTensor", divisor: float) -> "Mat
         raise RuntimeError("gm45 scalar div currently supports only divisor 2.0")
     out_owner = operation_context.output_texture(shape)
     params = (
-        numel(shape), tensor._storage_offset,
+        numel(shape), tensor._storage_offset, tensor._logical_strides,
         tensor._owner.layout.texture_width, tensor._owner.layout.texture_height,
         out_owner.layout.texture_width, float(divisor),
     )

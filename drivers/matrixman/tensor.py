@@ -32,6 +32,62 @@ def max_storage_index(shape: tuple[int, ...], strides: tuple[int, ...]) -> int:
     return sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
 
 
+def _cpu_layout_from_values(values, shape, strides, storage_offset):
+    """Place logical readback values into a CPU tensor with matching metadata."""
+    import numpy as np
+
+    shape = tuple(int(value) for value in shape)
+    strides = tuple(int(value) for value in strides)
+    storage_offset = int(storage_offset)
+    if any(stride < 0 for stride in strides) or storage_offset < 0:
+        raise RuntimeError("MatrixMan CPU readback does not support negative layout metadata")
+    storage_size = storage_offset + (max_storage_index(shape, strides) + 1 if numel(shape) else 0)
+    base = torch.empty(storage_size, dtype=values.dtype, device="cpu")
+    result = torch.as_strided(base, shape, strides, storage_offset)
+    source = values.detach()
+    if 0 not in strides:
+        result.copy_(source)
+    else:
+        # Expanded views have intentionally overlapping destinations.  A
+        # bulk copy is rejected by PyTorch for those layouts, so assign the
+        # logical values with Torch scalars while preserving the zero stride.
+        for index in np.ndindex(shape):
+            result[index] = source[index]
+    return result
+
+
+def readback_tensor(tensor: "MatrixManTensor") -> torch.Tensor:
+    """Explicitly copy a MatrixMan tensor to an ordinary CPU tensor."""
+    if not isinstance(tensor, MatrixManTensor):
+        raise TypeError("MatrixMan CPU readback requires a MatrixManTensor")
+    if tensor.dtype != torch.float32:
+        raise NotImplementedError(
+            f"MatrixMan CPU readback supports float32 only, got {tensor.dtype}"
+        )
+
+    shape = tuple(int(value) for value in tensor.shape)
+    strides = tuple(int(value) for value in tensor._logical_strides)
+    offset = int(tensor._storage_offset)
+    owner = tensor._owner
+    if owner.layout.kind == "cuda_linear":
+        import numpy as np
+
+        raw = owner.execution.from_device(owner.pointer, (owner.layout.numel,))
+        if offset < 0 or (numel(shape) and offset + max_storage_index(shape, strides) >= owner.layout.numel):
+            raise RuntimeError("MatrixMan CUDA readback view is outside storage")
+        values_array = np.empty(shape, dtype=np.float32)
+        for index in np.ndindex(shape):
+            values_array[index] = raw[offset + sum(i * stride for i, stride in zip(index, strides))]
+        return _cpu_layout_from_values(torch.from_numpy(values_array), shape, strides, offset)
+
+    if owner.layout.kind.startswith("matrix") or owner.layout.kind in {"packed_rgba", "empty"}:
+        from .backends.opengl.tensor import readback_tensor as opengl_readback
+
+        values = opengl_readback(owner, shape, offset, strides)
+        return _cpu_layout_from_values(values, shape, strides, offset)
+    raise RuntimeError(f"MatrixMan CPU readback cannot handle owner kind {owner.layout.kind!r}")
+
+
 def infer_view_shape(input_shape, requested_shape) -> tuple[int, ...]:
     """Resolve one inferred dimension for a contiguous metadata-only view."""
     requested = tuple(int(size) for size in requested_shape)
@@ -51,6 +107,66 @@ def infer_view_shape(input_shape, requested_shape) -> tuple[int, ...]:
     if any(size < 0 for size in requested):
         raise ValueError("MatrixMan view dimensions must be non-negative")
     return requested
+
+
+def expand_shape_strides(input_shape, input_strides, requested_shape):
+    """Return PyTorch-style expanded shape/strides without changing storage."""
+    source_shape = tuple(int(size) for size in input_shape)
+    source_strides = tuple(int(stride) for stride in input_strides)
+    requested = tuple(int(size) for size in requested_shape)
+    if len(source_shape) != len(source_strides):
+        raise ValueError("MatrixMan expand source shape and strides must have the same rank")
+    if len(requested) < len(source_shape):
+        raise ValueError("MatrixMan expand cannot remove dimensions")
+
+    offset = len(requested) - len(source_shape)
+    output_shape = []
+    output_strides = []
+    for output_index, requested_size in enumerate(requested):
+        if output_index < offset:
+            if requested_size < 0:
+                raise ValueError("MatrixMan expand does not allow -1 on prepended dimensions")
+            output_shape.append(requested_size)
+            output_strides.append(0)
+            continue
+        source_index = output_index - offset
+        source_size = source_shape[source_index]
+        source_stride = source_strides[source_index]
+        size = source_size if requested_size == -1 else requested_size
+        if size < 0:
+            raise ValueError("MatrixMan expand sizes must be non-negative or -1")
+        if source_size != size:
+            if source_size != 1 or source_size == 0 or size == 0:
+                raise ValueError(
+                    f"MatrixMan expand cannot change dimension {source_index} "
+                    f"from {source_size} to {size}"
+                )
+            source_stride = 0
+        output_shape.append(size)
+        output_strides.append(source_stride)
+    return tuple(output_shape), tuple(output_strides)
+
+
+def unsqueeze_shape_strides(input_shape, input_strides, dimension):
+    """Insert a size-one dimension using PyTorch-compatible view strides."""
+    shape = tuple(int(size) for size in input_shape)
+    strides = tuple(int(stride) for stride in input_strides)
+    rank = len(shape)
+    if len(strides) != rank:
+        raise ValueError("MatrixMan unsqueeze source shape and strides must have the same rank")
+    dimension = int(dimension)
+    if dimension < 0:
+        dimension += rank + 1
+    if dimension < 0 or dimension > rank:
+        raise IndexError("MatrixMan unsqueeze dimension is out of range")
+    if dimension == rank:
+        inserted_stride = 1
+    else:
+        inserted_stride = strides[dimension] * shape[dimension]
+    return (
+        shape[:dimension] + (1,) + shape[dimension:],
+        strides[:dimension] + (inserted_stride,) + strides[dimension:],
+    )
 
 
 def _impl():

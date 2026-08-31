@@ -23,6 +23,9 @@ def run_split(cuda, input_array, split_size, dimension):
         output_shape = shape[:dimension] + (current_size,) + shape[dimension + 1:]
         output_pointer = cuda.allocate(np.prod(output_shape, dtype=np.int64) * 4)
         padded_input = (1,) * (4 - input_array.ndim) + shape
+        padded_input_strides = (0,) * (4 - input_array.ndim) + tuple(
+            int(value) // 4 for value in input_array.strides
+        )
         padded_output = (1,) * (4 - input_array.ndim) + output_shape
         cuda.split_copy(
             input_pointer,
@@ -31,6 +34,7 @@ def run_split(cuda, input_array, split_size, dimension):
             dimension + 4 - input_array.ndim,
             offset,
             padded_input,
+            padded_input_strides,
             padded_output,
         )
         owners.append((output_pointer, output_shape))
