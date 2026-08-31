@@ -9,14 +9,7 @@ from ...backend import get_backend
 from ...tensor import MatrixManTensor
 from .backend import CudaBackend, CudaTensorOwner
 
-try:
-    from .gpumatrix import CudaExecutionBackend, print_check
-except ImportError:
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from gpumatrix import CudaExecutionBackend, print_check
+from .gpumatrix import CudaExecutionBackend, print_check
 
 
 def run_diagnostic() -> int:

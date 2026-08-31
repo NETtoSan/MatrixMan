@@ -5,14 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-try:
-    from .gpumatrix import CudaExecutionBackend, print_check
-except ImportError:
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from gpumatrix import CudaExecutionBackend, print_check
+from .gpumatrix import CudaExecutionBackend, print_check
 
 
 def reference_conv2d(input_array, weight, bias, stride=(1, 1), padding=(1, 1), dilation=(1, 1), groups=1):

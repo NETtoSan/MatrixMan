@@ -60,10 +60,26 @@ def device_info() -> dict[str, str]:
         "opengl": gm.glGetString(0x1F02),
         "glsl": gm.glGetString(0x8B8C),
     }
+    renderer_text = text(values["renderer"])
+    vendor_text = text(values["vendor"])
+    policy = classify_renderer(vendor_text, renderer_text)
     return {
         key: text(value)
         for key, value in values.items()
-    }
+    } | {"device_policy": policy}
+
+
+def classify_renderer(vendor: str, renderer: str) -> str:
+    """Describe renderer preference without affecting GL availability."""
+    lower_renderer = renderer.lower()
+    software = any(name in lower_renderer for name in ("llvmpipe", "softpipe", "swrast"))
+    if software:
+        policy = "software renderer; hardware GPU preferred when available"
+    elif "nvidia" in vendor.lower() or "nvidia" in renderer.lower():
+        policy = "NVIDIA fallback; alternate renderer selection unavailable via SDL"
+    else:
+        policy = "preferred non-NVIDIA renderer"
+    return policy
 
 
 def init() -> None:
@@ -83,7 +99,7 @@ def debug_enabled() -> bool:
 
 
 def profile_enabled() -> bool:
-    return profiling.enabled
+    return profiling.is_enabled()
 
 
 def profile_report() -> None:

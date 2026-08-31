@@ -8,7 +8,8 @@ implemented. Other GPUs remain unverified.
 
 The package is organized as:
 
-- `gm45_backend.py`: PyTorch dispatch and GM45 kernels
+- `backend.py`: canonical backend-neutral MatrixMan frontend and backend access
+- `gm45_backend.py`: deprecated compatibility re-export for historical imports
 - `gpumatrix.py`: legacy OpenGL 2.1 context and texture helpers
 - `diagnostics/`: standalone regressions, benchmarks, and hardware probes
 
@@ -23,8 +24,10 @@ x = matrixman.to_device(torch.randn(16, 16, dtype=torch.float32))
 ```
 
 Only explicitly supported operations run on the GM45. Unsupported operations
-raise instead of falling back to CPU arithmetic. Set `MATRIXMAN_DEBUG=1` for
-detailed dispatch/OpenGL tracing; normal execution uses concise kernel logs.
+raise instead of falling back to CPU arithmetic. Set `MATRIXMAN_TRACE=1` (or
+`matrixman.trace = True`) for high-level operation logs. The CUDA-specific
+`MATRIXMAN_CUDA_DEBUG=1` flag remains available for low-level implementation
+diagnostics; normal execution is quiet.
 
 Run the capability and numerical probe with:
 

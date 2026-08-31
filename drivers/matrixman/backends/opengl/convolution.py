@@ -37,7 +37,8 @@ gm.gl.glCopyTexSubImage2D.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int,
 
 
 def _backend():
-    # Import only when a kernel is executed: gm45_backend imports this module.
+    # Import only when a kernel is executed: the MatrixMan backend façade
+    # imports this module on demand.
     from . import backend as gm45_backend
     return gm45_backend
 

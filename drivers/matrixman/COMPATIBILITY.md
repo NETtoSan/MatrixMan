@@ -122,9 +122,31 @@ representative of production performance. Run risky configurations one at a
 time in separate processes because a bad Mesa workload may poison or hang the
 graphics context.
 
-`MATRIXMAN_PROFILE=1` enables aggregated MatrixMan timing and OpenGL counters;
+`MATRIXMAN_PROFILE=1` enables the selected backend's profiler (CUDA and
+OpenGL retain independent implementations);
 `MATRIXMAN_PROFILE_DETAIL=1` adds detailed profiling output. These are
 profiling controls, not capability requirements.
+
+Python configuration is also available:
+
+```python
+import matrixman
+
+matrixman.prefer("cuda")       # "cuda", "opengl", or "auto"
+matrixman.profiling = True     # explicit profiling override
+matrixman.trace = True         # high-level operation tracing
+```
+
+An explicit Python preference wins over `MATRIXMAN_BACKEND`; `"auto"` clears
+the Python override and restores normal environment-then-automatic selection.
+For profiling, an explicit Python setting wins over `MATRIXMAN_PROFILE`, which
+wins over the legacy CUDA-only `MATRIXMAN_CUDA_PROFILE` setting. The legacy
+variable remains accepted by the CUDA profiler for compatibility.
+
+Tracing is independent of both selection and profiling. It is disabled by
+default; use `MATRIXMAN_TRACE=1` (or `matrixman.trace = True`) to enable
+high-level operation messages, and `MATRIXMAN_TRACE=0` (or `False`) to disable
+them.
 
 ## What Has Been Established
 

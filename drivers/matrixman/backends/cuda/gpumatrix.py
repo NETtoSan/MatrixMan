@@ -15,10 +15,8 @@ import sys
 
 import numpy as np
 
-try:
-    from . import profiling
-except ImportError:  # direct execution of this diagnostic module
-    import profiling
+from . import profiling
+from ...config import trace_log
 
 
 CUresult = ctypes.c_int
@@ -2195,7 +2193,7 @@ class CudaExecutionBackend:
             else None
         )
         total_outputs = n * k * out_h * out_w
-        print(f"[MatrixMan/CUDA] Conv2D [{n},{c},{h},{w}] -> [{n},{k},{out_h},{out_w}]")
+        trace_log(f"[MatrixMan/CUDA] Conv2D [{n},{c},{h},{w}] -> [{n},{k},{out_h},{out_w}]")
         if _cuda_debug_enabled():
             print(
                 "[MatrixMan/CUDA/debug] Conv2D launch: "

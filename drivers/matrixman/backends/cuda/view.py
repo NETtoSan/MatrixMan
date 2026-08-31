@@ -3,11 +3,6 @@
 
 import numpy as np
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-
 from drivers.matrixman.tensor import MatrixManTensor, contiguous_strides, infer_view_shape
 from drivers.matrixman.backends.cuda.backend import CudaTensorOwner
 from drivers.matrixman.backends.cuda.gpumatrix import CudaExecutionBackend

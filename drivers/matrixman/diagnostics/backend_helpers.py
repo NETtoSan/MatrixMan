@@ -14,6 +14,19 @@ def set_trace_if_supported(matrixman, enabled: bool) -> None:
         matrixman.set_trace(enabled)
 
 
+def reset_unsupported_report_if_supported(matrixman) -> None:
+    """Reset optional OpenGL unsupported-op telemetry without gating tests."""
+    if get_backend().name == "opengl":
+        matrixman.reset_unsupported_report()
+
+
+def unsupported_report_if_supported(matrixman) -> dict:
+    """Return optional backend telemetry, or an empty report on CUDA."""
+    if get_backend().name == "opengl":
+        return matrixman.unsupported_report()
+    return {}
+
+
 def describe_storage(tensor) -> str:
     """Return owner-neutral storage metadata for diagnostic output."""
     return (

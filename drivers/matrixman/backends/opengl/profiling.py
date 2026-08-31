@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import functools
+import atexit
 import os
+import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 
 from . import gpumatrix as gm
+from ...config import profiling_enabled
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-enabled = _env_flag("MATRIXMAN_PROFILE")
+enabled = profiling_enabled()
 detail = _env_flag("MATRIXMAN_PROFILE_DETAIL")
 gpu_timing_enabled = _env_flag("MATRIXMAN_GPU_TIMING")
 started = time.perf_counter()
@@ -44,6 +47,56 @@ _gpu_timer_pending: list[tuple[int, str, dict | None]] = []
 _gpu_timer_dropped = 0
 gpu_timings: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "total": 0.0, "max": 0.0})
 gpu_timing_samples: list[dict] = []
+_exit_hook_registered = False
+
+
+def set_enabled(value: bool) -> None:
+    """Update the OpenGL profiler without importing another backend."""
+    global enabled
+    enabled = bool(value)
+    if enabled:
+        register_exit_hook()
+    if enabled or gpu_timing_enabled:
+        gm.glBegin = _profile_gl_begin
+        gm.glFinish = _profile_gl_finish
+        gm.glFlush = _profile_gl_flush
+    # These compatibility aliases are consumed by the OpenGL operation
+    # modules. Keep them synchronized when Python configuration changes after
+    # backend import.
+    for module_name in (
+        "drivers.matrixman.backends.opengl.backend",
+        "drivers.matrixman.backends.opengl.implementation",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "_profile_enabled"):
+            module._profile_enabled = enabled
+
+
+def is_enabled() -> bool:
+    """Return the OpenGL profiler's current runtime state."""
+    return enabled
+
+
+def register_exit_hook() -> None:
+    """Register OpenGL reporting only after OpenGL has been selected."""
+    global _exit_hook_registered
+    if _exit_hook_registered:
+        return
+
+    def report_if_used() -> None:
+        from ...backend import active_backend
+
+        active = active_backend()
+        if (
+            active is not None
+            and active.name == "opengl"
+            and enabled
+            and (ops or counters or gpu_timings or conv)
+        ):
+            report()
+
+    atexit.register(report_if_used)
+    _exit_hook_registered = True
 
 
 def initialize_gpu_timing() -> None:

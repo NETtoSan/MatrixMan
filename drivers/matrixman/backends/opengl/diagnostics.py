@@ -7,6 +7,9 @@ from collections import Counter, defaultdict
 
 import torch
 
+from ...config import set_trace as _set_trace
+from ...config import trace_enabled as _trace_enabled
+from ...config import trace_log
 from ...tensor import MatrixManTensor
 
 
@@ -14,27 +17,26 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-trace_enabled = _env_flag("MATRIXMAN_DEBUG")
 unsupported_counts: Counter[str] = Counter()
 unsupported_examples: dict[str, list[dict]] = defaultdict(list)
 
 
 def set_trace(enabled: bool = True) -> None:
-    global trace_enabled
-    trace_enabled = enabled
+    _set_trace(enabled)
 
 
 def debug_enabled() -> bool:
-    return trace_enabled
+    # MATRIXMAN_DEBUG remains a legacy low-level OpenGL debug switch; it does
+    # not turn on the new high-level operation trace.
+    return _env_flag("MATRIXMAN_DEBUG") or _trace_enabled()
 
 
 def trace(message: str) -> None:
-    if trace_enabled:
-        print(message)
+    trace_log(message)
 
 
 def kernel_log(message: str) -> None:
-    print(f"[MatrixMan/OpenGL] {message}")
+    trace_log(f"[MatrixMan/OpenGL] {message}")
 
 
 def error_log(message: str) -> None:

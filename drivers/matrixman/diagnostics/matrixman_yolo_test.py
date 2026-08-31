@@ -175,19 +175,24 @@ def run_fake_yolo_trace(model_spec: str, image_size: int, mode: str) -> tuple[At
 
 
 def run_real_matrixman_first_blocker(model_spec: str, image_size: int) -> dict[str, Any]:
-    gm45.reset_unsupported_report()
+    from drivers.matrixman.diagnostics.backend_helpers import (
+        reset_unsupported_report_if_supported,
+        unsupported_report_if_supported,
+    )
+
+    reset_unsupported_report_if_supported(gm45)
     try:
         model = YOLO(model_spec).model.eval()
         x_cpu = torch.zeros((1, 3, image_size, image_size), dtype=torch.float32)
         x = gm45.to_device(x_cpu)
         with torch.no_grad():
             _ = model(x)
-        return {"status": "unexpectedly completed YOLO forward", "unsupported": gm45.unsupported_report()}
+        return {"status": "unexpectedly completed YOLO forward", "unsupported": unsupported_report_if_supported(gm45)}
     except Exception as exc:
         return {
             "status": "blocked during real MatrixMan YOLO forward",
             "reason": f"{type(exc).__name__}: {exc}",
-            "unsupported": gm45.unsupported_report(),
+            "unsupported": unsupported_report_if_supported(gm45),
         }
 
 

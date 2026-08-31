@@ -20,6 +20,16 @@ MATRIXMAN_BACKEND=opengl python3 -m drivers.matrixman --check
 MatrixMan selected: OpenGL
 ```
 
+High-level operation tracing is independent of backend selection and profiling
+and is disabled by default:
+
+```python
+from drivers import matrixman
+matrixman.trace = True
+```
+
+The environment equivalent is `MATRIXMAN_TRACE=1` (use `0` to disable it).
+
 The OpenGL tests require SDL2, a usable OpenGL context, floating-point texture
 and framebuffer support, and a graphical environment. A headless failure such as
 `SDL_Init failed: No available video device` is an environment failure, not a
@@ -43,6 +53,17 @@ every operator needs two copies of a test.
 
 Directory placement describes the layer actually tested, not merely the
 backend eventually selected.
+
+Modules named `matrixman_*` are frontend diagnostics and must keep numerical
+validation independent of backend-specific telemetry. In particular, optional
+OpenGL unsupported-operation reports are omitted on CUDA; their absence is not
+an operation failure. Run portable checks explicitly against each implemented
+backend when hardware is available:
+
+```bash
+MATRIXMAN_BACKEND=cuda python3 -m drivers.matrixman.diagnostics.matrixman_conv_demo
+MATRIXMAN_BACKEND=opengl python3 -m drivers.matrixman.diagnostics.matrixman_conv_demo
+```
 
 - `drivers/matrixman/backends/cuda/<op>.py` is a CUDA backend diagnostic when
   it is run as an executable module. It may inspect `CudaExecutionBackend`,
@@ -155,7 +176,7 @@ deterministic Conv. The address diagnostic does not perform convolution.
 For low-level OpenGL checks:
 
 ```bash
-python3 drivers/matrixman/backends/opengl/gpumatrix.py
+python3 -m drivers.matrixman.backends.opengl.gpumatrix
 python3 -m drivers.matrixman.diagnostics.cpu_gpu_benchmark --skip-stress
 python3 -m drivers.matrixman.backends.opengl.gpu_stress --seconds 10 --size 128
 ```

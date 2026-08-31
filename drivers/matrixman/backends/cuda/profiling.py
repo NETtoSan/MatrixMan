@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import atexit
-import os
 import time
 from collections import defaultdict
 
+from ...config import profiling_enabled
+
 
 def _enabled() -> bool:
-    return os.environ.get("MATRIXMAN_CUDA_PROFILE", "").strip().lower() not in {
-        "", "0", "false", "no", "off"
-    }
+    return profiling_enabled(legacy_cuda=True)
 
 
 enabled = _enabled()
@@ -21,6 +20,52 @@ conv2d = defaultdict(float)
 activation = defaultdict(float)
 parameter_cache = defaultdict(float)
 conv2d_signatures = {}
+_exit_hook_registered = False
+
+
+def set_enabled(value: bool) -> None:
+    """Update profiling for an explicit Python configuration change."""
+    global enabled
+    enabled = bool(value)
+    if enabled:
+        register_exit_hook()
+
+
+def is_enabled() -> bool:
+    """Return the CUDA profiler's current runtime state."""
+    return enabled
+
+
+def reset() -> None:
+    """Reset aggregate CUDA profiling state for the next measurement window."""
+    records.clear()
+    batch_norm.clear()
+    conv2d.clear()
+    activation.clear()
+    parameter_cache.clear()
+    conv2d_signatures.clear()
+
+
+def register_exit_hook() -> None:
+    """Register CUDA reporting only after CUDA has been selected."""
+    global _exit_hook_registered
+    if _exit_hook_registered:
+        return
+
+    def report_if_used() -> None:
+        from ...backend import active_backend
+
+        active = active_backend()
+        if (
+            active is not None
+            and active.name == "cuda"
+            and enabled
+            and (records or batch_norm or conv2d or activation or parameter_cache)
+        ):
+            report()
+
+    atexit.register(report_if_used)
+    _exit_hook_registered = True
 
 
 def start() -> float | None:
@@ -176,6 +221,3 @@ def report() -> None:
                 f"output_elements={n * cout * hout * wout} "
                 f"MACs={macs} GMAC/s={gmacs:.3f}"
             )
-
-
-atexit.register(report)

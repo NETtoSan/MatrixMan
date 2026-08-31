@@ -192,7 +192,7 @@ def is_gm45_tensor(value) -> bool:
 def install_tensor_method() -> None:
     """Install the historical Tensor.gm45() convenience method."""
     def upload(value):
-        from .gm45_backend import to_device
+        from .backend import to_device
 
         return to_device(value)
 

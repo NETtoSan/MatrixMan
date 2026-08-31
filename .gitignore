@@ -32,3 +32,6 @@ textlogs/*.json
 
 # OS
 .DS_Store
+available
+fallback
+preferred

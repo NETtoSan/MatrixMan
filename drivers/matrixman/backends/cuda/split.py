@@ -3,14 +3,7 @@
 
 import numpy as np
 
-try:
-    from .gpumatrix import CudaExecutionBackend, print_check
-except ImportError:
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from gpumatrix import CudaExecutionBackend, print_check
+from .gpumatrix import CudaExecutionBackend, print_check
 
 
 def run_split(cuda, input_array, split_size, dimension):
