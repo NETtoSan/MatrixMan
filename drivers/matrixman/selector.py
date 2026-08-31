@@ -1,52 +1,123 @@
-"""Explicit MatrixMan backend probing and selection."""
+"""Backend capability probing and explicit MatrixMan backend selection."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import os
 
 from .backend import Backend, set_backend
+from .backends.cuda.backend import CudaBackend
+from .backends.cuda.gpumatrix import detect_device
 from .backends.opengl.backend import OpenGLBackend
 
 
-def _probe_results() -> list[tuple[str, str, type[Backend] | None]]:
-    results = [("opencl", "not implemented", None)]
+@dataclass(frozen=True)
+class BackendCapability:
+    """Small, shared capability record used by probing and selection."""
+
+    name: str
+    available: bool
+    enabled: bool
+    implemented: bool
+    backend: type[Backend] | None = None
+    device: str | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+def probe_capabilities() -> dict[str, BackendCapability]:
+    """Probe all known backends once and return the ordered capability registry."""
     try:
-        available = OpenGLBackend.probe()
+        opengl_available = OpenGLBackend.probe()
     except Exception:
-        available = False
-    results.append(("opengl", "available" if available else "unavailable", OpenGLBackend))
-    return results
+        opengl_available = False
+
+    try:
+        _, cuda_info = detect_device()
+    except Exception:
+        cuda_info = None
+
+    return {
+        "cuda": BackendCapability(
+            name="cuda",
+            available=cuda_info is not None,
+            enabled=True,
+            implemented=True,
+            backend=CudaBackend,
+            device=cuda_info["name"] if cuda_info else None,
+            metadata={"compute_capability": cuda_info["compute_capability"]}
+            if cuda_info
+            else {},
+        ),
+        "opengl": BackendCapability(
+            name="opengl",
+            available=opengl_available,
+            enabled=True,
+            implemented=True,
+            backend=OpenGLBackend,
+        ),
+        "opencl": BackendCapability(
+            name="opencl", available=False, enabled=False, implemented=False
+        ),
+    }
+
+
+def _status(capability: BackendCapability) -> str:
+    if capability.name == "opencl" and not capability.implemented:
+        return "not implemented"
+    return "available" if capability.available else "unavailable"
+
+
+def _print_probe(capabilities: dict[str, BackendCapability]) -> None:
+    print("MatrixMan probe:")
+    for name, capability in capabilities.items():
+        status = _status(capability)
+        suffix = " [disabled]" if capability.available and not capability.enabled else ""
+        print(f"  {name_label(name)}: {status}{suffix}")
+        if capability.device:
+            print(f"    device: {capability.device}")
+        if capability.metadata.get("compute_capability"):
+            print(f"    compute capability: {capability.metadata['compute_capability']}")
+
+
+def name_label(name: str) -> str:
+    return {"opencl": "OpenCL", "opengl": "OpenGL", "cuda": "CUDA"}[name]
 
 
 def select_backend() -> Backend:
-    """Probe the known backends, select OpenGL when usable, and log once."""
+    """Probe known backends, report the registry, and select an enabled backend."""
     requested = os.environ.get("MATRIXMAN_BACKEND", "").strip().lower()
-    if requested and requested not in {"opencl", "opengl"}:
+    capabilities = probe_capabilities()
+    _print_probe(capabilities)
+
+    if requested and requested not in {"cuda", "opengl", "opencl"}:
         raise RuntimeError(
-            f"Unknown MatrixMan backend {requested!r}; available names: opengl"
+            f"Unknown MatrixMan backend {requested!r}; available names: cuda, opengl"
         )
 
-    results = _probe_results()
-    labels = {"opencl": "OpenCL", "opengl": "OpenGL"}
-    summary = ", ".join(f"{labels[name]}={status}" for name, status, _ in results)
-    print(f"MatrixMan probe: {summary}")
-
-    statuses = {name: status for name, status, _ in results}
     if requested:
-        if statuses[requested] != "available":
-            if statuses[requested] == "not implemented":
+        capability = capabilities[requested]
+        if not capability.available or not capability.enabled or not capability.implemented:
+            if not capability.implemented:
                 raise RuntimeError(
                     "MatrixMan backend 'opencl' was requested, but OpenCL is not implemented"
                 )
+            if not capability.enabled:
+                raise RuntimeError(f"MatrixMan backend '{requested}' is disabled")
             raise RuntimeError(f"MatrixMan backend '{requested}' is unavailable")
-        selected_name = requested
+        selected = capability
     else:
-        selected_name = next(
-            (name for name, status, _ in results if status == "available"), None
+        selected = next(
+            (
+                capability
+                for capability in capabilities.values()
+                if capability.enabled and capability.implemented and capability.available
+            ),
+            None,
         )
-        if selected_name is None:
+        if selected is None:
             raise RuntimeError("No usable MatrixMan backend found")
 
-    selected_type = next(cls for name, _, cls in results if name == selected_name)
-    print(f"MatrixMan selected: {labels[selected_name]}")
-    return set_backend(selected_type())
+    if selected.backend is None:
+        raise RuntimeError(f"MatrixMan backend '{selected.name}' has no implementation")
+    print(f"MatrixMan selected: {name_label(selected.name)}")
+    return set_backend(selected.backend())

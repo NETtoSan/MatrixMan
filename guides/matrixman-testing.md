@@ -1,15 +1,27 @@
 # MatrixMan testing
 
-Run commands from the repository root. MatrixMan currently selects OpenGL when
-the SDL/OpenGL probe succeeds:
+Run commands from the repository root. MatrixMan prefers CUDA when the legacy
+CUDA probe succeeds, and falls back to OpenGL when CUDA is unavailable:
 
 ```text
-MatrixMan probe: OpenCL=not implemented, OpenGL=available
+MatrixMan probe:
+  CUDA: available
+    device: NVIDIA GeForce GT 720M
+    compute capability: 2.1
+  OpenGL: available
+  OpenCL: not implemented
+MatrixMan selected: CUDA
+```
+
+An explicit OpenGL override remains available even when CUDA is detected:
+
+```text
+MATRIXMAN_BACKEND=opengl python3 -m drivers.matrixman --check
 MatrixMan selected: OpenGL
 ```
 
-The tests require SDL2, a usable OpenGL context, floating-point texture and
-framebuffer support, and a graphical environment. A headless failure such as
+The OpenGL tests require SDL2, a usable OpenGL context, floating-point texture
+and framebuffer support, and a graphical environment. A headless failure such as
 `SDL_Init failed: No available video device` is an environment failure, not a
 numerical MatrixMan result.
 

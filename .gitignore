@@ -28,6 +28,7 @@ outputs/
 runs/
 *.log
 textlogs/*.txt
+textlogs/*.json
 
 # OS
 .DS_Store

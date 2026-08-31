@@ -49,7 +49,10 @@ arithmetic on the CPU.
 
 ## Current Status
 
-The working MatrixMan backend is currently OpenGL. The following are verified
+The working PyTorch-facing MatrixMan backend is currently OpenGL. A separate
+low-level CUDA execution backend is selectable when its legacy driver is
+available, but it is not yet integrated with the PrivateUse1 tensor frontend.
+The following are verified
 hardware results, not a claim that all GPUs from these vendors or families are
 supported:
 
@@ -302,14 +305,14 @@ The backend layout leaves room for future sibling implementations:
 ```text
 drivers/matrixman/backends/
 ├── opengl/   verified current backend
-├── cuda/     placeholder only; not implemented
+├── cuda/     legacy Driver API execution backend; frontend integration pending
 └── opencl/   placeholder only; not implemented
 ```
 
-CUDA and OpenCL support are not currently provided. A future backend will need
-its own runtime, resource ownership, tensor representation, dispatch bridge,
-operator implementations, and framework/factory integration. The current
-OpenGL `Gm45Tensor` is not intended to be shared by those backends.
+OpenCL support is not currently provided. CUDA has a low-level runtime and
+matrix execution path, but still needs its own tensor representation, dispatch
+bridge, operator implementations, and framework/factory integration. The
+current OpenGL `Gm45Tensor` is not intended to be shared by those backends.
 
 ## What MatrixMan Is Not
 
