@@ -6,7 +6,7 @@ import torch
 
 from .. import diagnostics, gpumatrix as gm, kernels, operation_context
 from ..storage import numel
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 def _packed_add_program(params: tuple) -> tuple[int, int, int]:
     rt = operation_context.gl_runtime()
@@ -182,7 +182,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_packed_sub(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm45Tensor":
+def _render_packed_sub(left: "MatrixManTensor", right: "MatrixManTensor") -> "MatrixManTensor":
     if left.dtype != torch.float32 or right.dtype != torch.float32:
         raise RuntimeError("gm45 packed sub only supports float32")
     if left.shape != right.shape:
@@ -227,8 +227,8 @@ def _render_packed_sub(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after packed sub: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, shape)
-def _render_packed_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: float) -> "Gm45Tensor":
+    return MatrixManTensor._from_owner(out_owner, shape)
+def _render_packed_add(left: "MatrixManTensor", right: "MatrixManTensor", alpha: float) -> "MatrixManTensor":
     if left.dtype != torch.float32 or right.dtype != torch.float32:
         raise RuntimeError("gm45 packed add only supports float32")
     operation_context.require_contiguous(left, "packed add")
@@ -278,7 +278,7 @@ def _render_packed_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: float) ->
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after packed add: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, shape)
+    return MatrixManTensor._from_owner(out_owner, shape)
 
 
 def _packed_strided_add_program(params: tuple) -> tuple[int, int, int]:
@@ -357,7 +357,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_packed_strided_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: float) -> "Gm45Tensor":
+def _render_packed_strided_add(left: "MatrixManTensor", right: "MatrixManTensor", alpha: float) -> "MatrixManTensor":
     if left.dtype != torch.float32 or right.dtype != torch.float32:
         raise RuntimeError("gm45 stride-aware packed add only supports float32")
     if left.shape != right.shape or len(left.shape) != 3 or int(left.shape[0]) != 1:
@@ -392,7 +392,7 @@ def _render_packed_strided_add(left: "Gm45Tensor", right: "Gm45Tensor", alpha: f
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after stride-aware packed add: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, shape)
+    return MatrixManTensor._from_owner(out_owner, shape)
 
 def _packed_scalar_div_program(params: tuple) -> tuple[int, int]:
     rt = operation_context.gl_runtime()
@@ -451,7 +451,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_packed_scalar_div(tensor: "Gm45Tensor", divisor: float) -> "Gm45Tensor":
+def _render_packed_scalar_div(tensor: "MatrixManTensor", divisor: float) -> "MatrixManTensor":
     if tensor.dtype != torch.float32:
         raise RuntimeError("gm45 scalar div supports only float32")
     if tensor._owner.layout.kind != "packed_rgba":
@@ -485,7 +485,7 @@ def _render_packed_scalar_div(tensor: "Gm45Tensor", divisor: float) -> "Gm45Tens
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after scalar div: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, shape)
+    return MatrixManTensor._from_owner(out_owner, shape)
 
 def _packed_broadcast_mul_program(params: tuple) -> tuple[int, int, int]:
     rt = operation_context.gl_runtime()
@@ -562,7 +562,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_packed_broadcast_mul(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm45Tensor":
+def _render_packed_broadcast_mul(left: "MatrixManTensor", right: "MatrixManTensor") -> "MatrixManTensor":
     if left.dtype != torch.float32 or right.dtype != torch.float32:
         raise RuntimeError("gm45 broadcast mul supports only float32")
     left_shape = tuple(int(v) for v in left.shape)
@@ -602,7 +602,7 @@ def _render_packed_broadcast_mul(left: "Gm45Tensor", right: "Gm45Tensor") -> "Gm
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after broadcast mul: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)
 
 def _scalar_add_program(params: tuple) -> tuple[int, int]:
     rt = operation_context.gl_runtime()
@@ -674,9 +674,9 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_scalar_add(tensor: "Gm45Tensor", scalar: float, alpha: float, *, tensor_first: bool) -> "Gm45Tensor":
-    if not isinstance(tensor, Gm45Tensor):
-        raise RuntimeError("gm45 scalar add requires one Gm45Tensor input")
+def _render_scalar_add(tensor: "MatrixManTensor", scalar: float, alpha: float, *, tensor_first: bool) -> "MatrixManTensor":
+    if not isinstance(tensor, MatrixManTensor):
+        raise RuntimeError("gm45 scalar add requires one MatrixManTensor input")
     if tensor.dtype != torch.float32:
         raise RuntimeError("gm45 scalar add supports only float32")
     if tensor._owner.layout.kind != "packed_rgba":
@@ -727,4 +727,4 @@ def _render_scalar_add(tensor: "Gm45Tensor", scalar: float, alpha: float, *, ten
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after scalar add: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, shape)
+    return MatrixManTensor._from_owner(out_owner, shape)

@@ -15,8 +15,8 @@ def main() -> int:
     for anchors in (84, 336, 8400):
         boxes_cpu = torch.randn((1, 4, anchors), dtype=torch.float32)
         strides_cpu = torch.randn((1, anchors), dtype=torch.float32)
-        boxes = gm45.to_gm45(boxes_cpu)
-        strides = gm45.to_gm45(strides_cpu)
+        boxes = gm45.to_device(boxes_cpu)
+        strides = gm45.to_device(strides_cpu)
         output = boxes * strides
         output_cpu = output.cpu()
         expected = boxes_cpu * strides_cpu

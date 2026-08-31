@@ -4,10 +4,23 @@ from ...backend import Backend
 from . import diagnostics, factories, gpumatrix as gm, profiling, runtime, tensor as tensor_module
 from . import metadata, operation_context, resources
 from .ops import matmul, postprocessing
+from ...tensor import (
+    Gm45Tensor,
+    MatrixManTensor,
+    PRIVATEUSE_DEVICE,
+    install_tensor_method,
+    is_gm45_tensor,
+    is_matrixman_tensor,
+)
 
 
 class OpenGLBackend(Backend):
     name = "opengl"
+
+    def __init__(self):
+        # Factory registration is selection-time work.  Importing this module
+        # must not install OpenGL PrivateUse1 implementations for CUDA.
+        factories.install_privateuse1_factory_kernels()
 
     def device_info(self) -> dict[str, str]:
         return device_info()
@@ -53,10 +66,6 @@ def device_info() -> dict[str, str]:
     }
 
 
-Gm45Tensor = tensor_module.Gm45Tensor
-PRIVATEUSE_DEVICE = tensor_module.PRIVATEUSE_DEVICE
-
-
 def init() -> None:
     runtime.init()
 
@@ -95,9 +104,7 @@ def unsupported_report() -> dict[str, dict]:
 
 tensor = tensor_module.tensor
 randn = tensor_module.randn
-to_gm45 = tensor_module.to_gm45
-is_gm45_tensor = tensor_module.is_gm45_tensor
-install_tensor_method = tensor_module.install_tensor_method
+to_gm45 = tensor_module.tensor
 
 
 def gpu_postprocess_detection(tensor):
@@ -119,6 +126,4 @@ _profile_counters = profiling.counters
 _profile_conv = profiling.conv
 
 
-_tensor_module = __import__(__name__.rsplit(".", 1)[0] + ".tensor", fromlist=["tensor"])
-_tensor_module.install_tensor_method()
-factories.install_privateuse1_factory_kernels()
+install_tensor_method()

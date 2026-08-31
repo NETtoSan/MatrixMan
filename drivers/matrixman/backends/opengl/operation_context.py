@@ -11,7 +11,8 @@ import torch
 
 from . import gpumatrix as gm
 from . import kernels, metadata, profiling, render, resources, runtime
-from .tensor import Gm45Tensor, owner_from_texture
+from ...tensor import MatrixManTensor
+from .tensor import owner_from_texture
 
 
 def gl_runtime():
@@ -33,7 +34,7 @@ def output_texture(shape):
 
 
 def tensor_from_owner(owner, shape, storage_offset=0, logical_strides=None):
-    return Gm45Tensor._from_owner(owner, shape, storage_offset, logical_strides)
+    return MatrixManTensor._from_owner(owner, shape, storage_offset, logical_strides)
 
 
 def validate_shape(shape) -> None:
@@ -41,7 +42,7 @@ def validate_shape(shape) -> None:
 
 
 def is_scalar_operand(value) -> bool:
-    if isinstance(value, Gm45Tensor):
+    if isinstance(value, MatrixManTensor):
         return False
     if isinstance(value, torch.Tensor):
         return value.device.type == "cpu" and value.numel() == 1 and value.dtype in {

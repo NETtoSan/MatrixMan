@@ -26,10 +26,10 @@ from .ops import pooling as _pooling
 from .ops import resize as _resize
 from .ops import softmax as _softmax
 from .storage import StorageLayout as _StorageLayout
+from ...tensor import MatrixManTensor, PRIVATEUSE_DEVICE
 
 OpenGLBackend = _backend.OpenGLBackend
-Gm45Tensor = _tensor.Gm45Tensor
-PRIVATEUSE_DEVICE = _tensor.PRIVATEUSE_DEVICE
+Gm45Tensor = MatrixManTensor
 
 init = _backend.init
 shutdown = _backend.shutdown
@@ -43,6 +43,7 @@ unsupported_report = _backend.unsupported_report
 tensor = _backend.tensor
 randn = _backend.randn
 to_gm45 = _backend.to_gm45
+is_matrixman_tensor = _backend.is_matrixman_tensor
 is_gm45_tensor = _backend.is_gm45_tensor
 install_tensor_method = _backend.install_tensor_method
 

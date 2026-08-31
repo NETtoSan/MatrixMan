@@ -7,7 +7,7 @@ import torch
 
 from .. import diagnostics, gpumatrix as gm, operation_context, profiling
 from ..storage import packed_atlas_size
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 def _batchnorm_program(params: tuple) -> tuple[int, int, int, int, int, int]:
     rt = operation_context.gl_runtime()
@@ -100,8 +100,8 @@ def _render_batch_norm(args):
     del momentum
     if training:
         raise RuntimeError("gm45 native_batch_norm supports inference/eval mode only")
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 native_batch_norm requires input to be a Gm45Tensor")
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 native_batch_norm requires input to be a MatrixManTensor")
     if input_tensor._owner.layout.kind != "packed_rgba":
         raise RuntimeError("gm45 native_batch_norm requires packed_rgba input storage")
     operation_context.require_contiguous(input_tensor, "native_batch_norm")
@@ -177,5 +177,5 @@ def _render_batch_norm(args):
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after batch_norm: 0x{err:04x}")
-    output = Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in input_tensor.shape))
+    output = MatrixManTensor._from_owner(out_owner, tuple(int(v) for v in input_tensor.shape))
     return output, torch.empty((0,), dtype=torch.float32), torch.empty((0,), dtype=torch.float32)

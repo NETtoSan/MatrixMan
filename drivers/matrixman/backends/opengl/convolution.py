@@ -394,7 +394,7 @@ def _render_convolution_spatial(input_tensor, out_owner, weight_owner, bias_owne
         gm.glVertex2f(1.0, 1.0); gm.glVertex2f(-1.0, 1.0); gm.glEnd()
     if (err := gm.glGetError()):
         raise RuntimeError(f"gm45 spatial-reuse convolution OpenGL error: 0x{err:04x}")
-    return b.Gm45Tensor._from_owner(out_owner, (1, params[3], params[4], params[5]))
+    return b.MatrixManTensor._from_owner(out_owner, (1, params[3], params[4], params[5]))
 
 
 def _conv_tile_shader_source(params: tuple, tile_x: int, tile_y: int) -> bytes:
@@ -677,7 +677,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         gm.glFinish()
         if b._profile_enabled:
             b._profile_conv["consolidation"] += time.perf_counter() - consolidation_started
-        return b.Gm45Tensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
+        return b.MatrixManTensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
     finally:
         for tile in tile_owners:
             _resources.release_scratch_texture(tile)
@@ -728,8 +728,8 @@ def execute(args):
     input_tensor, weight_tensor, bias_tensor = args[0], args[1], args[2]
     stride, padding, dilation = _as_pair(args[3], "stride"), _as_pair(args[4], "padding"), _as_pair(args[5], "dilation")
     transposed, output_padding, groups = bool(args[6]), _as_pair(args[7], "output_padding"), int(args[8])
-    if not isinstance(input_tensor, b.Gm45Tensor):
-        raise RuntimeError("gm45 convolution requires input to be a Gm45Tensor")
+    if not isinstance(input_tensor, b.MatrixManTensor):
+        raise RuntimeError("gm45 convolution requires input to be a MatrixManTensor")
     if input_tensor._owner.layout.kind != "packed_rgba":
         raise RuntimeError("gm45 convolution requires packed_rgba input storage")
     b._require_contiguous_logical(input_tensor, "convolution")
@@ -815,4 +815,4 @@ def execute(args):
     b._trace(f"gm45.opengl -> submitted Conv2D fullscreen quad, output texture #{out_owner.texture}")
     if (err := gm.glGetError()):
         raise RuntimeError(f"gm45 OpenGL error after convolution: 0x{err:04x}")
-    return b.Gm45Tensor._from_owner(out_owner, out_shape)
+    return b.MatrixManTensor._from_owner(out_owner, out_shape)

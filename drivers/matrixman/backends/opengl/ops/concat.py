@@ -7,7 +7,7 @@ import torch
 from .. import diagnostics, gpumatrix as gm, operation_context, profiling
 from ..kernels import glsl_float as _glsl_float
 from ..storage import contiguous_strides, numel
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 def _stack_program(params: tuple) -> tuple[int, tuple[int, ...]]:
     rt = operation_context.gl_runtime()
@@ -460,7 +460,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_stack(args, kwargs) -> "Gm45Tensor":
+def _render_stack(args, kwargs) -> "MatrixManTensor":
     tensors = list(args[0])
     dim = int(args[1]) if len(args) > 1 else int(kwargs.get("dim", 0))
     if not tensors:
@@ -474,8 +474,8 @@ def _render_stack(args, kwargs) -> "Gm45Tensor":
 
     shape = tuple(int(v) for v in tensors[0].shape)
     for tensor in tensors:
-        if not isinstance(tensor, Gm45Tensor):
-            raise RuntimeError("gm45 stack requires all inputs to be Gm45Tensor instances")
+        if not isinstance(tensor, MatrixManTensor):
+            raise RuntimeError("gm45 stack requires all inputs to be MatrixManTensor instances")
         if tensor.dtype != torch.float32:
             raise RuntimeError("gm45 stack supports only float32 inputs")
         if tensor._owner.layout.kind != "packed_rgba":
@@ -527,13 +527,13 @@ def _render_stack(args, kwargs) -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after stack: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)
 
-def _render_fill_scalar(args) -> "Gm45Tensor":
+def _render_fill_scalar(args) -> "MatrixManTensor":
     tensor = args[0]
     scalar = args[1]
-    if not isinstance(tensor, Gm45Tensor):
-        raise RuntimeError("gm45 fill_ requires a Gm45Tensor destination")
+    if not isinstance(tensor, MatrixManTensor):
+        raise RuntimeError("gm45 fill_ requires a MatrixManTensor destination")
     if tensor.dtype != torch.float32:
         raise RuntimeError("gm45 fill_ supports only float32 destinations")
     if tensor._owner.layout.kind != "packed_rgba":
@@ -585,7 +585,7 @@ def _render_fill_scalar(args) -> "Gm45Tensor":
     tensor._logical_strides = contiguous_strides(shape)
     return tensor
 
-def _render_cat_dim1_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
+def _render_cat_dim1_3d(tensors: list["MatrixManTensor"], dim: int) -> "MatrixManTensor":
     if len(tensors) != 2 or dim != 1:
         raise RuntimeError("gm45 3D dim-1 cat currently supports exactly two inputs")
     shapes = [tuple(int(v) for v in tensor.shape) for tensor in tensors]
@@ -594,8 +594,8 @@ def _render_cat_dim1_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
     if shapes[0][2] != shapes[1][2]:
         raise RuntimeError("gm45 3D dim-1 cat requires matching final dimensions")
     for tensor in tensors:
-        if not isinstance(tensor, Gm45Tensor) or tensor.dtype != torch.float32:
-            raise RuntimeError("gm45 3D dim-1 cat requires float32 Gm45Tensor inputs")
+        if not isinstance(tensor, MatrixManTensor) or tensor.dtype != torch.float32:
+            raise RuntimeError("gm45 3D dim-1 cat requires float32 MatrixManTensor inputs")
         if tensor._owner.layout.kind != "packed_rgba":
             raise RuntimeError("gm45 3D dim-1 cat requires packed_rgba input storage")
         operation_context.require_contiguous(tensor, "3D dim-1 cat")
@@ -630,9 +630,9 @@ def _render_cat_dim1_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after 3D dim-1 cat: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)
 
-def _render_cat(args, kwargs) -> "Gm45Tensor":
+def _render_cat(args, kwargs) -> "MatrixManTensor":
     tensors = list(args[0])
     dim = int(args[1]) if len(args) > 1 else int(kwargs.get("dim", 0))
     if dim < 0 and tensors:
@@ -655,8 +655,8 @@ def _render_cat(args, kwargs) -> "Gm45Tensor":
     _, _, height, width = first_shape
 
     for tensor, shape in zip(tensors, shapes):
-        if not isinstance(tensor, Gm45Tensor):
-            raise RuntimeError("gm45 cat requires all inputs to be Gm45Tensor instances")
+        if not isinstance(tensor, MatrixManTensor):
+            raise RuntimeError("gm45 cat requires all inputs to be MatrixManTensor instances")
         if tensor.dtype != torch.float32:
             raise RuntimeError("gm45 cat supports only float32 inputs")
         if tensor._owner.layout.kind != "packed_rgba":
@@ -715,9 +715,9 @@ def _render_cat(args, kwargs) -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after cat: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)
 
-def _render_cat_dim0_2d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
+def _render_cat_dim0_2d(tensors: list["MatrixManTensor"], dim: int) -> "MatrixManTensor":
     if not 2 <= len(tensors) <= 4:
         raise RuntimeError("gm45 2D dim-0 cat currently supports 2 to 4 input tensors")
     shapes = [tuple(int(v) for v in tensor.shape) for tensor in tensors]
@@ -727,8 +727,8 @@ def _render_cat_dim0_2d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
     _, cols = first_shape
 
     for tensor, shape in zip(tensors, shapes):
-        if not isinstance(tensor, Gm45Tensor):
-            raise RuntimeError("gm45 2D dim-0 cat requires all inputs to be Gm45Tensor instances")
+        if not isinstance(tensor, MatrixManTensor):
+            raise RuntimeError("gm45 2D dim-0 cat requires all inputs to be MatrixManTensor instances")
         if tensor.dtype != torch.float32:
             raise RuntimeError("gm45 2D dim-0 cat supports only float32 inputs")
         if tensor._owner.layout.kind != "packed_rgba":
@@ -787,9 +787,9 @@ def _render_cat_dim0_2d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after 2D dim-0 cat: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)
 
-def _render_cat_lastdim_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor":
+def _render_cat_lastdim_3d(tensors: list["MatrixManTensor"], dim: int) -> "MatrixManTensor":
     if not 2 <= len(tensors) <= 4:
         raise RuntimeError("gm45 3D last-dim cat currently supports 2 to 4 input tensors")
     shapes = [tuple(int(v) for v in tensor.shape) for tensor in tensors]
@@ -801,8 +801,8 @@ def _render_cat_lastdim_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor
     batch, rows, _ = first_shape
 
     for tensor, shape in zip(tensors, shapes):
-        if not isinstance(tensor, Gm45Tensor):
-            raise RuntimeError("gm45 3D last-dim cat requires all inputs to be Gm45Tensor instances")
+        if not isinstance(tensor, MatrixManTensor):
+            raise RuntimeError("gm45 3D last-dim cat requires all inputs to be MatrixManTensor instances")
         if tensor.dtype != torch.float32:
             raise RuntimeError("gm45 3D last-dim cat supports only float32 inputs")
         if tensor._owner.layout.kind != "packed_rgba":
@@ -860,4 +860,4 @@ def _render_cat_lastdim_3d(tensors: list["Gm45Tensor"], dim: int) -> "Gm45Tensor
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after 3D last-dim cat: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)

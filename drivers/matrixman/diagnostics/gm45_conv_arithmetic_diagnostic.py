@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from drivers import matrixman as gm45
 from drivers.matrixman import gpumatrix as gl
 from drivers.matrixman.backends.opengl import convolution, operation_context, resources, runtime, storage
-from drivers.matrixman.backends.opengl import tensor as tensor_module
+from drivers.matrixman import tensor as tensor_module
 
 gl.gl.glScissor.restype = None
 gl.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -70,7 +70,7 @@ def render_scalar(gx, gw, input_dims, weight_dims, body):
         gl.glEnd()
         if (error := gl.glGetError()):
             raise RuntimeError(f"arithmetic diagnostic OpenGL error: 0x{error:04x}")
-        return tensor_module.Gm45Tensor._from_owner(owner, (1,)).cpu().item()
+        return tensor_module.MatrixManTensor._from_owner(owner, (1,)).cpu().item()
     finally:
         gl.glDeleteProgram(program)
 
@@ -88,14 +88,14 @@ def render_constant(iterations, looped):
         gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER,gl.GL_COLOR_ATTACHMENT0,gl.GL_TEXTURE_2D,owner.texture,0)
         gl.glUseProgram(program); gl.glBegin(gl.GL_QUADS)
         gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
-        return tensor_module.Gm45Tensor._from_owner(owner,(1,)).cpu().item()
+        return tensor_module.MatrixManTensor._from_owner(owner,(1,)).cpu().item()
     finally:
         gl.glDeleteProgram(program)
 
 
 def render_full_conv(x, weight):
     """Run the existing full-output shader source without dispatching aten.convolution."""
-    gx = gm45.to_gm45(x)
+    gx = gm45.to_device(x)
     weight_owner = resources.upload_raw_packed_array(weight.numpy())
     out_shape = (1, weight.shape[0], x.shape[2], x.shape[3])
     out_owner = operation_context.output_texture(tuple(out_shape))
@@ -118,7 +118,7 @@ def render_full_conv(x, weight):
         gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
         if (error := gl.glGetError()):
             raise RuntimeError(f"full arithmetic diagnostic OpenGL error: 0x{error:04x}")
-        return tensor_module.Gm45Tensor._from_owner(out_owner, out_shape).cpu(), gx, weight_owner
+        return tensor_module.MatrixManTensor._from_owner(out_owner, out_shape).cpu(), gx, weight_owner
     except Exception:
         gl.glDeleteTextures(1, ctypes.byref(weight_owner.texture))
         raise
@@ -126,7 +126,7 @@ def render_full_conv(x, weight):
 
 def render_full_dispatch(x, weight, *, tiles=1, reset=False, out_owner=None):
     """Production shader dispatch with optional scissor tiling/state reset."""
-    gx = gm45.to_gm45(x)
+    gx = gm45.to_device(x)
     weight_owner = resources.upload_raw_packed_array(weight.numpy())
     out_shape = (1, weight.shape[0], x.shape[2], x.shape[3])
     if out_owner is None:
@@ -168,7 +168,7 @@ def render_full_dispatch(x, weight, *, tiles=1, reset=False, out_owner=None):
     if tiles != 1:
         gl.gl.glDisable(GL_SCISSOR_TEST)
     error = gl.glGetError()
-    actual = tensor_module.Gm45Tensor._from_owner(out_owner, out_shape).cpu()
+    actual = tensor_module.MatrixManTensor._from_owner(out_owner, out_shape).cpu()
     print(f"dispatch state: fbo={rt.fbo.value} complete={complete} viewport={width}x{height} active_texture=GL_TEXTURE2 input_tex={gx._owner.texture} weight_tex={weight_owner.texture} output_tex={out_owner.texture} program={program} samplers=(0,1,2) gl_error=0x{error:04x}")
     return actual, out_owner
 
@@ -183,7 +183,7 @@ def setup(in_c, out_c=1, h=32, w=32):
     torch.manual_seed(10000+in_c+out_c+h)
     x=torch.randn((1,in_c,h,w),dtype=torch.float32)*0.1
     weight=torch.randn((out_c,in_c,3,3),dtype=torch.float32)*0.1
-    return x,weight,gm45.to_gm45(x),gm45.to_gm45(weight.reshape(-1))
+    return x,weight,gm45.to_device(x),gm45.to_device(weight.reshape(-1))
 
 
 def tensor_probe(label, in_c, terms, looped=False, h=32, w=32):

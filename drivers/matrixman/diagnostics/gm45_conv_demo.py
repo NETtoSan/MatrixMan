@@ -3,7 +3,7 @@
 Correctness tests for the first GM45 Conv2D GLSL kernel.
 
 The tested operation is aten.convolution.default via torch.nn.functional.conv2d.
-Input and output tensors remain OpenGL texture-backed Gm45Tensors until the
+Input and output tensors remain OpenGL texture-backed MatrixManTensors until the
 explicit .cpu() validation readback.
 """
 
@@ -23,7 +23,7 @@ def run_case(shape, weight_shape, stride, padding, bias: bool) -> None:
     w_cpu = torch.randn(weight_shape, dtype=torch.float32) * 0.25
     b_cpu = torch.randn((weight_shape[0],), dtype=torch.float32) * 0.1 if bias else None
 
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     before_report = gm45.unsupported_report()
     y = F.conv2d(x, w_cpu, b_cpu, stride=stride, padding=padding)
     readback_report = gm45.unsupported_report()

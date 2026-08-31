@@ -18,6 +18,6 @@ Run the minimal Ultralytics YOLO example with a local model and image:
 python3 demo/example/yolo_example.py model.pt path/to/image.jpg --imgsz 320
 ```
 
-`matrixman.to_gm45(tensor)` uploads a float32 CPU tensor to MatrixMan. Supported
+`matrixman.to_device(tensor)` uploads a float32 CPU tensor to MatrixMan. Supported
 model arithmetic runs through the MatrixMan GPU path, and `tensor.cpu()` is an
 explicit readback for the final result and any CPU-side postprocessing.

@@ -3,7 +3,7 @@
 Minimal Phase 1 PyTorch-facing GM45 backend demo.
 
 This demonstrates:
-  - PrivateUse1 renamed to gm45
+  - PrivateUse1 renamed to matrixman
   - CPU -> gm45 upload
   - torch.add on gm45 tensors
   - torch.matmul on gm45 tensors
@@ -33,14 +33,14 @@ def main() -> int:
     gm45.set_trace(args.trace)
 
     print("PrivateUse1 backend name:", torch._C._get_privateuse1_backend_name())
-    print("torch.device('privateuseone:0') displays as:", torch.device("privateuseone:0"))
+    print("torch.device('matrixman:0') displays as:", torch.device("matrixman:0"))
 
     torch.manual_seed(123)
     a_cpu = torch.randn((16, 16), dtype=torch.float32)
     b_cpu = torch.randn((16, 16), dtype=torch.float32)
 
-    a = gm45.to_gm45(a_cpu)
-    b = gm45.to_gm45(b_cpu)
+    a = gm45.to_device(a_cpu)
+    b = gm45.to_device(b_cpu)
     print("A:", a)
     print("B:", b)
 

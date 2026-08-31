@@ -20,8 +20,8 @@ def main() -> int:
     torch.manual_seed(45)
     x_cpu = torch.randn((2, 2), dtype=torch.float32)
     other_cpu = torch.randn((2, 2), dtype=torch.float32)
-    x = matrixman.to_gm45(x_cpu)
-    other = matrixman.to_gm45(other_cpu)
+    x = matrixman.to_device(x_cpu)
+    other = matrixman.to_device(other_cpu)
 
     # This addition is executed by MatrixMan's GLSL elementwise kernel.
     y = x + other

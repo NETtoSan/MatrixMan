@@ -4,10 +4,10 @@
 
 MatrixMan is an experimental PyTorch `PrivateUse1` backend for GPUs that lack
 a usable native PyTorch compute backend. The current working backend is
-OpenGL. PyTorch's `PrivateUse1` device name is registered as `gm45` for
-historical compatibility, so names such as `Gm45Tensor`, `gm45:0`, and
-`to_gm45()` remain public compatibility names even though the implementation
-is no longer limited to GM45 hardware.
+OpenGL. PyTorch's `PrivateUse1` device name is registered as `matrixman`. Names
+such as `MatrixManTensor`, `matrixman:0`, and `to_device()` are backend-neutral;
+`Gm45Tensor` and `to_gm45()` remain deprecated compatibility names even though
+the implementation is no longer limited to GM45 hardware.
 
 The dispatch path is:
 
@@ -17,10 +17,10 @@ PyTorch ATen operation
   -> OpenGL backend operation
   -> packed texture/framebuffer resources
   -> GLSL fragment shader
-  -> Gm45Tensor result
+  -> MatrixManTensor result
 ```
 
-`Gm45Tensor` stores tensor metadata and an owner for an OpenGL texture. Views,
+`MatrixManTensor` stores tensor metadata and an owner for an OpenGL texture. Views,
 strides, offsets, and shape transformations are tracked as metadata where
 possible. Arithmetic stays on the selected backend. If an operation is not
 implemented, MatrixMan fails explicitly; it does not silently perform tensor
@@ -58,7 +58,8 @@ The OpenGL implementation is split under
 | `backend.py` | Backend façade, lifecycle, device information, and public hooks. |
 | `runtime.py` | SDL/OpenGL context and context-owned caches/resources. |
 | `resources.py` | Texture allocation, upload/readback, scratch textures, parameter caches. |
-| `tensor.py` | `Gm45Tensor`, texture ownership, metadata-aware readback. |
+| `../tensor.py` | Backend-neutral `MatrixManTensor` wrapper and metadata helpers. |
+| `tensor.py` | OpenGL texture ownership and metadata-aware readback. |
 | `metadata.py` | Shape, stride, offset, and view metadata. |
 | `factories.py` | PyTorch `PrivateUse1` factories and registration. |
 | `dispatch.py` | ATen dispatch bridge. |

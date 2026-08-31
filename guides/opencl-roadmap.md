@@ -43,7 +43,7 @@ The OpenCL backend should reuse the backend-neutral portions of MatrixMan:
 - the invariant that unsupported tensor arithmetic fails explicitly instead of
   silently moving to CPU.
 
-The OpenGL `Gm45Tensor` and its texture owner should not be shared as the
+The OpenGL `MatrixManTensor` and its texture owner should not be shared as the
 OpenCL tensor representation.
 
 ## What will differ

@@ -11,7 +11,7 @@ from drivers import matrixman as gm45
 def main() -> int:
     gm45.set_trace(True)
     cpu = torch.arange(168, dtype=torch.float32).reshape(84, 2)
-    x = gm45.to_gm45(cpu)
+    x = gm45.to_device(cpu)
     y = x.transpose(0, 1)
     z = y.unsqueeze(0)
 

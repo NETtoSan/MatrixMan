@@ -20,7 +20,7 @@ def main() -> int:
     for input_shape, weight_shape, groups, label in cases:
         input_cpu = torch.randn(input_shape, dtype=torch.float32)
         weight = torch.randn(weight_shape, dtype=torch.float32)
-        input_gpu = gm45.to_gm45(input_cpu)
+        input_gpu = gm45.to_device(input_cpu)
         output = F.conv2d(input_gpu, weight, None, stride=2, padding=1, groups=groups)
         output_cpu = output.cpu()
         expected = F.conv2d(input_cpu, weight, None, stride=2, padding=1, groups=groups)

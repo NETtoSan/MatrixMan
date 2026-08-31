@@ -13,12 +13,13 @@ from . import profiling
 from . import gpumatrix as gm
 from . import runtime
 from .storage import contiguous_strides, max_storage_index, numel
-
-
-def _impl():
-    # Compatibility hook retained for callers that still inspect the old bridge.
-    from . import dispatch
-    return dispatch
+from ...tensor import (
+    Gm45Tensor,
+    MatrixManTensor,
+    install_tensor_method,
+    is_gm45_tensor,
+    is_matrixman_tensor,
+)
 
 
 live_textures = weakref.WeakSet()
@@ -32,6 +33,10 @@ class _TextureOwner:
         self.layout = layout
         live_textures.add(self)
 
+    @property
+    def storage_description(self) -> str:
+        return f"texture={self.texture}"
+
     def __del__(self):
         if runtime.is_active() and self.texture:
             texture = ctypes.c_uint(self.texture)
@@ -42,9 +47,6 @@ class _TextureOwner:
 def owner_from_texture(texture, layout):
     """Construct the tensor-owned wrapper for an already allocated texture."""
     return _TextureOwner(texture, layout)
-
-
-PRIVATEUSE_DEVICE = torch.device("privateuseone:0")
 
 
 def _validate_cpu_input(tensor: torch.Tensor) -> np.ndarray:
@@ -81,12 +83,12 @@ def texture_from_cpu(tensor: torch.Tensor) -> _TextureOwner:
     return owner
 
 
-def tensor(data: torch.Tensor | np.ndarray | list[list[float]], *, device=None) -> "Gm45Tensor":
+def tensor(data: torch.Tensor | np.ndarray | list[list[float]], *, device=None) -> "MatrixManTensor":
     """Create a gm45 tensor by uploading CPU data into an OpenGL texture."""
     from . import runtime
 
     runtime.init()
-    if device is not None and str(device) not in {"gm45", "gm45:0", "privateuseone", "privateuseone:0"}:
+    if device is not None and str(device) not in {"matrixman", "matrixman:0", "privateuseone", "privateuseone:0"}:
         raise RuntimeError("gm45.tensor only creates tensors on the gm45 device")
     if not isinstance(data, torch.Tensor):
         data = torch.tensor(data, dtype=torch.float32)
@@ -95,10 +97,10 @@ def tensor(data: torch.Tensor | np.ndarray | list[list[float]], *, device=None) 
     if not data.is_contiguous():
         data = data.contiguous()
     owner = texture_from_cpu(data)
-    return Gm45Tensor._from_owner(owner, tuple(int(v) for v in data.shape))
+    return MatrixManTensor._from_owner(owner, tuple(int(v) for v in data.shape))
 
 
-def randn(*shape: int, seed: int | None = None) -> "Gm45Tensor":
+def randn(*shape: int, seed: int | None = None) -> "MatrixManTensor":
     """Create a gm45 tensor from CPU-generated random float32 data."""
     if len(shape) == 1:
         shape = (shape[0], shape[0])
@@ -108,56 +110,9 @@ def randn(*shape: int, seed: int | None = None) -> "Gm45Tensor":
     return tensor(torch.randn(shape, dtype=torch.float32, generator=generator))
 
 
-def to_gm45(data: torch.Tensor) -> "Gm45Tensor":
+def to_gm45(data: torch.Tensor) -> "MatrixManTensor":
+    """Deprecated OpenGL-module compatibility alias."""
     return tensor(data)
-
-
-def is_gm45_tensor(value) -> bool:
-    return isinstance(value, Gm45Tensor)
-
-
-def install_tensor_method() -> None:
-    """Convenience method: cpu_tensor.gm45() uploads to a gm45 texture."""
-    setattr(torch.Tensor, "gm45", lambda self: to_gm45(self))
-
-
-class Gm45Tensor(torch.Tensor):
-    """The public OpenGL-backed tensor wrapper."""
-
-    @staticmethod
-    def __new__(cls, owner, shape, storage_offset=0, logical_strides=None):
-        strides = logical_strides or contiguous_strides(shape)
-        return torch.Tensor._make_wrapper_subclass(
-            cls, shape, strides=strides, dtype=torch.float32,
-            layout=torch.strided, device=PRIVATEUSE_DEVICE, requires_grad=False,
-        )
-
-    def __init__(self, owner, shape, storage_offset=0, logical_strides=None):
-        self._owner = owner
-        self._shape = tuple(shape)
-        self._storage_offset = int(storage_offset)
-        self._logical_strides = tuple(logical_strides or contiguous_strides(self._shape))
-
-    @staticmethod
-    def _from_owner(owner, shape, storage_offset=0, logical_strides=None):
-        strides = tuple(logical_strides or contiguous_strides(shape))
-        if len(strides) != len(shape):
-            raise RuntimeError("gm45 tensor logical strides must match shape rank")
-        max_index = max_storage_index(shape, strides)
-        if storage_offset < 0 or (numel(shape) > 0 and storage_offset + max_index >= owner.layout.numel):
-            raise RuntimeError("gm45 tensor view storage offset is outside texture storage")
-        return Gm45Tensor(owner, shape, storage_offset, strides)
-
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        return _impl().handle_torch_dispatch(cls, func, types, args, kwargs)
-
-    def __repr__(self):
-        return (
-            f"Gm45Tensor(shape={tuple(self.shape)}, dtype=float32, device={self.device}, "
-            f"texture={self._owner.texture}, storage={self._owner.layout.kind}, "
-            f"offset={self._storage_offset}, strides={self._logical_strides})"
-        )
 
 
 def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset: int = 0,

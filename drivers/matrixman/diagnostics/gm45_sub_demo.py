@@ -15,8 +15,8 @@ def main() -> int:
     anchor_cpu = anchor_base_cpu.transpose(0, 1).unsqueeze(0)
     distance_cpu = torch.randn((1, 2, 84), dtype=torch.float32)
 
-    anchor = gm45.to_gm45(anchor_base_cpu).transpose(0, 1).unsqueeze(0)
-    distance = gm45.to_gm45(distance_cpu)
+    anchor = gm45.to_device(anchor_base_cpu).transpose(0, 1).unsqueeze(0)
+    distance = gm45.to_device(distance_cpu)
     output = torch.sub(anchor, distance)
     output_cpu = output.cpu()
     expected = anchor_cpu - distance_cpu

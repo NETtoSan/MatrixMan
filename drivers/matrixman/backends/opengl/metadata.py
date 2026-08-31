@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from . import diagnostics
-from .tensor import Gm45Tensor
+from ...tensor import MatrixManTensor
 from .storage import contiguous_strides
 
 
@@ -74,14 +74,14 @@ def metadata_view(tensor, shape: tuple[int, ...], op_name: str, logical_strides=
         f"  metadata only; texture #{tensor._owner.texture} reused; offset={tensor._storage_offset}; "
         f"strides={list(strides)}"
     )
-    return Gm45Tensor._from_owner(tensor._owner, shape, tensor._storage_offset, strides)
+    return MatrixManTensor._from_owner(tensor._owner, shape, tensor._storage_offset, strides)
 
 
 def metadata_transpose(args):
     tensor = args[0]
     dim0, dim1 = int(args[1]), int(args[2])
-    if not isinstance(tensor, Gm45Tensor):
-        raise RuntimeError("gm45 transpose requires a Gm45Tensor input")
+    if not isinstance(tensor, MatrixManTensor):
+        raise RuntimeError("gm45 transpose requires a MatrixManTensor input")
     rank = len(tensor.shape)
     if dim0 < 0:
         dim0 += rank
@@ -100,7 +100,7 @@ def metadata_transpose(args):
         f"  dims=({dim0}, {dim1}) -> shape={shape} strides={strides}\n"
         "  metadata only; no shader copy or GPU readback"
     )
-    return Gm45Tensor._from_owner(tensor._owner, tuple(shape), tensor._storage_offset, tuple(strides))
+    return MatrixManTensor._from_owner(tensor._owner, tuple(shape), tensor._storage_offset, tuple(strides))
 
 
 def metadata_unsqueeze(tensor, dim: int):
@@ -141,8 +141,8 @@ def metadata_expand(args, kwargs):
     input_tensor = args[0]
     requested = tuple(int(v) for v in args[1])
     implicit = bool(kwargs.get("implicit", args[2] if len(args) > 2 else False))
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 expand requires a Gm45Tensor input")
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 expand requires a MatrixManTensor input")
     old_shape = tuple(int(v) for v in input_tensor.shape)
     old_strides = input_tensor._logical_strides
     if len(requested) != len(old_shape):
@@ -174,15 +174,15 @@ def metadata_expand(args, kwargs):
         f"  expanded_dims={expanded_dims} has_minus_one={has_minus_one}\n"
         f"  metadata only; output strides={list(strides)}; no shader copy or GPU readback"
     )
-    return Gm45Tensor._from_owner(input_tensor._owner, shape, input_tensor._storage_offset, strides)
+    return MatrixManTensor._from_owner(input_tensor._owner, shape, input_tensor._storage_offset, strides)
 
 
-def metadata_split(args, kwargs) -> tuple["Gm45Tensor", ...]:
+def metadata_split(args, kwargs) -> tuple["MatrixManTensor", ...]:
     input_tensor = args[0]
     split_size_or_sections = args[1]
     dim = int(args[2]) if len(args) > 2 else int(kwargs.get("dim", 0))
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 split requires a Gm45Tensor input")
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 split requires a MatrixManTensor input")
     if input_tensor._owner.layout.kind != "packed_rgba":
         raise RuntimeError("gm45 split currently supports only packed_rgba tensor storage")
     require_contiguous_logical(input_tensor, "split")
@@ -235,7 +235,7 @@ def metadata_split(args, kwargs) -> tuple["Gm45Tensor", ...]:
     for index, section in enumerate(sections):
         out_shape = shape[:dim] + (section,) + shape[dim + 1 :]
         out_offset = input_tensor._storage_offset + logical_start * inner_block
-        outputs.append(Gm45Tensor._from_owner(input_tensor._owner, out_shape, out_offset))
+        outputs.append(MatrixManTensor._from_owner(input_tensor._owner, out_shape, out_offset))
         trace_lines.append(f"  output {index} offset={out_offset} shape={list(out_shape)}")
         logical_start += section
     trace_lines.append("  metadata only; no shader copy or GPU readback")

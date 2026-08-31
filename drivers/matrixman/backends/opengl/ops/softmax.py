@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from .. import diagnostics, gpumatrix as gm, operation_context
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 def _softmax_program(params: tuple) -> tuple[int, int]:
     rt = operation_context.gl_runtime()
@@ -100,12 +100,12 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_softmax(args) -> "Gm45Tensor":
+def _render_softmax(args) -> "MatrixManTensor":
     input_tensor = args[0]
     dim = int(args[1])
     half_to_float = bool(args[2]) if len(args) > 2 else False
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 softmax requires a Gm45Tensor input")
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 softmax requires a MatrixManTensor input")
     if input_tensor.dtype != torch.float32:
         raise RuntimeError("gm45 softmax supports only float32")
     if input_tensor._owner.layout.kind != "packed_rgba":
@@ -160,5 +160,4 @@ def _render_softmax(args) -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after softmax: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
-
+    return MatrixManTensor._from_owner(out_owner, out_shape)

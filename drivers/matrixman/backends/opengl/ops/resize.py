@@ -89,8 +89,8 @@ def render_upsample_nearest2d(args):
     scale_h = args[2] if len(args) > 2 else None
     scale_w = args[3] if len(args) > 3 else None
 
-    if not isinstance(input_tensor, operation_context.Gm45Tensor):
-        raise RuntimeError("gm45 upsample_nearest2d requires a Gm45Tensor input")
+    if not isinstance(input_tensor, operation_context.MatrixManTensor):
+        raise RuntimeError("gm45 upsample_nearest2d requires a MatrixManTensor input")
     if input_tensor.dtype != torch.float32:
         raise RuntimeError("gm45 upsample_nearest2d supports only float32")
     if input_tensor._owner.layout.kind != "packed_rgba":

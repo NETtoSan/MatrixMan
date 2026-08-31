@@ -113,13 +113,13 @@ def _report_metrics(label: str, actual: torch.Tensor, expected: torch.Tensor) ->
 
 def _float_upload_readback() -> bool:
     source = torch.tensor([[0.25, -1.5], [2.0, 7.25]], dtype=torch.float32)
-    return _report_metrics("Float texture", backend.to_gm45(source).cpu(), source)
+    return _report_metrics("Float texture", backend.to_device(source).cpu(), source)
 
 
 def _elementwise_shader() -> bool:
     left = torch.tensor([[1.0, -2.0], [3.5, 4.0]], dtype=torch.float32)
     right = torch.tensor([[2.0, 5.0], [-1.5, 0.5]], dtype=torch.float32)
-    actual = torch.add(backend.to_gm45(left), backend.to_gm45(right)).cpu()
+    actual = torch.add(backend.to_device(left), backend.to_device(right)).cpu()
     return _report_metrics("Elementwise add", actual, left + right)
 
 
@@ -128,7 +128,7 @@ def _conv() -> bool:
     source = torch.randn((1, 2, 8, 8), dtype=torch.float32)
     weight = torch.randn((3, 2, 3, 3), dtype=torch.float32) * 0.1
     expected = F.conv2d(source, weight, padding=1)
-    actual = F.conv2d(backend.to_gm45(source), weight, padding=1).cpu()
+    actual = F.conv2d(backend.to_device(source), weight, padding=1).cpu()
     return _report_metrics("Conv2D", actual, expected)
 
 
@@ -141,7 +141,7 @@ def _batch_norm() -> bool:
     bias = torch.randn(4, dtype=torch.float32)
     expected = F.batch_norm(source, mean, var, weight, bias, training=False, eps=1e-5)
     actual = F.batch_norm(
-        backend.to_gm45(source), mean, var, weight, bias, training=False, eps=1e-5
+        backend.to_device(source), mean, var, weight, bias, training=False, eps=1e-5
     ).cpu()
     return _report_metrics("BatchNorm", actual, expected)
 
@@ -149,7 +149,7 @@ def _batch_norm() -> bool:
 def _silu() -> bool:
     source = torch.linspace(-3.0, 3.0, 32, dtype=torch.float32).reshape(1, 2, 4, 4)
     expected = F.silu(source)
-    actual = torch.nn.SiLU(inplace=True)(backend.to_gm45(source)).cpu()
+    actual = torch.nn.SiLU(inplace=True)(backend.to_device(source)).cpu()
     return _report_metrics("SiLU_", actual, expected)
 
 
@@ -191,7 +191,7 @@ def _large_conv(
     weight = torch.randn((cout, cin, kernel, kernel), dtype=torch.float32) * 0.05
     padding = 1 if kernel == 3 else 0
     expected = F.conv2d(source, weight, padding=padding)
-    actual = F.conv2d(backend.to_gm45(source), weight, padding=padding).cpu()
+    actual = F.conv2d(backend.to_device(source), weight, padding=padding).cpu()
     if report_tiles:
         _report_physical_tiles(expected)
     atlas = packed_atlas_size(expected.numel())[0]

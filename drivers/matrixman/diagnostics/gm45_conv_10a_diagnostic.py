@@ -67,7 +67,7 @@ def main() -> int:
     matrixman.init()
     matrixman.profile_reset()
     try:
-        gpu_input = matrixman.to_gm45(source)
+        gpu_input = matrixman.to_device(source)
         os.environ.pop("MATRIXMAN_CONV_SPATIAL_REUSE", None)
         matrixman.profile_reset()
         baseline = F.conv2d(gpu_input, weight, padding=1).cpu()
@@ -94,7 +94,7 @@ def main() -> int:
         _mismatch_report(actual, baseline, "spatial_vs_baseline")
         tiny_source = torch.arange(1, 1 + 4 * 4 * 4, dtype=torch.float32).reshape(1, 4, 4, 4) / 17.0
         tiny_weight = torch.arange(1, 1 + 4 * 4 * 3 * 3, dtype=torch.float32).reshape(4, 4, 3, 3) / 31.0
-        tiny_passed = _run_tiny_check(matrixman.to_gm45(tiny_source), tiny_weight)
+        tiny_passed = _run_tiny_check(matrixman.to_device(tiny_source), tiny_weight)
         print(f"  baseline_gpu_time={'unavailable' if baseline_gpu is None else f'{baseline_gpu:.6f}s'}")
         print(f"  spatial_reuse_gpu_time={'unavailable' if fast_gpu is None else f'{fast_gpu:.6f}s'}")
         if baseline_gpu and fast_gpu:

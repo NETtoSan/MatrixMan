@@ -15,8 +15,8 @@ def main() -> int:
     anchor_cpu = anchor_base_cpu.transpose(0, 1).unsqueeze(0)
     rb_cpu = torch.randn((1, 2, 84), dtype=torch.float32)
 
-    anchor = gm45.to_gm45(anchor_base_cpu).transpose(0, 1).unsqueeze(0)
-    rb = gm45.to_gm45(rb_cpu)
+    anchor = gm45.to_device(anchor_base_cpu).transpose(0, 1).unsqueeze(0)
+    rb = gm45.to_device(rb_cpu)
     output = torch.add(anchor, rb, alpha=1.0)
     output_cpu = output.cpu()
     expected = anchor_cpu + rb_cpu

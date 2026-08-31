@@ -21,7 +21,7 @@ def main() -> None:
     generator.manual_seed(20260829)
     x_cpu = torch.randn((1, 32, 16, 16), dtype=torch.float32, generator=generator)
 
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     before_texture = x._owner.texture
     a, b = torch.split(x, 16, dim=1)
 
@@ -47,7 +47,7 @@ def main() -> None:
 
     # This verifies a later GLSL kernel consumes the split view's nonzero
     # storage offset instead of reading from the start of the original texture.
-    b_clone = gm45.Gm45Tensor._from_owner(b._owner, tuple(b.shape), b._storage_offset)
+    b_clone = gm45.MatrixManTensor._from_owner(b._owner, tuple(b.shape), b._storage_offset)
     torch.ops.aten.silu_.default(b_clone)
     silu_cpu = b_clone.cpu()
     silu_expected = torch.nn.functional.silu(b_expected)

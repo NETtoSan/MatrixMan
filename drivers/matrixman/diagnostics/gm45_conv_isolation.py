@@ -60,7 +60,7 @@ def exact_case():
     print("  convolution: stride=(1,1) padding=(1,1) dilation=(1,1) groups=1")
 
     upload_start = time.perf_counter()
-    gpu_input = gm45.to_gm45(exact_input)
+    gpu_input = gm45.to_device(exact_input)
     print(f"  input upload: {time.perf_counter() - upload_start:.3f}s texture=#{gpu_input._owner.texture}")
     with torch.no_grad():
         cpu_out = F.conv2d(exact_input, weight, None, stride=1, padding=1)
@@ -117,7 +117,7 @@ def synthetic_case(in_channels, out_channels, height, width):
     torch.manual_seed(1000 + in_channels + out_channels + height)
     cpu_input = torch.randn((1, in_channels, height, width), dtype=torch.float32)
     weight = torch.randn((out_channels, in_channels, 3, 3), dtype=torch.float32)
-    gpu_input = gm45.to_gm45(cpu_input)
+    gpu_input = gm45.to_device(cpu_input)
     cpu_out = F.conv2d(cpu_input, weight, None, stride=1, padding=1)
     gpu_out = F.conv2d(gpu_input, weight, None, stride=1, padding=1).cpu()
     a, b, c = stats(cpu_out, gpu_out)

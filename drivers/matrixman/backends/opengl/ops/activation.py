@@ -6,7 +6,7 @@ import torch
 
 from .. import diagnostics, gpumatrix as gm, kernels, operation_context, profiling
 from ..storage import numel
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 def _silu_program(params: tuple) -> tuple[int, int]:
     rt = operation_context.gl_runtime()
@@ -85,7 +85,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_packed_sigmoid(tensor: "Gm45Tensor") -> "Gm45Tensor":
+def _render_packed_sigmoid(tensor: "MatrixManTensor") -> "MatrixManTensor":
     if tensor.dtype != torch.float32:
         raise RuntimeError("gm45 sigmoid supports only float32")
     if tensor._owner.layout.kind != "packed_rgba":
@@ -119,7 +119,7 @@ def _render_packed_sigmoid(tensor: "Gm45Tensor") -> "Gm45Tensor":
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after sigmoid: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)
 
 def _silu_shader_source(params: tuple) -> bytes:
     numel, input_offset, input_tex_w, input_tex_h, out_tex_w = params
@@ -176,10 +176,10 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_silu_inplace(args) -> "Gm45Tensor":
+def _render_silu_inplace(args) -> "MatrixManTensor":
     input_tensor = args[0]
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 silu_ requires a Gm45Tensor input")
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 silu_ requires a MatrixManTensor input")
     if input_tensor.dtype != torch.float32:
         raise RuntimeError("gm45 silu_ supports only float32")
     if input_tensor._owner.layout.kind != "packed_rgba":

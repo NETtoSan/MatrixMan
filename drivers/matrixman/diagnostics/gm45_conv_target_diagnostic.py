@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from drivers import matrixman as gm45
 from drivers.matrixman import gpumatrix as gl
 from drivers.matrixman.backends.opengl import convolution, operation_context, resources, runtime, storage
-from drivers.matrixman.backends.opengl import tensor as tensor_module
+from drivers.matrixman import tensor as tensor_module
 
 gl.gl.glScissor.restype = None
 gl.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -23,7 +23,7 @@ gl.gl.glColorMask.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte, ct
 
 
 def _params(x, w, out_owner, full_out_w, full_out_h, tile_base=0):
-    inp = gm45.to_gm45(x)
+    inp = gm45.to_device(x)
     wo = resources.upload_raw_packed_array(w.numpy())
     params = (x.shape[1], x.shape[2], x.shape[3], w.shape[0], full_out_h, x.shape[3],
               3, 3, 1, 1, 1, 1, False, 1, inp._storage_offset,
@@ -74,7 +74,7 @@ def _draw_conv(x, w, physical_w, physical_h, *, tile_base=0, out_owner=None, res
     gl.glBegin(gl.GL_QUADS)
     gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
     err = gl.glGetError()
-    result = tensor_module.Gm45Tensor._from_owner(out_owner, tuple(out_owner_shape(out_owner))).cpu()
+    result = tensor_module.MatrixManTensor._from_owner(out_owner, tuple(out_owner_shape(out_owner))).cpu()
     gl.glDeleteProgram(program)
     return result, out_owner, complete, err, inp, wo
 
@@ -101,7 +101,7 @@ def target_only(size):
     complete=gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)==gl.GL_FRAMEBUFFER_COMPLETE
     gl.glUseProgram(program); gl.glBegin(gl.GL_QUADS)
     gl.glVertex2f(-1,-1); gl.glVertex2f(1,-1); gl.glVertex2f(1,1); gl.glVertex2f(-1,1); gl.glEnd()
-    err=gl.glGetError(); actual=tensor_module.Gm45Tensor._from_owner(owner,out_owner_shape(owner)).cpu().reshape(-1)
+    err=gl.glGetError(); actual=tensor_module.MatrixManTensor._from_owner(owner,out_owner_shape(owner)).cpu().reshape(-1)
     expected=torch.arange(size*size*4,dtype=torch.float32)
     d=(actual-expected).abs(); gl.glDeleteProgram(program)
     return complete,err,d.max().item(),d.mean().item()
@@ -125,7 +125,7 @@ def main():
         x=torch.randn((1,64,160,160),dtype=torch.float32)*0.03
         w=torch.randn((64,64,3,3),dtype=torch.float32)*0.03
         expected=F.conv2d(x,w,padding=1)
-        result=F.conv2d(gm45.to_gm45(x),w,padding=1).cpu()
+        result=F.conv2d(gm45.to_device(x),w,padding=1).cpu()
         print(f"production result: shape={list(result.shape)} max_abs={(result-expected).abs().max().item():.6g} allclose={torch.allclose(result,expected,rtol=1e-4,atol=1e-4)}")
         full_atlas=640
         for item in convolution._tile_diagnostic_snapshots:

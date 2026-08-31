@@ -179,7 +179,7 @@ def run_real_gm45_first_blocker(model_spec: str, image_size: int) -> dict[str, A
     try:
         model = YOLO(model_spec).model.eval()
         x_cpu = torch.zeros((1, 3, image_size, image_size), dtype=torch.float32)
-        x = gm45.to_gm45(x_cpu)
+        x = gm45.to_device(x_cpu)
         with torch.no_grad():
             _ = model(x)
         return {"status": "unexpectedly completed YOLO forward", "unsupported": gm45.unsupported_report()}
@@ -291,7 +291,7 @@ def main() -> int:
     print("  discovery execution: PyTorch FakeTensor/meta; no CPU tensor arithmetic fallback is claimed as GM45")
 
     real_blocker = run_real_gm45_first_blocker(args.model, args.imgsz)
-    print("\nReal Gm45Tensor attempt:")
+    print("\nReal MatrixManTensor attempt:")
     print("  status:", real_blocker["status"])
     if "reason" in real_blocker:
         print("  reason:", real_blocker["reason"])

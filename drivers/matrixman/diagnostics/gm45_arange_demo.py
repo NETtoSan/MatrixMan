@@ -45,7 +45,7 @@ def check_inplace_fill(label: str, tensor, value: float, expected) -> None:
 
 def main() -> None:
     gm45.set_trace(True)
-    seed_tensor = gm45.to_gm45(torch.zeros((1,), dtype=torch.float32))
+    seed_tensor = gm45.to_device(torch.zeros((1,), dtype=torch.float32))
     device = seed_tensor.device
 
     check(
@@ -75,7 +75,7 @@ def main() -> None:
         0.5 + torch.arange(8, dtype=torch.float32),
     )
     nchw_cpu = torch.arange(1 * 3 * 2 * 4, dtype=torch.float32).reshape(1, 3, 2, 4)
-    nchw = gm45.to_gm45(nchw_cpu)
+    nchw = gm45.to_device(nchw_cpu)
     check_from_callable(
         "packed NCHW tensor + scalar",
         lambda: nchw + 1.25,

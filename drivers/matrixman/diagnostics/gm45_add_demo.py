@@ -33,8 +33,8 @@ def main() -> None:
 
     a_cpu = torch.randn((1, 16, 16, 16), dtype=torch.float32, generator=generator)
     b_cpu = torch.randn((1, 16, 16, 16), dtype=torch.float32, generator=generator)
-    a = gm45.to_gm45(a_cpu)
-    b = gm45.to_gm45(b_cpu)
+    a = gm45.to_device(a_cpu)
+    b = gm45.to_device(b_cpu)
     y = torch.add(a, b, alpha=0.5)
     print("Normal packed NCHW add")
     print(f"  left texture: #{a._owner.texture} offset={a._storage_offset}")
@@ -42,7 +42,7 @@ def main() -> None:
     report_case("  result", y, a_cpu + 0.5 * b_cpu)
 
     x_cpu = torch.randn((1, 32, 16, 16), dtype=torch.float32, generator=generator)
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     left, right = torch.split(x, 16, dim=1)
     split_sum = torch.add(left, right)
     print("\nSplit-derived nonzero-offset add")

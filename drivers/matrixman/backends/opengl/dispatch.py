@@ -11,7 +11,7 @@ from . import tensor as tensor_module
 from . import operation_context
 from .ops import activation, arithmetic, concat, matmul, normalization, pooling, resize, softmax
 from .storage import numel
-from .tensor import Gm45Tensor
+from ...tensor import MatrixManTensor
 
 _render_packed_sub = arithmetic._render_packed_sub
 _render_packed_broadcast_mul = arithmetic._render_packed_broadcast_mul
@@ -55,13 +55,13 @@ def _record_unsupported(func, args, kwargs) -> None:
     diagnostics.record_unsupported(func, args, kwargs)
 
 
-def _render_binary(kind: str, left: Gm45Tensor, right: Gm45Tensor, alpha: float = 1.0) -> Gm45Tensor:
+def _render_binary(kind: str, left: MatrixManTensor, right: MatrixManTensor, alpha: float = 1.0) -> MatrixManTensor:
     if kind == "add":
-        if isinstance(left, Gm45Tensor) and operation_context.is_scalar_operand(right):
+        if isinstance(left, MatrixManTensor) and operation_context.is_scalar_operand(right):
             return arithmetic._render_scalar_add(left, operation_context.scalar_value(right), alpha, tensor_first=True)
-        if operation_context.is_scalar_operand(left) and isinstance(right, Gm45Tensor):
+        if operation_context.is_scalar_operand(left) and isinstance(right, MatrixManTensor):
             return arithmetic._render_scalar_add(right, operation_context.scalar_value(left), alpha, tensor_first=False)
-    if not isinstance(left, Gm45Tensor) or not isinstance(right, Gm45Tensor):
+    if not isinstance(left, MatrixManTensor) or not isinstance(right, MatrixManTensor):
         raise RuntimeError(f"gm45 {kind} requires both inputs to be gm45 tensors")
     if left.shape != right.shape:
         raise RuntimeError(f"gm45 {kind} requires equal shapes")
@@ -81,7 +81,7 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
 
         if func is torch.ops.aten.add.Tensor:
             _kernel_log("Add")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL add kernel")
             _trace("  -> GLSL fragment shader arithmetic: out = left + right")
             alpha = kwargs.get("alpha", args[2] if len(args) > 2 else 1)
@@ -91,38 +91,38 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
 
         if func is torch.ops.aten.sub.Tensor:
             _kernel_log("Sub")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL packed sub kernel")
             _trace("  -> GLSL fragment shader arithmetic: out = left - right")
-            if len(args) < 2 or not isinstance(args[0], Gm45Tensor) or not isinstance(args[1], Gm45Tensor):
-                raise RuntimeError("gm45 sub currently requires two Gm45Tensor operands")
+            if len(args) < 2 or not isinstance(args[0], MatrixManTensor) or not isinstance(args[1], MatrixManTensor):
+                raise RuntimeError("gm45 sub currently requires two MatrixManTensor operands")
             return _render_packed_sub(args[0], args[1])
 
         if func is torch.ops.aten.mul.Tensor:
             _kernel_log("Mul")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL packed broadcast mul kernel")
             _trace("  -> GLSL fragment shader arithmetic: out = lhs * rhs")
-            if len(args) < 2 or not isinstance(args[0], Gm45Tensor) or not isinstance(args[1], Gm45Tensor):
-                raise RuntimeError("gm45 mul currently requires two Gm45Tensor operands")
+            if len(args) < 2 or not isinstance(args[0], MatrixManTensor) or not isinstance(args[1], MatrixManTensor):
+                raise RuntimeError("gm45 mul currently requires two MatrixManTensor operands")
             return _render_packed_broadcast_mul(args[0], args[1])
 
         if func is torch.ops.aten.sigmoid.default:
             _kernel_log("Sigmoid")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL packed sigmoid kernel")
             _trace("  -> GLSL fragment shader arithmetic: out = 1 / (1 + exp(-x))")
-            if len(args) < 1 or not isinstance(args[0], Gm45Tensor):
-                raise RuntimeError("gm45 sigmoid requires a Gm45Tensor input")
+            if len(args) < 1 or not isinstance(args[0], MatrixManTensor):
+                raise RuntimeError("gm45 sigmoid requires a MatrixManTensor input")
             return _render_packed_sigmoid(args[0])
 
         if func is torch.ops.aten.div.Tensor:
             _kernel_log("Div")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL packed scalar div kernel")
             _trace("  -> GLSL fragment shader arithmetic: out = input / scalar")
-            if len(args) < 2 or not isinstance(args[0], Gm45Tensor) or not _is_scalar_operand(args[1]):
-                raise RuntimeError("gm45 div currently requires a Gm45Tensor divided by a scalar")
+            if len(args) < 2 or not isinstance(args[0], MatrixManTensor) or not _is_scalar_operand(args[1]):
+                raise RuntimeError("gm45 div currently requires a MatrixManTensor divided by a scalar")
             rounding_mode = kwargs.get("rounding_mode")
             if rounding_mode is not None:
                 raise RuntimeError("gm45 div currently supports rounding_mode=None only")
@@ -130,80 +130,80 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
 
         if func is torch.ops.aten.mm.default:
             _kernel_log("MatMul")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL matmul kernel")
             _trace("  -> GLSL fragment shader arithmetic: sum(left[row,k] * right[k,col])")
             return matmul.render_matmul(args[0], args[1])
 
         if func is torch.ops.aten.convolution.default:
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL Conv2D kernel")
             _trace("  -> GLSL fragment shader arithmetic: bias + sum(input * weight)")
             return convolution.execute(args)
 
         if func is torch.ops.aten.native_batch_norm.default:
             _kernel_log("BatchNorm")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL BatchNorm inference kernel")
             _trace("  -> GLSL fragment shader arithmetic: ((x - mean) / sqrt(var + eps)) * weight + bias")
             return _render_batch_norm(args)
 
         if func is torch.ops.aten.silu_.default:
             _kernel_log("SiLU")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL SiLU kernel")
             _trace("  -> GLSL fragment shader arithmetic: x / (1 + exp(-x))")
             return _render_silu_inplace(args)
 
         if func is torch.ops.aten.split.Tensor:
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL metadata-only split view")
             return _metadata_split(args, kwargs)
 
         if func is torch.ops.aten.cat.default:
             _kernel_log("Cat")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL cat copy/repack kernel")
             _trace("  -> GLSL fragment shader copy: packed tensor concatenation")
             return _render_cat(args, kwargs)
 
         if func is torch.ops.aten.stack.default:
             _kernel_log("Stack")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL stack materialization kernel")
             _trace("  -> GLSL fragment shader copy: logical-stride tensor stack")
             return _render_stack(args, kwargs)
 
         if func is torch.ops.aten.fill_.Scalar:
             _kernel_log("Fill")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL fill_ scalar kernel")
             _trace("  -> GLSL fragment shader write: out = scalar")
             return _render_fill_scalar(args)
 
         if func is torch.ops.aten.max_pool2d_with_indices.default:
             _kernel_log("MaxPool")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL max_pool2d values kernel")
             _trace("  -> GLSL fragment shader arithmetic: max over valid 5x5 window")
             return _render_max_pool2d_with_indices(args)
 
         if func is torch.ops.aten.upsample_nearest2d.default:
             _kernel_log("Upsample")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL upsample_nearest2d kernel")
             _trace("  -> GLSL fragment shader sampling: output[y,x] -> input[y/2,x/2]")
             return _render_upsample_nearest2d(args)
 
         if func is torch.ops.aten._softmax.default:
             _kernel_log("Softmax")
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL DFL softmax kernel")
             _trace("  -> GLSL fragment shader arithmetic: stable 16-bin max/exp/sum/normalize")
             return _render_softmax(args)
 
         if func is torch.ops.aten._to_copy.default:
-            _trace("  -> Gm45Tensor.__torch_dispatch__")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> explicit GPU-to-CPU transfer requested")
             target_device = kwargs.get("device")
             target_dtype = kwargs.get("dtype")

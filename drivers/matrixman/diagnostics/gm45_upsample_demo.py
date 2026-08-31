@@ -32,7 +32,7 @@ def main() -> None:
     generator.manual_seed(20260829)
 
     known_cpu = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.float32)
-    known = gm45.to_gm45(known_cpu)
+    known = gm45.to_device(known_cpu)
     known_y = F.interpolate(known, size=(4, 4), mode="nearest")
     known_expected = F.interpolate(known_cpu, size=(4, 4), mode="nearest")
     report_upsample("Known-value nearest 2x upsample", known, known_y, known_expected)
@@ -40,20 +40,20 @@ def main() -> None:
     print(known_y.cpu()[0, 0])
 
     x_cpu = torch.randn((1, 256, 2, 2), dtype=torch.float32, generator=generator)
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     y = F.interpolate(x, size=(4, 4), mode="nearest")
     expected = F.interpolate(x_cpu, size=(4, 4), mode="nearest")
     report_upsample("Traced YOLO nearest upsample [1,256,2,2] -> [1,256,4,4]", x, y, expected)
 
     split_cpu = torch.randn((1, 512, 2, 2), dtype=torch.float32, generator=generator)
-    split_source = gm45.to_gm45(split_cpu)
+    split_source = gm45.to_device(split_cpu)
     _, right = torch.split(split_source, 256, dim=1)
     split_y = F.interpolate(right, size=(4, 4), mode="nearest")
     split_expected = F.interpolate(split_cpu[:, 256:512], size=(4, 4), mode="nearest")
     report_upsample("Split-derived nonzero-offset nearest upsample", right, split_y, split_expected)
 
     skip_cpu = torch.randn((1, 128, 4, 4), dtype=torch.float32, generator=generator)
-    skip = gm45.to_gm45(skip_cpu)
+    skip = gm45.to_device(skip_cpu)
     cat_y = torch.cat([split_y, skip], dim=1)
     cat_expected = torch.cat([split_expected, skip_cpu], dim=1)
     cat_cpu = cat_y.cpu()

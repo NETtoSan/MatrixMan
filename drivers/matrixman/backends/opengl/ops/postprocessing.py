@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from .. import diagnostics, gpumatrix as gm, operation_context, profiling
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 
 def _shader_source(channels: int, anchors: int, input_width: int, input_height: int,
@@ -84,10 +84,10 @@ def _program(params: tuple) -> tuple[int, int]:
     return rt.postprocess_programs[params], rt.postprocess_uniforms[params]
 
 
-def reduce_detection_output(tensor: "Gm45Tensor") -> "Gm45Tensor":
+def reduce_detection_output(tensor: "MatrixManTensor") -> "MatrixManTensor":
     """Reduce [1, 4+classes, anchors] to [1, 6, anchors] on the GPU."""
-    if not isinstance(tensor, Gm45Tensor):
-        raise RuntimeError("gm45 detection reduction requires a Gm45Tensor")
+    if not isinstance(tensor, MatrixManTensor):
+        raise RuntimeError("gm45 detection reduction requires a MatrixManTensor")
     if tensor.dtype != torch.float32 or tensor._owner.layout.kind != "packed_rgba":
         raise RuntimeError("gm45 detection reduction requires packed float32 storage")
     shape = tuple(int(value) for value in tensor.shape)
@@ -116,4 +116,4 @@ def reduce_detection_output(tensor: "Gm45Tensor") -> "Gm45Tensor":
         operation_context.draw_fullscreen_quad()
     if (err := gm.glGetError()):
         raise RuntimeError(f"gm45 OpenGL error after detection reduction: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, out_shape)
+    return MatrixManTensor._from_owner(out_owner, out_shape)

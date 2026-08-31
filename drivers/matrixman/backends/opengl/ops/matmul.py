@@ -6,7 +6,8 @@ import torch
 
 from .. import diagnostics, gpumatrix as gm, operation_context, resources
 from ..storage import StorageLayout
-from ..tensor import Gm45Tensor, owner_from_texture
+from ....tensor import MatrixManTensor
+from ..tensor import owner_from_texture
 
 
 def new_empty_matrix_texture(n: int):
@@ -17,7 +18,7 @@ def new_empty_matrix_texture(n: int):
     return owner
 
 
-def render_matrix_binary(kind: str, left: Gm45Tensor, right: Gm45Tensor, alpha: float = 1.0) -> Gm45Tensor:
+def render_matrix_binary(kind: str, left: MatrixManTensor, right: MatrixManTensor, alpha: float = 1.0) -> MatrixManTensor:
     if left.dim() != 2 or left.shape[0] != left.shape[1]:
         raise RuntimeError(f"gm45 {kind} only supports square 2D matrices")
     if alpha != 1.0:
@@ -61,8 +62,8 @@ def render_matrix_binary(kind: str, left: Gm45Tensor, right: Gm45Tensor, alpha: 
     return operation_context.tensor_from_owner(out_owner, (n, n))
 
 
-def render_matmul(left: Gm45Tensor, right: Gm45Tensor) -> Gm45Tensor:
-    if not isinstance(left, Gm45Tensor) or not isinstance(right, Gm45Tensor):
+def render_matmul(left: MatrixManTensor, right: MatrixManTensor) -> MatrixManTensor:
+    if not isinstance(left, MatrixManTensor) or not isinstance(right, MatrixManTensor):
         raise RuntimeError("gm45 matmul requires both inputs to be gm45 tensors")
     if left.shape != right.shape:
         raise RuntimeError("gm45 matmul requires equal shapes")

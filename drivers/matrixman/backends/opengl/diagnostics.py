@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 
 import torch
 
-from .tensor import Gm45Tensor
+from ...tensor import MatrixManTensor
 
 
 def _env_flag(name: str) -> bool:
@@ -46,9 +46,9 @@ def shape_text(shape) -> str:
 
 
 def summarize_dispatch_value(value):
-    if isinstance(value, Gm45Tensor):
+    if isinstance(value, MatrixManTensor):
         return {
-            "kind": "Gm45Tensor", "shape": list(value.shape), "dtype": str(value.dtype),
+            "kind": "MatrixManTensor", "shape": list(value.shape), "dtype": str(value.dtype),
             "device": str(value.device), "texture": value._owner.texture,
             "storage": value._owner.layout.kind, "storage_offset": value._storage_offset,
             "logical_strides": list(value._logical_strides),

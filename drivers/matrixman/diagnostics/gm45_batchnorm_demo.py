@@ -25,7 +25,7 @@ def main() -> int:
     running_var = torch.rand((5,), dtype=torch.float32) + 0.5
     eps = 1e-3
 
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     y = F.batch_norm(x, running_mean, running_var, weight, bias, training=False, eps=eps)
     y_cpu = y.cpu()
     ref = F.batch_norm(x_cpu, running_mean, running_var, weight, bias, training=False, eps=eps)

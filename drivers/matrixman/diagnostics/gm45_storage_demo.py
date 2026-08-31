@@ -18,7 +18,7 @@ from drivers import matrixman as gm45
 
 def check_roundtrip(shape: tuple[int, ...]) -> None:
     x_cpu = torch.randn(shape, dtype=torch.float32)
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     x_back = x.cpu()
     print(f"roundtrip {list(shape)}:")
     print(f"  gm45 tensor: {x}")
@@ -41,7 +41,7 @@ def main() -> int:
     check_roundtrip((1, 64, 8, 8))
 
     x_cpu = torch.randn((1, 16, 32, 32), dtype=torch.float32)
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     y = x.view(1, 16, 1024)
     z = y.flatten(1)
     s = z.unsqueeze(0).squeeze(0)

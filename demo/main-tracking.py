@@ -50,7 +50,8 @@ def main() -> int:
     try:
         info = get_backend().device_info()
         print("MatrixMan VisDrone demo")
-        print(f"backend: MatrixMan / {info['backend']} / {info.get('renderer', 'unknown')}")
+        device = info.get("renderer") or info.get("device") or info.get("name") or "unknown"
+        print(f"backend: MatrixMan / {info['backend']} / {device}")
         yolo = YOLO(str(model_path))
         net = yolo.model.eval()
         names = yolo.names if isinstance(yolo.names, dict) else dict(enumerate(yolo.names))
@@ -69,11 +70,11 @@ def main() -> int:
                 frame_started = time.perf_counter()
                 display_frame = cv2.resize(frame, (args.imgsz, args.imgsz), interpolation=cv2.INTER_LINEAR)
                 cpu_input = preprocess_frame(frame, args.imgsz)
-                gpu_input = matrixman.to_gm45(cpu_input)
+                gpu_input = matrixman.to_device(cpu_input)
                 with torch.no_grad():
                     prediction = first_tensor(net(gpu_input))
-                if not matrixman.is_gm45_tensor(prediction):
-                    raise RuntimeError("model output did not remain a Gm45Tensor")
+                if not matrixman.is_matrixman_tensor(prediction):
+                    raise RuntimeError("model output did not remain a MatrixManTensor")
                 prediction = prediction.cpu()
                 result, _ = detections(prediction, args.imgsz, args.imgsz, names, args.conf, args.iou)
                 for (x1, y1, x2, y2), score, _cls, label in result:

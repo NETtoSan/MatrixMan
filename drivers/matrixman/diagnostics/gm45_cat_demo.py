@@ -34,7 +34,7 @@ def main() -> None:
     generator.manual_seed(20260829)
 
     x_cpu = torch.randn((1, 32, 16, 16), dtype=torch.float32, generator=generator)
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     left, right = torch.split(x, 16, dim=1)
     residual = torch.add(left, right)
     y = torch.cat([left, right, residual], dim=1)
@@ -42,7 +42,7 @@ def main() -> None:
     report_cat("Three-input YOLO-style cat with split offset", [left, right, residual], y, expected)
 
     four_cpu = [torch.randn((1, 32, 8, 8), dtype=torch.float32, generator=generator) for _ in range(4)]
-    four_gpu = [gm45.to_gm45(tensor) for tensor in four_cpu]
+    four_gpu = [gm45.to_device(tensor) for tensor in four_cpu]
     four_y = torch.cat(four_gpu, dim=1)
     report_cat("Four-input YOLO-style channel cat", four_gpu, four_y, torch.cat(four_cpu, dim=1))
 
@@ -51,7 +51,7 @@ def main() -> None:
         torch.full((16, 1), 16.0, dtype=torch.float32),
         torch.full((4, 1), 32.0, dtype=torch.float32),
     ]
-    gm45_device = gm45.to_gm45(torch.zeros((1,), dtype=torch.float32)).device
+    gm45_device = gm45.to_device(torch.zeros((1,), dtype=torch.float32)).device
     stride_gpu = [
         torch.full(tensor.shape, float(tensor[0, 0]), device=gm45_device, dtype=torch.float32)
         for tensor in stride_cpu
@@ -64,7 +64,7 @@ def main() -> None:
         1000.0 + torch.arange(16 * 2, dtype=torch.float32).reshape(16, 2),
         2000.0 + torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2),
     ]
-    anchors_gpu = [gm45.to_gm45(tensor) for tensor in anchors_cpu]
+    anchors_gpu = [gm45.to_device(tensor) for tensor in anchors_cpu]
     anchors_y = torch.cat(anchors_gpu, dim=0)
     report_cat("YOLO anchor_points 2D dim-0 cat", anchors_gpu, anchors_y, torch.cat(anchors_cpu, dim=0))
 

@@ -19,7 +19,7 @@ def main() -> int:
 
     torch.manual_seed(3030)
     x_cpu = torch.randn((1, 7, 5, 6), dtype=torch.float32) * 2.0
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     input_texture = x._owner.texture
 
     # This dispatches aten.silu_.default. The backend writes a new output texture

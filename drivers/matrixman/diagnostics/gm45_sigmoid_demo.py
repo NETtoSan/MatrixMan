@@ -14,7 +14,7 @@ def main() -> int:
     print("GM45 YOLO sigmoid")
     for channels, anchors in ((80, 84), (80, 8400), (10, 33600)):
         cpu = torch.randn((1, channels, anchors), dtype=torch.float32)
-        gpu = gm45.to_gm45(cpu)
+        gpu = gm45.to_device(cpu)
         output = torch.sigmoid(gpu)
         output_cpu = output.cpu()
         expected = torch.sigmoid(cpu)

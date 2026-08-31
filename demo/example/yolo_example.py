@@ -64,7 +64,7 @@ def main() -> int:
     print("CPU input:", list(input_cpu.shape), input_cpu.dtype)
 
     # CPU preprocessing/upload ends here. The model forward uses MatrixMan.
-    input_mm = matrixman.to_gm45(input_cpu)
+    input_mm = matrixman.to_device(input_cpu)
     print("MatrixMan input:", type(input_mm).__name__, input_mm.device)
     with torch.no_grad():
         output_mm = model(input_mm)

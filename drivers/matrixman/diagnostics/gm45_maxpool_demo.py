@@ -34,7 +34,7 @@ def main() -> None:
     # Negative-biased values verify that out-of-bounds padding is treated as
     # negative infinity, not zero.
     x_cpu = torch.randn((1, 128, 2, 2), dtype=torch.float32, generator=generator) - 5.0
-    x = gm45.to_gm45(x_cpu)
+    x = gm45.to_device(x_cpu)
     y = F.max_pool2d(x, kernel_size=5, stride=1, padding=2)
     expected = F.max_pool2d(x_cpu, kernel_size=5, stride=1, padding=2)
     report_pool("YOLO SPPF max_pool2d values", x, y, expected)
@@ -52,7 +52,7 @@ def main() -> None:
     print(f"  values allclose: {torch.allclose(direct_cpu, expected, atol=1e-5, rtol=1e-5)}")
 
     split_cpu = torch.randn((1, 256, 2, 2), dtype=torch.float32, generator=generator) - 3.0
-    split_source = gm45.to_gm45(split_cpu)
+    split_source = gm45.to_device(split_cpu)
     _, right = torch.split(split_source, 128, dim=1)
     split_pool = F.max_pool2d(right, kernel_size=5, stride=1, padding=2)
     split_expected = F.max_pool2d(split_cpu[:, 128:256], kernel_size=5, stride=1, padding=2)

@@ -9,54 +9,17 @@ import torch
 
 from . import diagnostics, gpumatrix as gm, kernels, operation_context, render, runtime
 from .storage import StorageLayout, numel
-from .tensor import Gm45Tensor
+from ...tensor import MatrixManTensor
 
 
 _aten_privateuse1_lib = None
 
 
 def register_privateuse_name() -> None:
-    """Register MatrixMan's stable PrivateUse1 device name."""
-    try:
-        torch.utils.rename_privateuse1_backend("gm45")
-    except RuntimeError as exc:
-        current = torch._C._get_privateuse1_backend_name()
-        if current != "gm45":
-            raise RuntimeError(f"PrivateUse1 is already registered as {current!r}, not 'gm45'") from exc
+    """Deprecated compatibility wrapper for shared MatrixMan registration."""
+    from ...privateuse import register_privateuse1_backend
 
-    class BackendModule:
-        @staticmethod
-        def is_available() -> bool:
-            from . import runtime
-            return runtime.is_active()
-
-        @staticmethod
-        def device_count() -> int:
-            return 1
-
-        @staticmethod
-        def current_device() -> int:
-            return 0
-
-        @staticmethod
-        def is_initialized() -> bool:
-            from . import runtime
-            return runtime.is_active()
-
-        @staticmethod
-        def _is_in_bad_fork() -> bool:
-            return False
-
-        @staticmethod
-        def manual_seed_all(seed: int) -> None:
-            del seed
-            return None
-
-    try:
-        torch._register_device_module("privateuseone", BackendModule)
-    except RuntimeError:
-        if not hasattr(torch, "gm45"):
-            raise
+    register_privateuse1_backend()
 
 
 def _new_zero_element_placeholder(shape: tuple[int, ...]):
@@ -81,7 +44,7 @@ def _validate_factory_options(op_name: str, dtype, layout, device, pin_memory) -
         raise RuntimeError(f"gm45 {op_name} supports only strided layout, got {layout}")
     if pin_memory:
         raise RuntimeError(f"gm45 {op_name} does not support pin_memory")
-    if device is not None and str(device) not in {"gm45", "gm45:0", "privateuseone", "privateuseone:0"}:
+    if device is not None and str(device) not in {"matrixman", "matrixman:0", "privateuseone", "privateuseone:0"}:
         raise RuntimeError(f"gm45 {op_name} got unsupported device {device}")
 
 
@@ -104,14 +67,14 @@ def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, 
         raise RuntimeError(f"gm45 empty supports only strided layout, got {layout}")
     if pin_memory:
         raise RuntimeError("gm45 empty does not support pin_memory")
-    if device is not None and str(device) not in {"gm45", "gm45:0", "privateuseone", "privateuseone:0"}:
+    if device is not None and str(device) not in {"matrixman", "matrixman:0", "privateuseone", "privateuseone:0"}:
         raise RuntimeError(f"gm45 empty got unsupported device {device}")
     if numel(shape) == 0:
         owner = _new_zero_element_placeholder(shape)
-        return Gm45Tensor._from_owner(owner, shape)
+        return MatrixManTensor._from_owner(owner, shape)
     owner = operation_context.output_texture(shape)
     diagnostics.trace(f"gm45.empty -> allocated texture #{owner.texture} shape={list(shape)}")
-    return Gm45Tensor._from_owner(owner, shape)
+    return MatrixManTensor._from_owner(owner, shape)
 
 
 def arange_program(params: tuple) -> int:
@@ -167,13 +130,13 @@ def _arange_length(start: float, end: float, step: float) -> int:
     return max(0, int(math.ceil((end - start) / step)))
 
 
-def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None) -> Gm45Tensor:
+def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None) -> MatrixManTensor:
     _validate_factory_options("arange", dtype, layout, device, bool(pin_memory))
     start_f, end_f, step_f = float(start), float(end), float(step)
     length = _arange_length(start_f, end_f, step_f)
     shape = (length,)
     if length == 0:
-        return Gm45Tensor._from_owner(_new_zero_element_placeholder(shape), shape)
+        return MatrixManTensor._from_owner(_new_zero_element_placeholder(shape), shape)
     out_owner = operation_context.output_texture(shape)
     params = (length, start_f, step_f, out_owner.layout.texture_width)
     program = arange_program(params)
@@ -193,7 +156,7 @@ def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after arange: 0x{err:04x}")
-    return Gm45Tensor._from_owner(out_owner, shape)
+    return MatrixManTensor._from_owner(out_owner, shape)
 
 
 def arange_default(end, **kwargs):

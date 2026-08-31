@@ -116,13 +116,13 @@ def main() -> int:
                 frame_started = time.perf_counter()
                 cpu_input = preprocess_frame(frame, args.imgsz)
                 upload_started = time.perf_counter()
-                gpu_input = matrixman.to_gm45(cpu_input)
+                gpu_input = matrixman.to_device(cpu_input)
                 upload_time = time.perf_counter() - upload_started
                 inference_started = time.perf_counter()
                 with torch.no_grad():
                     output = first_tensor(net(gpu_input))
                 inference_time = time.perf_counter() - inference_started
-                if not matrixman.is_gm45_tensor(output):
+                if not matrixman.is_matrixman_tensor(output):
                     raise RuntimeError("model output did not remain a MatrixMan tensor")
                 readback_started = time.perf_counter()
                 reduction_enabled = os.environ.get("MATRIXMAN_GPU_POSTPROCESS", "").strip().lower() not in {"", "0", "false", "no", "off"}

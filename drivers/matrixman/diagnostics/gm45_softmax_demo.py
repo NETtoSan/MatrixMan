@@ -13,7 +13,7 @@ def main() -> int:
     torch.manual_seed(20260829)
     base_cpu = torch.randn((1, 4, 16, 84), dtype=torch.float32)
     input_cpu = base_cpu.transpose(1, 2)
-    input_gpu = gm45.to_gm45(base_cpu).transpose(1, 2)
+    input_gpu = gm45.to_device(base_cpu).transpose(1, 2)
     output_gpu = torch.ops.aten._softmax.default(input_gpu, 1, False)
     output_cpu = output_gpu.cpu()
     expected = torch.softmax(input_cpu, dim=1)

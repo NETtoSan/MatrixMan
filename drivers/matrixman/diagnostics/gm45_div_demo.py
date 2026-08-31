@@ -13,7 +13,7 @@ def main() -> int:
     torch.manual_seed(20260829)
     for anchors in (84, 336, 8400):
         cpu = torch.randn((1, 2, anchors), dtype=torch.float32)
-        gpu = gm45.to_gm45(cpu)
+        gpu = gm45.to_device(cpu)
         output = gpu / 2
         output_cpu = output.cpu()
         expected = cpu / 2

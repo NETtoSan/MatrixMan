@@ -125,15 +125,17 @@ defaults.
 
 ## Architecture
 
-MatrixMan has a small explicit backend interface and currently selects OpenGL
-as its only usable backend. The OpenGL implementation is split into modules
+MatrixMan has a small explicit backend interface. It selects CUDA first when
+the legacy CUDA capability is available, then falls back to OpenGL. The
+OpenGL implementation is split into modules
 under `drivers/matrixman/backends/opengl/`:
 
 ```text
 backend.py          backend façade and public entrypoint
 runtime.py          SDL/OpenGL context and context-owned lifetime
 resources.py        textures, uploads, readback resources, and caches
-tensor.py           Gm45Tensor and OpenGL texture ownership
+../tensor.py        backend-neutral MatrixManTensor wrapper and metadata
+tensor.py           OpenGL texture ownership and readback helpers
 metadata.py         logical views, strides, offsets, and split metadata
 kernels.py          shader/program lookup and shared kernel helpers
 render.py           shared framebuffer and fullscreen-render plumbing
@@ -149,8 +151,9 @@ ops/                arithmetic, activation, normalization, pooling, resize,
 
 `implementation.py` is now only a small compatibility re-export façade. It is
 not in the normal runtime execution path. The `backends/cuda/` and
-`backends/opencl/` directories are reserved placeholder packages only; neither
-backend is implemented or selected.
+`backends/opencl/` remains a reserved placeholder package. CUDA selection is
+currently truthful at the backend boundary, while its PrivateUse1 operator
+coverage is still being added.
 
 ## Basic PyTorch Usage
 
@@ -163,8 +166,8 @@ from drivers import matrixman
 a_cpu = torch.randn((2, 2), dtype=torch.float32)
 b_cpu = torch.randn((2, 2), dtype=torch.float32)
 
-a = matrixman.to_gm45(a_cpu)
-b = matrixman.to_gm45(b_cpu)
+a = matrixman.to_device(a_cpu)
+b = matrixman.to_device(b_cpu)
 
 c = a + b                 # MatrixMan GPU tensor add
 result = c.cpu()          # explicit readback to CPU
@@ -189,7 +192,7 @@ from ultralytics import YOLO
 from drivers import matrixman
 
 model = YOLO("model.pt").model.eval()
-input_mm = matrixman.to_gm45(input_cpu)
+input_mm = matrixman.to_device(input_cpu)
 
 with torch.no_grad():
     output_mm = model(input_mm)
@@ -210,23 +213,25 @@ python3 demo/example/yolo_example.py model.pt path/to/image.jpg --imgsz 320
 The execution boundary is deliberately visible:
 
 ```text
-image -> CPU preprocessing -> PyTorch tensor -> matrixman.to_gm45()
-      -> Gm45Tensor -> Ultralytics/PyTorch forward
+image -> CPU preprocessing -> PyTorch tensor -> matrixman.to_device()
+      -> MatrixManTensor -> Ultralytics/PyTorch forward
       -> supported tensor arithmetic through MatrixMan/OpenGL/GLSL
       -> explicit CPU readback -> CPU postprocessing
 ```
 
 Python `model.forward` and its control flow still execute normally on the
 CPU/PyTorch side. MatrixMan intercepts supported tensor operations involving a
-`Gm45Tensor` and executes their arithmetic through OpenGL/GLSL.
+`MatrixManTensor` and executes their arithmetic through OpenGL/GLSL.
 
 MatrixMan is not specific to VisDrone. Ultralytics YOLO models can be
 attempted when the ATen operations they exercise are supported; this does not
 mean every YOLO or Ultralytics model is supported. The current VisDrone-style
 checkpoint is tested evidence, not a general Ultralytics compatibility claim.
 
-The historical public names `Gm45Tensor`, `to_gm45()`, and device name
-`gm45:0` are retained for compatibility. They identify the current PyTorch
+The backend-neutral names are `MatrixManTensor`, `to_device()`,
+`is_matrixman_tensor()`, and the PyTorch device name `matrixman:0`. The
+historical public names `Gm45Tensor`, `to_gm45()`, and `is_gm45_tensor()` remain
+deprecated forwarding aliases. These names identify the current PyTorch
 integration and do not imply that execution is restricted to GM45 hardware.
 
 ### Tested Model Evidence
@@ -312,7 +317,7 @@ drivers/matrixman/backends/
 OpenCL support is not currently provided. CUDA has a low-level runtime and
 matrix execution path, but still needs its own tensor representation, dispatch
 bridge, operator implementations, and framework/factory integration. The
-current OpenGL `Gm45Tensor` is not intended to be shared by those backends.
+current OpenGL `MatrixManTensor` is not intended to be shared by those backends.
 
 ## What MatrixMan Is Not
 

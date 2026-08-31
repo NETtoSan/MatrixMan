@@ -70,7 +70,7 @@ void main()
     return source.encode("ascii")
 
 
-def _run_probe(tensor: gm45.Gm45Tensor, mode: str, shape: tuple[int, ...]) -> torch.Tensor:
+def _run_probe(tensor: gm45.MatrixManTensor, mode: str, shape: tuple[int, ...]) -> torch.Tensor:
     out_owner = operation_context.output_texture(shape)
     rt = runtime.runtime_required()
     program = gl.make_program(_probe_shader(
@@ -95,7 +95,7 @@ def _run_probe(tensor: gm45.Gm45Tensor, mode: str, shape: tuple[int, ...]) -> to
         error = gl.glGetError()
         if error:
             raise RuntimeError(f"OpenGL address probe error: 0x{error:04x}")
-        result = gm45.Gm45Tensor._from_owner(out_owner, shape).cpu()
+        result = gm45.MatrixManTensor._from_owner(out_owner, shape).cpu()
     finally:
         gl.glDeleteProgram(program)
     return result
@@ -133,7 +133,7 @@ def _report_mismatch(label: str, expected: torch.Tensor, actual: torch.Tensor, s
 def input_case(shape: tuple[int, ...]) -> None:
     count = math.prod(shape)
     cpu = torch.arange(count, dtype=torch.float32).reshape(shape)
-    tensor = gm45.to_gm45(cpu)
+    tensor = gm45.to_device(cpu)
     actual = _run_probe(tensor, "input", shape)
     print(f"INPUT shape={list(shape)} texture={tensor._owner.texture} atlas={tensor._owner.layout.texture_width}x{tensor._owner.layout.texture_height}")
     _report_mismatch("input lookup", cpu, actual, shape, tensor._owner.layout.texture_width)
@@ -148,7 +148,7 @@ def weight_case(shape: tuple[int, ...]) -> None:
                 for x in range(kw):
                     cpu[o, i, y, x] = o * 1000 + i * 10 + y * 2 + x
     flat = cpu.reshape(-1)
-    tensor = gm45.to_gm45(flat)
+    tensor = gm45.to_device(flat)
     actual = _run_probe(tensor, "weight", flat.shape)
     print(f"WEIGHT logical shape={list(shape)} packed buffer={list(flat.shape)} texture={tensor._owner.texture} atlas={tensor._owner.layout.texture_width}x{tensor._owner.layout.texture_height}")
     _report_mismatch("weight lookup", flat, actual, shape, tensor._owner.layout.texture_width)
@@ -156,7 +156,7 @@ def weight_case(shape: tuple[int, ...]) -> None:
 
 def output_case(shape: tuple[int, ...]) -> None:
     count = math.prod(shape)
-    source = gm45.to_gm45(torch.zeros(shape, dtype=torch.float32))
+    source = gm45.to_device(torch.zeros(shape, dtype=torch.float32))
     actual = _run_probe(source, "output", shape)
     expected = torch.arange(count, dtype=torch.float32).reshape(shape)
     print(f"OUTPUT shape={list(shape)} atlas={source._owner.layout.texture_width}x{source._owner.layout.texture_height}")

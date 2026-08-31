@@ -63,7 +63,7 @@ Functions/state:
 - `_unsupported_counts`
 - `_unsupported_examples`
 
-These are called from initialization, operators, readback, and dispatch. `_summarize_dispatch_value` depends on `Gm45Tensor`, while unsupported reports depend on the dispatch argument structure. Tracing is a direct module-global side effect rather than an operation service.
+These are called from initialization, operators, readback, and dispatch. `_summarize_dispatch_value` depends on `MatrixManTensor`, while unsupported reports depend on the dispatch argument structure. Tracing is a direct module-global side effect rather than an operation service.
 
 Proposed destination: a small diagnostics utility, with profiling remaining in `profiling.py`. Do not put this collection into `operation_context.py`.
 
@@ -253,7 +253,7 @@ Functions:
 
 The active view helpers are routed through `metadata.py`; the `_legacy_*` bodies remain inert compatibility remnants. `_metadata_split` remains active and handles supported batch-1 NCHW and DFL-shaped cases, including storage offsets and alias construction.
 
-Dependencies include `Gm45Tensor`, `_TextureOwner.layout`, storage strides, `_numel`, shape validation, and tracing. Split also contains model-trace-specific compatibility cases.
+Dependencies include `MatrixManTensor`, `_TextureOwner.layout`, storage strides, `_numel`, shape validation, and tracing. Split also contains model-trace-specific compatibility cases.
 
 Proposed destination: `metadata.py`; split should move after its dispatch-specific supported cases are isolated.
 
@@ -285,7 +285,7 @@ Functions:
 - `_render_packed_scalar_div`
 - `_render_packed_broadcast_mul`
 
-These create outputs, validate packed layouts/strides, select arithmetic programs, attach the shared FBO, bind textures and uniforms, draw fullscreen quads, check errors, and construct `Gm45Tensor` outputs.
+These create outputs, validate packed layouts/strides, select arithmetic programs, attach the shared FBO, bind textures and uniforms, draw fullscreen quads, check errors, and construct `MatrixManTensor` outputs.
 
 Dependencies:
 
@@ -295,7 +295,7 @@ Dependencies:
 - `_is_scalar_operand`, `_scalar_value`
 - metadata contiguity checks
 - `render.py`
-- `Gm45Tensor._from_owner`
+- `MatrixManTensor._from_owner`
 - direct `gm` state and profiling/tracing
 
 Caller: `_DispatchBridge.__torch_dispatch__`; `_render_binary` is also called by `OpenGLBackend.matmul`.
@@ -423,7 +423,7 @@ Functions:
 - `tensor`
 - `randn`
 - `to_gm45`
-- `is_gm45_tensor`
+- `is_matrixman_tensor`
 - `install_tensor_method`
 - `_install_privateuse1_factory_kernels`
 
@@ -449,7 +449,7 @@ resources.py
 
 tensor.py
   ├── _TextureOwner
-  └── Gm45Tensor wrapper and owner construction
+  └── MatrixManTensor wrapper and owner construction
 
 metadata.py
   └── logical shape/stride/storage-offset aliases
@@ -490,7 +490,7 @@ operator execution
   -> runtime program/uniform cache
   -> operation context
   -> resource output allocation
-  -> Gm45Tensor construction
+  -> MatrixManTensor construction
   -> render/FBO helpers
   -> profiling/tracing
 
@@ -515,7 +515,7 @@ dispatch
 3. `_glsl_float` and storage helpers affect many shader generators.
 4. Profiling/tracing globals are read directly by resource and operator code.
 5. Program and uniform dictionaries are runtime-owned, but selection and insertion logic is still operator-local.
-6. `Gm45Tensor._from_owner` is the common return path for almost every operator.
+6. `MatrixManTensor._from_owner` is the common return path for almost every operator.
 7. Framebuffer checks, texture binding, uniform setup, and `glGetError` handling are repeated inside operator bodies.
 8. The dispatch bridge names every private implementation helper and prevents deletion until routing is migrated.
 9. Lazy callbacks from `operation_context.py`, `metadata.py`, `resources.py`, and `tensor.py` preserve compatibility but keep the monolith reachable.
@@ -542,7 +542,8 @@ Separate `_new_empty_packed_texture` into:
 ```text
 storage.py       layout calculation
 resources.py     RGBA32F allocation
-tensor.py        _TextureOwner and Gm45Tensor construction
+../tensor.py     MatrixManTensor wrapper and owner construction
+tensor.py        _TextureOwner and OpenGL readback
 operation_context.py  narrow assembly function
 ```
 
@@ -625,7 +626,7 @@ allocate_packed_output(shape)
     -> resource allocation + StorageLayout + _TextureOwner
 
 tensor_from_owner(owner, shape, offset, strides)
-    -> Gm45Tensor
+    -> MatrixManTensor
 ```
 
 The contract must preserve packed atlas dimensions, ownership registration, tracing, and profiling counters.
@@ -694,7 +695,7 @@ convolution.py
   dedicated tiled Conv2D subsystem
 
 tensor.py
-  Gm45Tensor and texture ownership
+  MatrixManTensor and texture ownership
 
 metadata.py
   logical views, strides, and storage offsets

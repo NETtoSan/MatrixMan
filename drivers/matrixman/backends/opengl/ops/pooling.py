@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from .. import diagnostics, gpumatrix as gm, operation_context
-from ..tensor import Gm45Tensor
+from ....tensor import MatrixManTensor
 
 def _maxpool_program(params: tuple) -> tuple[int, int]:
     rt = operation_context.gl_runtime()
@@ -92,7 +92,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_max_pool2d_with_indices(args) -> tuple["Gm45Tensor", torch.Tensor]:
+def _render_max_pool2d_with_indices(args) -> tuple["MatrixManTensor", torch.Tensor]:
     input_tensor = args[0]
     kernel_size = _as_pair(args[1], "kernel_size")
     stride = _as_pair(args[2], "stride")
@@ -100,8 +100,8 @@ def _render_max_pool2d_with_indices(args) -> tuple["Gm45Tensor", torch.Tensor]:
     dilation = _as_pair(args[4], "dilation") if len(args) > 4 else (1, 1)
     ceil_mode = bool(args[5]) if len(args) > 5 else False
 
-    if not isinstance(input_tensor, Gm45Tensor):
-        raise RuntimeError("gm45 max_pool2d requires a Gm45Tensor input")
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 max_pool2d requires a MatrixManTensor input")
     if input_tensor.dtype != torch.float32:
         raise RuntimeError("gm45 max_pool2d supports only float32")
     if input_tensor._owner.layout.kind != "packed_rgba":
@@ -160,7 +160,7 @@ def _render_max_pool2d_with_indices(args) -> tuple["Gm45Tensor", torch.Tensor]:
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after max_pool2d: 0x{err:04x}")
-    values = Gm45Tensor._from_owner(out_owner, out_shape)
+    values = MatrixManTensor._from_owner(out_owner, out_shape)
     indices = torch.empty((0,), dtype=torch.int64, device="cpu")
     return values, indices
 

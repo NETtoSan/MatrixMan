@@ -8,7 +8,7 @@ import os
 from .backend import Backend, set_backend
 from .backends.cuda.backend import CudaBackend
 from .backends.cuda.gpumatrix import detect_device
-from .backends.opengl.backend import OpenGLBackend
+from .privateuse import register_privateuse1_backend
 
 
 @dataclass(frozen=True)
@@ -24,17 +24,26 @@ class BackendCapability:
     metadata: dict[str, str] = field(default_factory=dict)
 
 
-def probe_capabilities() -> dict[str, BackendCapability]:
+def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
     """Probe all known backends once and return the ordered capability registry."""
-    try:
-        opengl_available = OpenGLBackend.probe()
-    except Exception:
-        opengl_available = False
-
     try:
         _, cuda_info = detect_device()
     except Exception:
         cuda_info = None
+
+    # OpenGL probing currently creates its hidden context.  Do not import or
+    # probe it on the CUDA path.  It is still probed when needed for fallback
+    # selection or when explicitly requested.
+    opengl_available = False
+    opengl_backend = None
+    if requested == "opengl" or cuda_info is None:
+        try:
+            from .backends.opengl.backend import OpenGLBackend
+
+            opengl_available = OpenGLBackend.probe()
+            opengl_backend = OpenGLBackend
+        except Exception:
+            opengl_available = False
 
     return {
         "cuda": BackendCapability(
@@ -53,7 +62,7 @@ def probe_capabilities() -> dict[str, BackendCapability]:
             available=opengl_available,
             enabled=True,
             implemented=True,
-            backend=OpenGLBackend,
+            backend=opengl_backend,
         ),
         "opencl": BackendCapability(
             name="opencl", available=False, enabled=False, implemented=False
@@ -86,7 +95,7 @@ def name_label(name: str) -> str:
 def select_backend() -> Backend:
     """Probe known backends, report the registry, and select an enabled backend."""
     requested = os.environ.get("MATRIXMAN_BACKEND", "").strip().lower()
-    capabilities = probe_capabilities()
+    capabilities = probe_capabilities(requested)
     _print_probe(capabilities)
 
     if requested and requested not in {"cuda", "opengl", "opencl"}:
@@ -119,5 +128,6 @@ def select_backend() -> Backend:
 
     if selected.backend is None:
         raise RuntimeError(f"MatrixMan backend '{selected.name}' has no implementation")
+    register_privateuse1_backend()
     print(f"MatrixMan selected: {name_label(selected.name)}")
     return set_backend(selected.backend())
