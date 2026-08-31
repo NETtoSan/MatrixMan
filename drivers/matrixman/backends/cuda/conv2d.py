@@ -168,6 +168,7 @@ def run_diagnostic() -> int:
                 print("  corner samples:", actual_case[0, :2, :2, :2])
 
         for height, width in ((4, 4), (40, 40), (80, 80)):
+            print(f"testing specialized [1,64,{height},{width}]...", flush=True)
             run_specialized_case(height, width)
     return 0
 

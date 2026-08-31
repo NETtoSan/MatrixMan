@@ -1,6 +1,7 @@
 """MatrixMan CUDA backend façade."""
 
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -187,7 +188,11 @@ class CudaBackend(Backend):
         out_w = (w + 2 * pad_w - dilation_w * (s - 1) - 1) // stride_w + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError("MatrixMan/CUDA: convolution output dimensions must be positive")
+        disable_specialized = os.environ.get(
+            "MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV", ""
+        ).strip().lower() not in {"", "0", "false", "no", "off"}
         specialized = (
+            not disable_specialized and
             c == 64 and k == 64 and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
             and pad_h == 1 and pad_w == 1

@@ -39,7 +39,17 @@ CUDA_BLOCK_SIZE = 128
 
 
 def _cuda_debug_enabled() -> bool:
-    return os.environ.get("MATRIXMAN_CUDA_DEBUG", "").strip().lower() not in {
+    return _truthy_environment("MATRIXMAN_CUDA_DEBUG")
+
+
+def _truthy_environment(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in {
+        "", "0", "false", "no", "off"
+    }
+
+
+def _specialized_conv_disabled() -> bool:
+    return os.environ.get("MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV", "").strip().lower() not in {
         "", "0", "false", "no", "off"
     }
 
@@ -1110,7 +1120,9 @@ CONV_DONE:
 
     // One block owns one output-channel plane.  The 576 weights for that
     // channel are loaded cooperatively into 2304 bytes of shared memory.
-    cvta.to.shared.u32 %r33, conv3x3_weights;
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r33, %rd8;
     mov.u32 %r22, %r19;
 FAST_LOAD:
     setp.ge.u32 %p0, %r22, 576;
@@ -1702,8 +1714,6 @@ class CudaExecutionBackend:
             ptx = ctypes.create_string_buffer(PTX)
             info_log = ctypes.create_string_buffer(16384)
             error_log = ctypes.create_string_buffer(16384)
-            info_log_size = ctypes.c_uint(len(info_log))
-            error_log_size = ctypes.c_uint(len(error_log))
             jit_options = (ctypes.c_int * 4)(
                 CU_JIT_INFO_LOG_BUFFER,
                 CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
@@ -1712,9 +1722,9 @@ class CudaExecutionBackend:
             )
             jit_values = (ctypes.c_void_p * 4)(
                 ctypes.cast(info_log, ctypes.c_void_p),
-                ctypes.cast(ctypes.byref(info_log_size), ctypes.c_void_p),
+                ctypes.c_void_p(len(info_log)),
                 ctypes.cast(error_log, ctypes.c_void_p),
-                ctypes.cast(ctypes.byref(error_log_size), ctypes.c_void_p),
+                ctypes.c_void_p(len(error_log)),
             )
             module_description = (
                 "embedded sm_21 PTX module: matrix_add, matrix_sub, "
@@ -1724,13 +1734,18 @@ class CudaExecutionBackend:
                 "conv2d_3x3_s1_p1_c64, batch_norm_inference, silu, "
                 "split_copy, cat_copy, upsample_nearest2d"
             )
-            load_result = self.driver.cuModuleLoadDataEx(
-                ctypes.byref(self.module),
-                ctypes.cast(ptx, ctypes.c_void_p),
-                len(jit_options),
-                jit_options,
-                jit_values,
-            )
+            if _truthy_environment("MATRIXMAN_CUDA_LEGACY_MODULE_LOAD"):
+                load_result = self.driver.cuModuleLoadData(
+                    ctypes.byref(self.module), ctypes.cast(ptx, ctypes.c_void_p)
+                )
+            else:
+                load_result = self.driver.cuModuleLoadDataEx(
+                    ctypes.byref(self.module),
+                    ctypes.cast(ptx, ctypes.c_void_p),
+                    len(jit_options),
+                    jit_options,
+                    jit_values,
+                )
             if load_result != CUDA_SUCCESS:
                 jit_error = error_log.value.decode(errors="replace").strip()
                 error_name = ctypes.c_char_p()
@@ -1739,10 +1754,9 @@ class CudaExecutionBackend:
                 self.driver.cuGetErrorString(load_result, ctypes.byref(error_message))
                 name = error_name.value.decode(errors="replace") if error_name.value else str(load_result)
                 message = error_message.value.decode(errors="replace") if error_message.value else "unknown error"
-                raise RuntimeError(
-                    f"cuModuleLoadDataEx ({module_description}): {name} ({message})\n"
-                    f"PTX JIT error log:\n{jit_error or '(empty)'}"
-                )
+                loader = "cuModuleLoadData" if _truthy_environment("MATRIXMAN_CUDA_LEGACY_MODULE_LOAD") else "cuModuleLoadDataEx"
+                detail = f"\nPTX JIT error log:\n{jit_error or '(empty)'}" if loader.endswith("Ex") else ""
+                raise RuntimeError(f"{loader} ({module_description}): {name} ({message}){detail}")
             if _cuda_debug_enabled() and info_log.value:
                 print(
                     "[MatrixMan/CUDA/debug] PTX JIT info log:\n"
@@ -2155,6 +2169,8 @@ class CudaExecutionBackend:
         groups: int,
         specialized: bool = False,
     ) -> None:
+        if specialized and _specialized_conv_disabled():
+            specialized = False
         dimensions = (n, c, h, w, k, r, s, out_h, out_w)
         if min(dimensions) <= 0:
             raise ValueError("convolution dimensions must be positive")
@@ -2201,7 +2217,9 @@ class CudaExecutionBackend:
                 ctypes.c_uint(dilation_h), ctypes.c_uint(dilation_w),
                 ctypes.c_uint(groups),
             ],
-            n * k if specialized else total_outputs,
+            # The specialized kernel assigns one block to each output plane;
+            # _launch derives grid.x by dividing this count by the block size.
+            n * k * CUDA_BLOCK_SIZE if specialized else total_outputs,
             profile_signature=profile_signature,
             profile_variant="specialized-3x3" if specialized else "generic",
         )
