@@ -21,6 +21,16 @@ activation = defaultdict(float)
 parameter_cache = defaultdict(float)
 readback = defaultdict(float)
 conv2d_signatures = {}
+async_mode = False
+synchronizations = defaultdict(lambda: {"calls": 0, "seconds": 0.0, "pending_blocks": 0, "pending_bytes": 0})
+launch_gap = {
+    "launches": 0,
+    "synchronized_seconds": 0.0,
+    "inter_launch_seconds": 0.0,
+    "max_inter_launch_seconds": 0.0,
+    "last_sync_end": None,
+    "buckets": defaultdict(int),
+}
 allocation = {
     "requests": 0,
     "free_requests": 0,
@@ -36,6 +46,7 @@ allocation = {
     "live_by_size": defaultdict(int),
     "peak_live_by_size": defaultdict(int),
     "live_pointers": {},
+    "pending_pointers": {},
     "category_requests": defaultdict(int),
     "category_driver_allocations": defaultdict(int),
     "category_driver_frees": defaultdict(int),
@@ -46,6 +57,12 @@ allocation = {
     "cached_bytes": 0,
     "peak_cached_blocks": 0,
     "peak_cached_bytes": 0,
+    "pending_blocks": 0,
+    "pending_bytes": 0,
+    "peak_pending_blocks": 0,
+    "peak_pending_bytes": 0,
+    "synchronization_boundaries": 0,
+    "pending_reclaimed": 0,
 }
 _exit_hook_registered = False
 
@@ -56,6 +73,11 @@ def set_enabled(value: bool) -> None:
     enabled = bool(value)
     if enabled:
         register_exit_hook()
+
+
+def set_async_mode(value: bool) -> None:
+    global async_mode
+    async_mode = bool(value)
 
 
 def is_enabled() -> bool:
@@ -72,6 +94,13 @@ def reset() -> None:
     parameter_cache.clear()
     readback.clear()
     conv2d_signatures.clear()
+    synchronizations.clear()
+    launch_gap["launches"] = 0
+    launch_gap["synchronized_seconds"] = 0.0
+    launch_gap["inter_launch_seconds"] = 0.0
+    launch_gap["max_inter_launch_seconds"] = 0.0
+    launch_gap["last_sync_end"] = None
+    launch_gap["buckets"].clear()
     allocation["requests"] = 0
     allocation["free_requests"] = 0
     allocation["requested_bytes"] = 0
@@ -86,6 +115,7 @@ def reset() -> None:
     allocation["live_by_size"].clear()
     allocation["peak_live_by_size"].clear()
     allocation["live_pointers"].clear()
+    allocation["pending_pointers"].clear()
     allocation["category_requests"].clear()
     allocation["category_driver_allocations"].clear()
     allocation["category_driver_frees"].clear()
@@ -96,6 +126,12 @@ def reset() -> None:
     allocation["cached_bytes"] = 0
     allocation["peak_cached_blocks"] = 0
     allocation["peak_cached_bytes"] = 0
+    allocation["pending_blocks"] = 0
+    allocation["pending_bytes"] = 0
+    allocation["peak_pending_blocks"] = 0
+    allocation["peak_pending_bytes"] = 0
+    allocation["synchronization_boundaries"] = 0
+    allocation["pending_reclaimed"] = 0
 
 
 def register_exit_hook() -> None:
@@ -112,7 +148,7 @@ def register_exit_hook() -> None:
             active is not None
             and active.name == "cuda"
             and enabled
-            and (records or batch_norm or conv2d or activation or parameter_cache or readback)
+            and (records or batch_norm or conv2d or activation or parameter_cache or readback or launch_gap["launches"])
         ):
             report()
 
@@ -122,6 +158,44 @@ def register_exit_hook() -> None:
 
 def start() -> float | None:
     return time.perf_counter() if enabled else None
+
+
+def launch_started() -> float | None:
+    """Record the timestamp immediately before a driver kernel launch."""
+    if not enabled:
+        return None
+    started = time.perf_counter()
+    previous_sync_end = launch_gap["last_sync_end"]
+    if previous_sync_end is not None:
+        gap = started - previous_sync_end
+        launch_gap["inter_launch_seconds"] += gap
+        launch_gap["max_inter_launch_seconds"] = max(
+            launch_gap["max_inter_launch_seconds"], gap
+        )
+        if gap < 50e-6:
+            bucket = "<50 us"
+        elif gap < 100e-6:
+            bucket = "50-100 us"
+        elif gap < 250e-6:
+            bucket = "100-250 us"
+        elif gap < 500e-6:
+            bucket = "250-500 us"
+        elif gap < 1e-3:
+            bucket = "0.5-1 ms"
+        else:
+            bucket = ">1 ms"
+        launch_gap["buckets"][bucket] += 1
+    return started
+
+
+def launch_synchronized(started: float | None) -> None:
+    """Record the timestamp immediately after the existing synchronization."""
+    if not enabled or started is None:
+        return
+    finished = time.perf_counter()
+    launch_gap["launches"] += 1
+    launch_gap["synchronized_seconds"] += finished - started
+    launch_gap["last_sync_end"] = finished
 
 
 def observe(label: str, started: float | None, byte_count: int = 0) -> float | None:
@@ -293,6 +367,71 @@ def allocation_driver_freed() -> None:
         allocation["driver_frees"] += 1
 
 
+def allocation_pending(pointer) -> None:
+    """Move a released live allocation into the post-synchronization set."""
+    if not enabled:
+        return
+    address = int(pointer.value)
+    entry = allocation["live_pointers"].pop(address, None)
+    if entry is None:
+        return
+    nbytes, _category = entry
+    allocation["live_count"] -= 1
+    allocation["live_bytes"] -= nbytes
+    allocation["live_by_size"][nbytes] -= 1
+    allocation["pending_pointers"][address] = (nbytes, _category)
+    allocation["pending_blocks"] += 1
+    allocation["pending_bytes"] += nbytes
+    allocation["peak_pending_blocks"] = max(
+        allocation["peak_pending_blocks"], allocation["pending_blocks"]
+    )
+    allocation["peak_pending_bytes"] = max(
+        allocation["peak_pending_bytes"], allocation["pending_bytes"]
+    )
+
+
+def allocation_pending_reclaimed(pointer, nbytes: int, to_pool: bool) -> None:
+    if not enabled:
+        return
+    address = int(pointer.value)
+    entry = allocation.get("pending_pointers", {}).pop(address, None)
+    if entry is None:
+        return
+    allocation["pending_blocks"] -= 1
+    allocation["pending_bytes"] -= int(nbytes)
+    allocation["pending_reclaimed"] += 1
+    if to_pool:
+        allocation["cached_blocks"] += 1
+        allocation["cached_bytes"] += int(nbytes)
+        allocation["pool_returns"] += 1
+        allocation["peak_cached_blocks"] = max(
+            allocation["peak_cached_blocks"], allocation["cached_blocks"]
+        )
+        allocation["peak_cached_bytes"] = max(
+            allocation["peak_cached_bytes"], allocation["cached_bytes"]
+        )
+
+
+def synchronization_boundary() -> None:
+    if enabled:
+        allocation["synchronization_boundaries"] += 1
+
+
+def record_synchronization(
+    reason: str,
+    elapsed: float | None,
+    pending_blocks: int,
+    pending_bytes: int,
+) -> None:
+    if not enabled or elapsed is None:
+        return
+    record = synchronizations[reason]
+    record["calls"] += 1
+    record["seconds"] += float(elapsed)
+    record["pending_blocks"] += int(pending_blocks)
+    record["pending_bytes"] += int(pending_bytes)
+
+
 def observe_conv2d_signature(
     signature: tuple[int, ...], elapsed: float | None, variant: str = "generic"
 ) -> None:
@@ -323,12 +462,44 @@ def report() -> None:
         return
     print("\nMatrixMan CUDA profile")
     print("----------------------------------------")
+    if launch_gap["launches"]:
+        launches = int(launch_gap["launches"])
+        synchronized_ms = launch_gap["synchronized_seconds"] * 1000.0
+        gap_count = max(0, launches - 1)
+        gap_ms = launch_gap["inter_launch_seconds"] * 1000.0
+        print("CUDA launch timing")
+        print(
+            f"  synchronized launches: {launches} total={synchronized_ms:.3f} ms "
+            f"avg={(synchronized_ms / launches) if launches else 0.0:.3f} ms"
+        )
+        print(
+            f"  inter-launch gaps: {gap_count} total={gap_ms:.3f} ms "
+            f"avg={(gap_ms / gap_count) if gap_count else 0.0:.3f} ms "
+            f"max={launch_gap['max_inter_launch_seconds'] * 1000.0:.3f} ms"
+        )
+        print("  inter-launch gap buckets")
+        for bucket in ("<50 us", "50-100 us", "100-250 us", "250-500 us", "0.5-1 ms", ">1 ms"):
+            print(f"    {bucket}: {launch_gap['buckets'].get(bucket, 0)}")
+    if async_mode:
+        print("  ASYNC MODE: operator timings are host enqueue/submission times")
     for label, record in records.items():
         calls = int(record["calls"])
         total_ms = record["seconds"] * 1000.0
         average_ms = total_ms / calls if calls else 0.0
         suffix = f" bytes={int(record['bytes'])}" if record["bytes"] else ""
-        print(f"{label:<24} calls={calls:<4} total={total_ms:9.3f} ms avg={average_ms:8.3f} ms{suffix}")
+        display_label = f"{label} (host enqueue)" if async_mode and label == "Conv2D" else label
+        print(f"{display_label:<32} calls={calls:<4} total={total_ms:9.3f} ms avg={average_ms:8.3f} ms{suffix}")
+    if synchronizations:
+        print("Synchronization boundaries")
+        for reason, record in synchronizations.items():
+            calls = int(record["calls"])
+            total_ms = record["seconds"] * 1000.0
+            print(
+                f"  {reason:<34} calls={calls:<4} total={total_ms:9.3f} ms "
+                f"avg={(total_ms / calls) if calls else 0.0:8.3f} ms "
+                f"pending_reclaimed={int(record['pending_blocks'])} "
+                f"pending_bytes={int(record['pending_bytes'])}"
+            )
     if batch_norm:
         print("BatchNorm parameter traffic")
         print(f"  invocations: {int(batch_norm['invocations'])}")
@@ -393,6 +564,12 @@ def report() -> None:
         print(f"  cached bytes: {allocation['cached_bytes']}")
         print(f"  peak cached blocks: {allocation['peak_cached_blocks']}")
         print(f"  peak cached bytes: {allocation['peak_cached_bytes']}")
+        print(f"  pending releases: {allocation['pending_blocks']}")
+        print(f"  pending release bytes: {allocation['pending_bytes']}")
+        print(f"  peak pending releases: {allocation['peak_pending_blocks']}")
+        print(f"  peak pending bytes: {allocation['peak_pending_bytes']}")
+        print(f"  synchronization boundaries: {allocation['synchronization_boundaries']}")
+        print(f"  pending blocks reclaimed: {allocation['pending_reclaimed']}")
         print("  allocation requests by category")
         for category, calls in sorted(allocation["category_requests"].items()):
             driver_calls = allocation["category_driver_allocations"].get(category, 0)
@@ -435,9 +612,10 @@ def report() -> None:
             # calls before calculating aggregate throughput.
             gmacs = (macs * calls) / (seconds * 1e9) if seconds else 0.0
             print(f"{_format_conv2d_signature(signature)} variant={variant}")
+            throughput = "" if async_mode else f" GMAC/s={gmacs:.3f}"
+            timing_label = "host enqueue ms" if async_mode else "avg ms"
             print(
                 f"    calls={calls} total={total_ms:.3f} ms "
-                f"({percent:.1f}%) avg={average_ms:.3f} ms "
-                f"output_elements={n * cout * hout * wout} "
-                f"MACs={macs} GMAC/s={gmacs:.3f}"
+                f"({percent:.1f}%) {timing_label}={average_ms:.3f} ms "
+                f"output_elements={n * cout * hout * wout} MACs={macs}{throughput}"
             )

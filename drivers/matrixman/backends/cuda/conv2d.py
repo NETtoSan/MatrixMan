@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Standalone legacy-CUDA NCHW Conv2D diagnostic."""
 
+import time
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -58,6 +60,12 @@ def run_diagnostic() -> int:
         print("CUDA device:", cuda.info["name"])
         print("compute capability:", cuda.info["compute_capability"])
         print("device memory (MiB):", cuda.info["memory_mib"])
+        for label, function in (
+            ("conv2d_3x3_s1_p1_c64_plane", cuda.convolution_plane_function),
+            ("conv2d_3x3_s1_p1_c64_plane_2block", cuda.convolution_plane_2block_function),
+            ("conv2d_3x3_s1_p1_c64_plane_256", cuda.convolution_plane_256_function),
+        ):
+            print(f"{label} attributes:", cuda.function_attributes(function))
         input_pointer = cuda.to_device(input_array)
         weight_pointer = cuda.to_device(weight)
         bias_pointer = cuda.to_device(bias)
@@ -136,6 +144,8 @@ def run_diagnostic() -> int:
                     specialized_3x3_plane=variant == "plane",
                     specialized_3x3_plane_legacy=variant == "plane_legacy",
                     specialized_3x3_spatial=variant == "spatial",
+                    specialized_3x3_plane_2block=variant == "plane_2block",
+                    specialized_3x3_plane_256=variant == "plane_256",
                 )
                 actual_case = cuda.from_device(output_dev, expected_case.shape)
             finally:
@@ -165,9 +175,74 @@ def run_diagnostic() -> int:
             return actual_case
 
         plane_results = {}
-        for height, width in ((4, 4), (40, 40), (80, 80)):
+        for height, width in ((4, 4), (20, 20), (40, 40), (80, 80)):
             print(f"testing specialized plane [1,64,{height},{width}]...", flush=True)
             plane_results[(height, width)] = run_specialized_case(height, width)
+
+        two_block_results = {}
+        for height, width in ((4, 4), (20, 20), (40, 40), (80, 80)):
+            print(f"testing specialized plane_2block [1,64,{height},{width}]...", flush=True)
+            two_block_results[(height, width)] = run_specialized_case(height, width, "plane_2block")
+        for key in sorted(set(plane_results) & set(two_block_results)):
+            difference = np.abs(plane_results[key] - two_block_results[key])
+            print(
+                f"Specialized plane/plane_2block comparison {key[0]}x{key[1]}: "
+                f"max_abs_diff={difference.max():.6g} "
+                f"mean_abs_diff={difference.mean():.6g}"
+            )
+
+        plane_256_results = {}
+        for height, width in ((4, 4), (20, 20), (40, 40), (80, 80)):
+            print(f"testing specialized plane_256 [1,64,{height},{width}]...", flush=True)
+            plane_256_results[(height, width)] = run_specialized_case(height, width, "plane_256")
+        for key in sorted(set(plane_results) & set(plane_256_results)):
+            difference = np.abs(plane_results[key] - plane_256_results[key])
+            print(
+                f"Specialized plane/plane_256 comparison {key[0]}x{key[1]}: "
+                f"max_abs_diff={difference.max():.6g} "
+                f"mean_abs_diff={difference.mean():.6g}"
+            )
+
+        def benchmark_specialized_variants(height, width, variants, repetitions=20):
+            rng = np.random.RandomState(9100 + height * 100 + width)
+            input_case = rng.uniform(-1.0, 1.0, (1, 64, height, width)).astype(np.float32)
+            weight_case = rng.uniform(-0.25, 0.25, (64, 64, 3, 3)).astype(np.float32)
+            bias_case = rng.uniform(-0.1, 0.1, (64,)).astype(np.float32)
+            input_dev = cuda.to_device(input_case)
+            weight_dev = cuda.to_device(weight_case)
+            bias_dev = cuda.to_device(bias_case)
+            output_dev = cuda.allocate(input_case.nbytes)
+            try:
+                for variant in variants:
+                    def launch():
+                        cuda.convolution(
+                            input_dev, weight_dev, bias_dev, output_dev,
+                            1, 64, height, width, 64, 3, 3, height, width,
+                            1, 1, 1, 1, 1, 1, 1,
+                            specialized_3x3_plane=variant == "plane",
+                            specialized_3x3_plane_2block=variant == "plane_2block",
+                            specialized_3x3_plane_256=variant == "plane_256",
+                        )
+
+                    for _ in range(3):
+                        launch()
+                    started = time.perf_counter()
+                    for _ in range(repetitions):
+                        launch()
+                    elapsed_ms = (time.perf_counter() - started) * 1000.0 / repetitions
+                    macs = 64 * height * width * 64 * 9
+                    gmacs = macs / (elapsed_ms / 1000.0) / 1e9
+                    print(
+                        f"Benchmark {variant} [1,64,{height},{width}]: "
+                        f"avg_kernel_ms={elapsed_ms:.3f} GMAC/s={gmacs:.3f} "
+                        f"repetitions={repetitions}"
+                    )
+            finally:
+                for pointer in (input_dev, weight_dev, bias_dev, output_dev):
+                    cuda.free(pointer)
+
+        for height, width in ((20, 20), (40, 40), (80, 80)):
+            benchmark_specialized_variants(height, width, ("plane", "plane_2block", "plane_256"))
 
 
         legacy_results = {}

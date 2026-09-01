@@ -107,11 +107,7 @@ class CudaBackend(Backend):
         }
 
     def synchronize(self):
-        check_cuda(
-            self.execution.driver,
-            self.execution.driver.cuCtxSynchronize(),
-            "cuCtxSynchronize",
-        )
+        self.execution.synchronize()
 
     def matmul(self, left, right):
         """Execute 2D matrix multiplication through the existing CUDA kernel."""
@@ -175,6 +171,7 @@ class CudaBackend(Backend):
             return entry[2], False
 
         if entry is not None:
+            self.execution.synchronize()
             self.execution.free(entry[2])
             profiling.parameter_cache_adjust("retained_allocations", -1)
             profiling.parameter_cache_adjust("retained_bytes", -entry[3])
@@ -1123,6 +1120,7 @@ class CudaBackend(Backend):
             raise
 
     def close(self) -> None:
+        self.execution.synchronize("shutdown")
         for _, (_, _, pointer, _) in list(self._parameter_cache.items()):
             self.execution.free(pointer)
         self._parameter_cache.clear()

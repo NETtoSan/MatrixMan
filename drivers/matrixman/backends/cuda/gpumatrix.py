@@ -25,6 +25,7 @@ CUdeviceptr = ctypes.c_uint64
 CUcontext = ctypes.c_void_p
 CUmodule = ctypes.c_void_p
 CUfunction = ctypes.c_void_p
+CUfunction_attribute = ctypes.c_int
 
 CUDA_SUCCESS = 0
 CU_JIT_INFO_LOG_BUFFER = 3
@@ -50,6 +51,10 @@ def _specialized_conv_disabled() -> bool:
     return os.environ.get("MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV", "").strip().lower() not in {
         "", "0", "false", "no", "off"
     }
+
+
+def _async_queue_disabled() -> bool:
+    return _truthy_environment("MATRIXMAN_CUDA_DISABLE_ASYNC_QUEUE")
 
 
 PTX = r"""
@@ -4192,6 +4197,75 @@ UPSAMPLE_DONE:
 """.encode("ascii")
 
 
+def _append_two_block_plane_kernel(ptx: bytes) -> bytes:
+    """Add the diagnostic-only two-block c64 plane variant."""
+    source = ptx.decode("ascii")
+    entry = ".visible .entry conv2d_3x3_s1_p1_c64_plane("
+    start = source.index(entry)
+    end = source.index("\n}\n", start) + 3
+    kernel = source[start:end]
+    kernel = kernel.replace(
+        "conv2d_3x3_s1_p1_c64_plane",
+        "conv2d_3x3_s1_p1_c64_plane_2block",
+    )
+    kernel = kernel.replace("PLANE2_", "PLANE2BLOCK_")
+    kernel = kernel.replace(
+        """    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;""",
+        """    // Two blocks share one output-channel plane.
+    mov.u32 %r23, 2;
+    div.u32 %r22, %r17, %r23;
+    rem.u32 %r47, %r17, %r23;
+    div.u32 %r20, %r22, %r5;
+    rem.u32 %r21, %r22, %r5;""",
+    )
+    kernel = kernel.replace(
+        """    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;""",
+        """    mul.lo.u32 %r22, %r8, %r9;
+    add.u32 %r45, %r22, 1;
+    mov.u32 %r46, 2;
+    div.u32 %r45, %r45, %r46;
+    setp.eq.u32 %p0, %r47, 0;
+    selp.u32 %r46, %r45, %r22, %p0;
+    mov.u32 %r23, %r19;
+    mul.lo.u32 %r45, %r45, %r47;
+    add.u32 %r23, %r23, %r45;""",
+    )
+    kernel = kernel.replace(
+        "setp.lt.u32 %p2, %r24, %r22;",
+        "setp.lt.u32 %p2, %r24, %r46;",
+    )
+    return ptx + kernel.encode("ascii")
+
+
+PTX = _append_two_block_plane_kernel(PTX)
+
+
+def _append_256_thread_plane_kernel(ptx: bytes) -> bytes:
+    """Add the diagnostic-only 256-thread c64 plane variant."""
+    source = ptx.decode("ascii")
+    entry = ".visible .entry conv2d_3x3_s1_p1_c64_plane("
+    start = source.index(entry)
+    end = source.index("\n}\n", start) + 3
+    kernel = source[start:end]
+    kernel = kernel.replace(
+        "conv2d_3x3_s1_p1_c64_plane",
+        "conv2d_3x3_s1_p1_c64_plane_256",
+    )
+    kernel = kernel.replace("PLANE2_", "PLANE256_")
+    kernel = kernel.replace(
+        "    add.u32 %r23, %r23, 256;\n    bra PLANE256_SPATIAL;",
+        "    add.u32 %r23, %r23, %r18;\n"
+        "    add.u32 %r23, %r23, %r18;\n"
+        "    bra PLANE256_SPATIAL;",
+    )
+    return ptx + kernel.encode("ascii")
+
+
+PTX = _append_256_thread_plane_kernel(PTX)
+
+
 def load_driver() -> ctypes.CDLL:
     path = ctypes.util.find_library("cuda") or "libcuda.so.1"
     try:
@@ -4236,6 +4310,12 @@ def configure_driver(driver: ctypes.CDLL) -> None:
     driver.cuModuleUnload.restype = CUresult
     driver.cuModuleGetFunction.argtypes = [ctypes.POINTER(CUfunction), CUmodule, ctypes.c_char_p]
     driver.cuModuleGetFunction.restype = CUresult
+    driver.cuFuncGetAttribute.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        CUfunction_attribute,
+        CUfunction,
+    ]
+    driver.cuFuncGetAttribute.restype = CUresult
     driver.cuLaunchKernel.argtypes = [
         CUfunction, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
         ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
@@ -4297,7 +4377,10 @@ class CudaExecutionBackend:
         if device_index != 0:
             raise ValueError("only CUDA device 0 is currently supported")
         self._pool_enabled = not _truthy_environment("MATRIXMAN_CUDA_DISABLE_ALLOC_POOL")
+        self._async_queue_enabled = not _async_queue_disabled()
+        profiling.set_async_mode(self._async_queue_enabled)
         self._free_blocks: dict[int, list[CUdeviceptr]] = {}
+        self._pending_releases: list[CUdeviceptr] = []
         self._allocation_records: dict[int, tuple[int, str, str]] = {}
         self.driver = load_driver()
         configure_driver(self.driver)
@@ -4335,6 +4418,8 @@ class CudaExecutionBackend:
                 "conv2d_3x3_s1_p1_small_c10, conv2d_3x3_s1_p1_small_c12, "
                 "conv2d_3x3_s1_p1_small_c24, "
                 "conv2d_3x3_s1_p1_c64_spatial, "
+                "conv2d_3x3_s1_p1_c64_plane_2block, "
+                "conv2d_3x3_s1_p1_c64_plane_256, "
                 "conv2d_1x1_s1_c64, conv2d_1x1_s1_cin16, conv2d_1x1_s1_cin24, conv2d_1x1_s1_cin36, conv2d_1x1_s1_cin48, conv2d_1x1_s1_cin72, batch_norm_inference, silu, "
                 "split_copy, cat_copy, upsample_nearest2d"
             )
@@ -4388,6 +4473,8 @@ class CudaExecutionBackend:
             self.convolution_c24_c64_plane_function = CUfunction()
             self.convolution_c48_c64_plane_function = CUfunction()
             self.convolution_spatial_function = CUfunction()
+            self.convolution_plane_2block_function = CUfunction()
+            self.convolution_plane_256_function = CUfunction()
             self.convolution_1x1_function = CUfunction()
             self.convolution_1x1_cin16_function = CUfunction()
             self.convolution_1x1_cin24_function = CUfunction()
@@ -4421,6 +4508,8 @@ class CudaExecutionBackend:
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_c24_c64_plane_function), self.module, b"conv2d_3x3_s1_p1_c24_c64_plane"), "get conv2d_3x3_s1_p1_c24_c64_plane")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_c48_c64_plane_function), self.module, b"conv2d_3x3_s1_p1_c48_c64_plane"), "get conv2d_3x3_s1_p1_c48_c64_plane")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_spatial_function), self.module, b"conv2d_3x3_s1_p1_c64_spatial"), "get conv2d_3x3_s1_p1_c64_spatial")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_plane_2block_function), self.module, b"conv2d_3x3_s1_p1_c64_plane_2block"), "get conv2d_3x3_s1_p1_c64_plane_2block")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_plane_256_function), self.module, b"conv2d_3x3_s1_p1_c64_plane_256"), "get conv2d_3x3_s1_p1_c64_plane_256")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_function), self.module, b"conv2d_1x1_s1_c64"), "get conv2d_1x1_s1_c64")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin16_function), self.module, b"conv2d_1x1_s1_cin16"), "get conv2d_1x1_s1_cin16")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin24_function), self.module, b"conv2d_1x1_s1_cin24"), "get conv2d_1x1_s1_cin24")
@@ -4455,6 +4544,8 @@ class CudaExecutionBackend:
                 id(self.convolution_c24_c64_plane_function): "Conv2D",
                 id(self.convolution_c48_c64_plane_function): "Conv2D",
                 id(self.convolution_spatial_function): "Conv2D",
+                id(self.convolution_plane_2block_function): "Conv2D",
+                id(self.convolution_plane_256_function): "Conv2D",
                 id(self.convolution_1x1_function): "Conv2D",
                 id(self.convolution_1x1_cin16_function): "Conv2D",
                 id(self.convolution_1x1_cin24_function): "Conv2D",
@@ -4474,6 +4565,7 @@ class CudaExecutionBackend:
     def close(self) -> None:
         if self.closed:
             return
+        self._synchronize_and_reclaim("shutdown")
         self._drain_pool()
         if self.module:
             check(self.driver, self.driver.cuModuleUnload(self.module), "cuModuleUnload")
@@ -4488,6 +4580,28 @@ class CudaExecutionBackend:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+    def function_attributes(self, function: CUfunction) -> dict[str, int]:
+        """Read compiled CUDA function resource attributes for diagnostics."""
+        attributes = {
+            "max_threads_per_block": 0,
+            "shared_size_bytes": 1,
+            "num_regs": 4,
+        }
+        result = {}
+        for name, attribute in attributes.items():
+            value = ctypes.c_int()
+            check(
+                self.driver,
+                self.driver.cuFuncGetAttribute(
+                    ctypes.byref(value),
+                    CUfunction_attribute(attribute),
+                    function,
+                ),
+                f"cuFuncGetAttribute({name})",
+            )
+            result[name] = int(value.value)
+        return result
 
     def _drain_pool(self) -> None:
         """Release cached temporary blocks while the CUDA context is alive."""
@@ -4508,11 +4622,61 @@ class CudaExecutionBackend:
                     pointer.value = 0
         self._free_blocks.clear()
 
+    def _drain_pending_releases(self) -> tuple[int, int]:
+        """Reclaim released temporary storage after completed default-stream work."""
+        pending = self._pending_releases
+        self._pending_releases = []
+        reclaimed_blocks = 0
+        reclaimed_bytes = 0
+        for pointer in pending:
+            address = int(pointer.value)
+            record = self._allocation_records.get(address)
+            if record is None or record[2] != "pending":
+                continue
+            nbytes, category, _state = record
+            reclaimed_blocks += 1
+            reclaimed_bytes += nbytes
+            to_pool = self._pool_enabled and category != "parameter"
+            if to_pool:
+                self._allocation_records[address] = (nbytes, category, "cached")
+                self._free_blocks.setdefault(nbytes, []).append(pointer)
+                profiling.allocation_pending_reclaimed(pointer, nbytes, True)
+            else:
+                started = profiling.start()
+                try:
+                    check(self.driver, self.driver.cuMemFree_v2(pointer), "cuMemFree")
+                    profiling.allocation_pending_reclaimed(pointer, nbytes, False)
+                    profiling.allocation_driver_freed()
+                finally:
+                    profiling.observe("Free", started)
+                    self._allocation_records.pop(address, None)
+                    pointer.value = 0
+        return reclaimed_blocks, reclaimed_bytes
+
+    def _synchronize_and_reclaim(self, reason: str = "other") -> None:
+        """Synchronize the default stream, then make released storage reusable."""
+        if self.closed or not self.context or not self.context.value:
+            return
+        started = profiling.start()
+        check(
+            self.driver,
+            self.driver.cuCtxSynchronize(),
+            "cuCtxSynchronize",
+        )
+        profiling.synchronization_boundary()
+        reclaimed_blocks, reclaimed_bytes = self._drain_pending_releases()
+        profiling.record_synchronization(
+            reason, profiling.observe("Synchronization", started),
+            reclaimed_blocks, reclaimed_bytes,
+        )
+
     def _allocate_driver(self, nbytes: int) -> CUdeviceptr:
         pointer = CUdeviceptr()
         result = self.driver.cuMemAlloc_v2(ctypes.byref(pointer), nbytes)
-        if result != CUDA_SUCCESS and self._pool_enabled and self._free_blocks:
-            self._drain_pool()
+        if result != CUDA_SUCCESS:
+            self._synchronize_and_reclaim("oom_recovery")
+            if self._pool_enabled and self._free_blocks:
+                self._drain_pool()
             pointer = CUdeviceptr()
             result = self.driver.cuMemAlloc_v2(ctypes.byref(pointer), nbytes)
         check(self.driver, result, "cuMemAlloc")
@@ -4556,13 +4720,24 @@ class CudaExecutionBackend:
             ):
                 nbytes, category, _state = record
                 cached_pointer = CUdeviceptr(address)
-                self._allocation_records[address] = (nbytes, category, "cached")
-                self._free_blocks.setdefault(nbytes, []).append(cached_pointer)
-                profiling.allocation_pool_returned(pointer)
+                self._allocation_records[address] = (nbytes, category, "pending")
+                self._pending_releases.append(cached_pointer)
+                profiling.allocation_pending(pointer)
+                pointer.value = 0
+                return
+            if record is not None and record[1] != "parameter" and record[2] == "live":
+                nbytes, category, _state = record
+                self._allocation_records[address] = (nbytes, category, "pending")
+                self._pending_releases.append(CUdeviceptr(address))
+                profiling.allocation_pending(pointer)
                 pointer.value = 0
                 return
             if record is not None and record[2] == "cached":
                 raise RuntimeError("CUDA temporary allocation was returned to the pool twice")
+            if record is not None and record[2] == "pending":
+                raise RuntimeError("CUDA temporary allocation was released twice")
+            if record is not None and record[1] == "parameter" and self._async_queue_enabled:
+                self._synchronize_and_reclaim("parameter_replacement")
             started = profiling.start()
             try:
                 check(self.driver, self.driver.cuMemFree_v2(pointer), "cuMemFree")
@@ -4594,7 +4769,14 @@ class CudaExecutionBackend:
             raise
         return pointer
 
+    def synchronize(self, reason: str = "explicit_backend_synchronize") -> None:
+        self._synchronize_and_reclaim(reason)
+
     def from_device(self, pointer: CUdeviceptr, shape: tuple[int, ...]) -> np.ndarray:
+        # The synchronous DtoH copy is a readback boundary.  Synchronize first
+        # so released temporaries become reusable only after all queued work
+        # preceding this readback has completed.
+        self._synchronize_and_reclaim("readback")
         output = np.empty(shape, dtype=np.float32)
         started = profiling.start()
         try:
@@ -4610,6 +4792,7 @@ class CudaExecutionBackend:
         work_items: int,
         profile_signature: tuple[int, ...] | None = None,
         profile_variant: str = "generic",
+        block_size: int = CUDA_BLOCK_SIZE,
     ) -> None:
         if work_items <= 0:
             raise ValueError("kernel work size must be positive")
@@ -4618,9 +4801,12 @@ class CudaExecutionBackend:
             params = (ctypes.c_void_p * len(args))(
                 *(ctypes.cast(ctypes.byref(arg), ctypes.c_void_p) for arg in args)
             )
-            grid = (work_items + CUDA_BLOCK_SIZE - 1) // CUDA_BLOCK_SIZE
-            check(self.driver, self.driver.cuLaunchKernel(function, grid, 1, 1, CUDA_BLOCK_SIZE, 1, 1, 0, None, params, None), "cuLaunchKernel")
-            check(self.driver, self.driver.cuCtxSynchronize(), "cuCtxSynchronize")
+            grid = (work_items + block_size - 1) // block_size
+            launch_started = profiling.launch_started()
+            check(self.driver, self.driver.cuLaunchKernel(function, grid, 1, 1, block_size, 1, 1, 0, None, params, None), "cuLaunchKernel")
+            if not self._async_queue_enabled:
+                self._synchronize_and_reclaim("synchronous_launch")
+                profiling.launch_synchronized(launch_started)
         finally:
             label = getattr(self, "_function_labels", {}).get(id(function), "CUDA kernel")
             elapsed = profiling.observe(label, started)
@@ -4897,12 +5083,14 @@ class CudaExecutionBackend:
         specialized_3x3_c24_c64_plane: bool = False,
         specialized_3x3_c48_c64_plane: bool = False,
         specialized_3x3_plane_legacy: bool = False,
+        specialized_3x3_plane_2block: bool = False,
+        specialized_3x3_plane_256: bool = False,
     ) -> None:
         # ``specialized=True`` remains a compatibility alias for the original
         # plane kernel; new callers use the explicit legacy name.
         specialized_3x3_plane_legacy = specialized_3x3_plane_legacy or specialized
         specialized = False
-        if (specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_1x1_cin72 or specialized_3x3_spatial or specialized_3x3_plane or specialized_3x3_c8_c64_plane or specialized_3x3_small_c8 or specialized_3x3_small_c10 or specialized_3x3_small_c12 or specialized_3x3_small_c24 or specialized_3x3_c24_c64_plane or specialized_3x3_c48_c64_plane) and _specialized_conv_disabled():
+        if (specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_1x1_cin72 or specialized_3x3_spatial or specialized_3x3_plane or specialized_3x3_plane_2block or specialized_3x3_plane_256 or specialized_3x3_c8_c64_plane or specialized_3x3_small_c8 or specialized_3x3_small_c10 or specialized_3x3_small_c12 or specialized_3x3_small_c24 or specialized_3x3_c24_c64_plane or specialized_3x3_c48_c64_plane) and _specialized_conv_disabled():
             specialized = False
             specialized_1x1 = False
             specialized_1x1_cin16 = False
@@ -4912,6 +5100,8 @@ class CudaExecutionBackend:
             specialized_1x1_cin72 = False
             specialized_3x3_spatial = False
             specialized_3x3_plane = False
+            specialized_3x3_plane_2block = False
+            specialized_3x3_plane_256 = False
             specialized_3x3_c8_c64_plane = False
             specialized_3x3_small_c8 = False
             specialized_3x3_small_c10 = False
@@ -4990,6 +5180,20 @@ class CudaExecutionBackend:
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         ):
             raise ValueError("invalid plane specialized 3x3 Conv2D configuration")
+        if specialized_3x3_plane_2block and not (
+            n == 1 and c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid two-block plane specialized 3x3 Conv2D configuration")
+        if specialized_3x3_plane_256 and not (
+            n == 1 and c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid 256-thread plane specialized 3x3 Conv2D configuration")
         if specialized_3x3_c8_c64_plane and not (
             n == 1 and c == 8 and k == 64 and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
@@ -5028,7 +5232,7 @@ class CudaExecutionBackend:
                 and dilation_h == 1 and dilation_w == 1 and groups == 1
             ):
                 raise ValueError("invalid small-channel specialized 3x3 Conv2D configuration")
-        if sum(bool(value) for value in (specialized_3x3_plane_legacy, specialized_1x1, specialized_1x1_cin16, specialized_1x1_cin24, specialized_1x1_cin36, specialized_1x1_cin48, specialized_1x1_cin72, specialized_3x3_spatial, specialized_3x3_plane, specialized_3x3_c8_c64_plane, specialized_3x3_small_c8, specialized_3x3_small_c10, specialized_3x3_small_c12, specialized_3x3_small_c24, specialized_3x3_c24_c64_plane, specialized_3x3_c48_c64_plane)) > 1:
+        if sum(bool(value) for value in (specialized_3x3_plane_legacy, specialized_1x1, specialized_1x1_cin16, specialized_1x1_cin24, specialized_1x1_cin36, specialized_1x1_cin48, specialized_1x1_cin72, specialized_3x3_spatial, specialized_3x3_plane, specialized_3x3_plane_2block, specialized_3x3_plane_256, specialized_3x3_c8_c64_plane, specialized_3x3_small_c8, specialized_3x3_small_c10, specialized_3x3_small_c12, specialized_3x3_small_c24, specialized_3x3_c24_c64_plane, specialized_3x3_c48_c64_plane)) > 1:
             raise ValueError("multiple specialized Conv2D paths requested")
         profile_signature = (
             (
@@ -5051,8 +5255,8 @@ class CudaExecutionBackend:
                 f"total_outputs={total_outputs}"
             )
         fast_path = (
-            specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_1x1_cin72 or specialized_3x3_spatial
-            or specialized_3x3_plane or specialized_3x3_c8_c64_plane
+            specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_1x1_cin72 or specialized_3x3_spatial or specialized_3x3_plane_2block
+            or specialized_3x3_plane_256 or specialized_3x3_plane or specialized_3x3_c8_c64_plane
             or specialized_3x3_small_c8
             or specialized_3x3_small_c10 or specialized_3x3_small_c12
             or specialized_3x3_small_c24
@@ -5073,6 +5277,10 @@ class CudaExecutionBackend:
             if specialized_1x1_cin48
             else self.convolution_1x1_cin72_function
             if specialized_1x1_cin72
+            else self.convolution_plane_2block_function
+            if specialized_3x3_plane_2block
+            else self.convolution_plane_256_function
+            if specialized_3x3_plane_256
             else self.convolution_plane_function
             if specialized_3x3_plane
             else self.convolution_c8_c64_plane_function
@@ -5111,6 +5319,10 @@ class CudaExecutionBackend:
                 n * k * ((out_h * out_w + CUDA_BLOCK_SIZE - 1) // CUDA_BLOCK_SIZE)
                 * CUDA_BLOCK_SIZE
                 if specialized_3x3_spatial
+                else n * k * 2 * CUDA_BLOCK_SIZE
+                if specialized_3x3_plane_2block
+                else n * k * 2 * CUDA_BLOCK_SIZE
+                if specialized_3x3_plane_256
                 else n * k * CUDA_BLOCK_SIZE
                 if fast_path
                 else total_outputs
@@ -5124,6 +5336,8 @@ class CudaExecutionBackend:
                 else "specialized-1x1-cin36" if specialized_1x1_cin36
                 else "specialized-1x1-cin48" if specialized_1x1_cin48
                 else "specialized-1x1-cin72" if specialized_1x1_cin72
+                else "specialized-3x3-plane-2block" if specialized_3x3_plane_2block
+                else "specialized-3x3-plane-256" if specialized_3x3_plane_256
                 else "specialized-3x3-spatial" if specialized_3x3_spatial
                 else "specialized-3x3-plane" if specialized_3x3_plane
                 else "specialized-3x3-c8-c64-plane" if specialized_3x3_c8_c64_plane
@@ -5135,6 +5349,7 @@ class CudaExecutionBackend:
                 else "specialized-3x3-c48-c64-plane" if specialized_3x3_c48_c64_plane
                 else "generic"
             ),
+            block_size=256 if specialized_3x3_plane_256 else CUDA_BLOCK_SIZE,
         )
 
     def batch_norm(
