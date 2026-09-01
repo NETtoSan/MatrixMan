@@ -246,6 +246,38 @@ class CudaBackend(Backend):
             and pad_h == 0 and pad_w == 0
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         )
+        specialized_1x1_cin16 = (
+            not disable_specialized and
+            input_tensor.is_contiguous()
+            and n == 1 and c == 16 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_1x1_cin24 = (
+            not disable_specialized and
+            input_tensor.is_contiguous()
+            and n == 1 and c == 24 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_1x1_cin36 = (
+            not disable_specialized and
+            input_tensor.is_contiguous()
+            and n == 1 and c == 36 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_1x1_cin48 = (
+            not disable_specialized and
+            input_tensor.is_contiguous()
+            and n == 1 and c == 48 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
         specialized_3x3_spatial = (
             not disable_specialized and
             conv3x3_variant == "spatial" and
@@ -337,6 +369,10 @@ class CudaBackend(Backend):
                 stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
                 specialized=specialized_3x3_plane_legacy,
                 specialized_1x1=specialized_1x1,
+                specialized_1x1_cin16=specialized_1x1_cin16,
+                specialized_1x1_cin24=specialized_1x1_cin24,
+                specialized_1x1_cin36=specialized_1x1_cin36,
+                specialized_1x1_cin48=specialized_1x1_cin48,
                 specialized_3x3_spatial=specialized_3x3_spatial,
                 specialized_3x3_plane=specialized_3x3_plane,
                 specialized_3x3_c8_c64_plane=specialized_3x3_c8_c64_plane,
