@@ -20,6 +20,7 @@ def _operator_name(func) -> str:
         torch.ops.aten.native_batch_norm.default: "BatchNorm",
         torch.ops.aten.silu_.default: "SiLU",
         torch.ops.aten.add.Tensor: "Add",
+        torch.ops.aten.mm.default: "MatMul",
         torch.ops.aten.sub.Tensor: "Sub",
         torch.ops.aten.div.Tensor: "Div",
         torch.ops.aten.div.Scalar: "Div",
@@ -162,6 +163,15 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             if len(args) < 2:
                 raise RuntimeError("MatrixMan/CUDA: malformed mul arguments")
             owner = backend.mul(args[0], args[1])
+            return type(args[0])._from_owner(
+                owner,
+                owner.shape,
+                logical_strides=owner.strides,
+            )
+        if func is torch.ops.aten.mm.default:
+            if len(args) < 2:
+                raise RuntimeError("MatrixMan/CUDA: malformed mm arguments")
+            owner = backend.matmul(args[0], args[1])
             return type(args[0])._from_owner(
                 owner,
                 owner.shape,

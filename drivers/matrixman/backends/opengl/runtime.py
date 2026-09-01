@@ -25,6 +25,7 @@ class _GlRuntime:
     packed_strided_add_programs: dict[tuple, int]
     packed_scalar_div_programs: dict[tuple, int]
     packed_broadcast_mul_programs: dict[tuple, int]
+    packed_matmul_programs: dict[tuple, int]
     packed_sigmoid_programs: dict[tuple, int]
     scalar_add_programs: dict[tuple, int]
     stack_programs: dict[tuple, int]
@@ -51,6 +52,7 @@ class _GlRuntime:
     packed_strided_add_uniforms: dict[tuple, tuple[int, int]]
     packed_scalar_div_uniforms: dict[tuple, int]
     packed_broadcast_mul_uniforms: dict[tuple, tuple[int, int]]
+    packed_matmul_uniforms: dict[tuple, tuple[int, int]]
     packed_sigmoid_uniforms: dict[tuple, int]
     scalar_add_uniforms: dict[tuple, int]
     stack_uniforms: dict[tuple, tuple[int, ...]]
@@ -105,6 +107,7 @@ def init() -> None:
         tile_copy_programs={}, batchnorm_programs={}, silu_programs={},
         packed_add_programs={}, packed_sub_programs={}, packed_strided_add_programs={},
         packed_scalar_div_programs={}, packed_broadcast_mul_programs={},
+        packed_matmul_programs={},
         packed_sigmoid_programs={}, scalar_add_programs={}, stack_programs={},
         fill_programs={}, cat_programs={}, cat_dim0_2d_programs={},
         cat_lastdim_programs={}, cat_dim1_3d_programs={}, maxpool_programs={},
@@ -113,6 +116,7 @@ def init() -> None:
         tile_copy_uniforms={}, batchnorm_uniforms={}, silu_uniforms={},
         packed_add_uniforms={}, packed_sub_uniforms={}, packed_strided_add_uniforms={},
         packed_scalar_div_uniforms={}, packed_broadcast_mul_uniforms={},
+        packed_matmul_uniforms={},
         packed_sigmoid_uniforms={}, scalar_add_uniforms={}, stack_uniforms={},
         fill_uniforms={}, cat_uniforms={}, cat_dim0_2d_uniforms={},
         cat_lastdim_uniforms={}, cat_dim1_3d_uniforms={}, maxpool_uniforms={},

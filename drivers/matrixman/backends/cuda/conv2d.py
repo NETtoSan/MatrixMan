@@ -112,7 +112,7 @@ def run_diagnostic() -> int:
             for pointer in (input_pointer, weight_pointer, output_pointer):
                 cuda.free(pointer)
 
-        def run_specialized_case(height, width):
+        def run_specialized_case(height, width, spatial=False):
             rng = np.random.RandomState(height * 100 + width)
             input_case = rng.uniform(-1.0, 1.0, (1, 64, height, width)).astype(np.float32)
             weight_case = rng.uniform(-0.25, 0.25, (64, 64, 3, 3)).astype(np.float32)
@@ -133,7 +133,8 @@ def run_diagnostic() -> int:
                     input_dev, weight_dev, bias_dev, output_dev,
                     1, 64, height, width, 64, 3, 3, height, width,
                     1, 1, 1, 1, 1, 1, 1,
-                    specialized=True,
+                    specialized=not spatial,
+                    specialized_3x3_spatial=spatial,
                 )
                 actual_case = cuda.from_device(output_dev, expected_case.shape)
             finally:
@@ -142,7 +143,8 @@ def run_diagnostic() -> int:
             error = np.abs(actual_case - expected_case)
             matches = np.allclose(actual_case, expected_case, rtol=5e-4, atol=5e-4)
             print(
-                f"Specialized 3x3 Conv2D [1,64,{height},{width}] -> "
+                f"Specialized 3x3 {'spatial' if spatial else 'plane'} Conv2D "
+                f"[1,64,{height},{width}] -> "
                 f"[1,64,{height},{width}]: max_abs_diff={error.max():.6g} "
                 f"mean_abs_diff={error.mean():.6g} matches CPU reference: {matches}"
             )
@@ -159,10 +161,96 @@ def run_diagnostic() -> int:
                         f"{'PASS' if channel_ok else 'FAIL'}"
                     )
                 print("  corner samples:", actual_case[0, :2, :2, :2])
+            return actual_case
 
+        plane_results = {}
         for height, width in ((4, 4), (40, 40), (80, 80)):
             print(f"testing specialized [1,64,{height},{width}]...", flush=True)
-            run_specialized_case(height, width)
+            plane_results[(height, width)] = run_specialized_case(height, width)
+
+        spatial_results = {}
+        for height, width in ((4, 4), (20, 20), (40, 40), (80, 80)):
+            print(f"testing specialized spatial [1,64,{height},{width}]...", flush=True)
+            spatial_results[(height, width)] = run_specialized_case(height, width, spatial=True)
+        for key in sorted(set(plane_results) & set(spatial_results)):
+            difference = np.abs(plane_results[key] - spatial_results[key])
+            print(
+                f"Specialized plane/spatial comparison {key[0]}x{key[1]}: "
+                f"max_abs_diff={difference.max():.6g} "
+                f"mean_abs_diff={difference.mean():.6g}"
+            )
+
+        def run_specialized_1x1_case(height, width):
+            rng = np.random.RandomState(7000 + height * 100 + width)
+            input_case = rng.uniform(-1.0, 1.0, (1, 64, height, width)).astype(np.float32)
+            weight_case = rng.uniform(-0.25, 0.25, (64, 64, 1, 1)).astype(np.float32)
+            bias_case = rng.uniform(-0.1, 0.1, (64,)).astype(np.float32)
+            expected_case = F.conv2d(
+                torch.from_numpy(input_case),
+                torch.from_numpy(weight_case),
+                torch.from_numpy(bias_case),
+            ).numpy()
+            input_dev = cuda.to_device(input_case)
+            weight_dev = cuda.to_device(weight_case)
+            bias_dev = cuda.to_device(bias_case)
+            output_dev = cuda.allocate(expected_case.nbytes)
+            try:
+                cuda.convolution(
+                    input_dev, weight_dev, bias_dev, output_dev,
+                    1, 64, height, width, 64, 1, 1, height, width,
+                    1, 1, 0, 0, 1, 1, 1,
+                    specialized_1x1=True,
+                )
+                actual_case = cuda.from_device(output_dev, expected_case.shape)
+            finally:
+                for pointer in (input_dev, weight_dev, bias_dev, output_dev):
+                    cuda.free(pointer)
+            error = np.abs(actual_case - expected_case)
+            matches = np.allclose(actual_case, expected_case, rtol=5e-4, atol=5e-4)
+            print(
+                f"Specialized 1x1 c64 Conv2D [1,64,{height},{width}] -> "
+                f"[1,64,{height},{width}]: max_abs_diff={error.max():.6g} "
+                f"mean_abs_diff={error.mean():.6g} matches CPU reference: {matches}"
+            )
+            if not matches:
+                raise AssertionError("specialized 1x1 Conv2D does not match CPU reference")
+
+        for height, width in ((80, 80), (40, 40), (20, 20)):
+            print(f"testing specialized 1x1 c64 [1,64,{height},{width}]...", flush=True)
+            run_specialized_1x1_case(height, width)
+
+        # Nearby 1x1 shapes must continue to use the generic kernel.
+        input_case = np.arange(1, 1 + 32 * 4 * 4, dtype=np.float32).reshape(1, 32, 4, 4) / 100
+        weight_case = np.arange(1, 1 + 64 * 32, dtype=np.float32).reshape(64, 32, 1, 1) / 100
+        bias_case = np.arange(64, dtype=np.float32) / 100
+        expected_case = F.conv2d(
+            torch.from_numpy(input_case),
+            torch.from_numpy(weight_case),
+            torch.from_numpy(bias_case),
+        ).numpy()
+        print("testing generic 1x1 fallback [1,32,4,4] -> [1,64,4,4]...", flush=True)
+        input_dev = cuda.to_device(input_case)
+        weight_dev = cuda.to_device(weight_case)
+        bias_dev = cuda.to_device(bias_case)
+        output_dev = cuda.allocate(expected_case.nbytes)
+        try:
+            cuda.convolution(
+                input_dev, weight_dev, bias_dev, output_dev,
+                1, 32, 4, 4, 64, 1, 1, 4, 4,
+                1, 1, 0, 0, 1, 1, 1,
+            )
+            actual_case = cuda.from_device(output_dev, expected_case.shape)
+        finally:
+            for pointer in (input_dev, weight_dev, bias_dev, output_dev):
+                cuda.free(pointer)
+        error = np.abs(actual_case - expected_case)
+        matches = np.allclose(actual_case, expected_case, rtol=5e-4, atol=5e-4)
+        print(
+            f"Generic fallback max_abs_diff={error.max():.6g} "
+            f"mean_abs_diff={error.mean():.6g} matches CPU reference: {matches}"
+        )
+        if not matches:
+            raise AssertionError("generic 1x1 fallback does not match CPU reference")
     return 0
 
 

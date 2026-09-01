@@ -27,6 +27,11 @@ def main() -> int:
     split_reference, _ = torch.chunk(source_cpu, 2, dim=1)
     check("split-derived", split, split_reference)
 
+    offset_view = matrixman.MatrixManTensor._from_owner(
+        source._owner, (2, 3), storage_offset=6, logical_strides=(3, 1)
+    )
+    check("contiguous nonzero-offset", offset_view, source_cpu.reshape(-1)[6:12].reshape(2, 3))
+
     transposed = source.transpose(2, 3)
     check("transposed", transposed, source_cpu.transpose(2, 3))
 

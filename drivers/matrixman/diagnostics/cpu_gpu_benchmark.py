@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenGL-only fragment-shader matrix multiplication benchmark.
+Backend-neutral MatrixMan versus CPU matrix multiplication benchmark.
 
 This compares the same operation on the same float32 inputs:
 
@@ -9,9 +9,8 @@ This compares the same operation on the same float32 inputs:
 CPU path:
     NumPy A @ B, used as both benchmark and correctness reference.
 
-OpenGL path:
-    CPU matrices -> OpenGL RGBA32F textures -> GLSL 1.20 fragment shader
-    -> framebuffer texture -> optional glReadPixels validation.
+MatrixMan path:
+    CPU matrices -> selected MatrixMan backend -> backend-aware readback.
 
 The GPU operation under test does not fall back to CPU arithmetic.
 """
@@ -19,15 +18,17 @@ The GPU operation under test does not fall back to CPU arithmetic.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import math
 import statistics
 import time
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
+from drivers import matrixman
 from drivers.matrixman.backend import get_backend
+from drivers.matrixman.diagnostics.backend_helpers import readback_tensor
 
 
 gm = None
@@ -35,7 +36,7 @@ gpu_stress = None
 
 
 def _load_opengl_benchmark_modules() -> None:
-    """Load the legacy OpenGL benchmark implementation after backend gating."""
+    """Load the legacy OpenGL stress implementation after backend gating."""
     global gm, gpu_stress
     if gm is not None:
         return
@@ -56,65 +57,8 @@ class BenchResult:
     max_abs_error: float | None = None
     matches: bool | None = None
     error: str | None = None
-
-
-class GpuMatmulBench:
-    """Reusable single-matmul OpenGL GLSL benchmark state for one matrix size."""
-
-    def __init__(self, n: int, a: np.ndarray, b: np.ndarray):
-        self.n = n
-        self.program = gm.make_program(gpu_stress.shader_source(gpu_stress.MUL_SHADER, n))
-        self.left_loc = gm.glGetUniformLocation(self.program, b"left_tex")
-        self.right_loc = gm.glGetUniformLocation(self.program, b"right_tex")
-        self.fbo = ctypes.c_uint()
-        gm.glGenFramebuffers(1, ctypes.byref(self.fbo))
-
-        self.tex_a = gpu_stress.create_texture(n, a)
-        self.tex_b = gpu_stress.create_texture(n, b)
-        self.tex_out = gpu_stress.create_texture(n)
-        self.textures = [self.tex_a, self.tex_b, self.tex_out]
-
-        gm.glViewport(0, 0, n, n)
-        gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, self.fbo.value)
-        gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, self.tex_out, 0)
-        status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
-        if status != gm.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError(f"framebuffer incomplete for {n}x{n}: 0x{status:04x}")
-
-    def upload_inputs(self, a: np.ndarray, b: np.ndarray) -> None:
-        gpu_stress.update_texture(self.tex_a, a)
-        gpu_stress.update_texture(self.tex_b, b)
-
-    def dispatch(self) -> None:
-        gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, self.fbo.value)
-        gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, self.tex_out, 0)
-        gm.glUseProgram(self.program)
-
-        gm.glActiveTexture(gm.GL_TEXTURE0)
-        gm.glBindTexture(gm.GL_TEXTURE_2D, self.tex_a)
-        gm.glUniform1i(self.left_loc, 0)
-
-        gm.glActiveTexture(gm.GL_TEXTURE1)
-        gm.glBindTexture(gm.GL_TEXTURE_2D, self.tex_b)
-        gm.glUniform1i(self.right_loc, 1)
-
-        gm.glBegin(gm.GL_QUADS)
-        gm.glVertex2f(-1.0, -1.0)
-        gm.glVertex2f(1.0, -1.0)
-        gm.glVertex2f(1.0, 1.0)
-        gm.glVertex2f(-1.0, 1.0)
-        gm.glEnd()
-
-    def read_result(self) -> np.ndarray:
-        return gpu_stress.read_texture(self.tex_out, self.fbo, self.n)
-
-    def cleanup(self) -> None:
-        gm.glUseProgram(0)
-        gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, 0)
-        textures = (ctypes.c_uint * len(self.textures))(*self.textures)
-        gm.glDeleteTextures(len(self.textures), textures)
-        gm.glDeleteFramebuffers(1, ctypes.byref(self.fbo))
-        gm.glDeleteProgram(self.program)
+    phases: dict[str, float] | None = None
+    phase_calls: dict[str, int] | None = None
 
 
 def make_benchmark_inputs(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -150,47 +94,124 @@ def benchmark_cpu(a: np.ndarray, b: np.ndarray, min_seconds: float) -> tuple[np.
     return reference, result_from_total("CPU NumPy", n, elapsed, max(count, 1))
 
 
-def benchmark_gpu_compute_only(bench: GpuMatmulBench, n: int, min_seconds: float) -> BenchResult:
-    # Inputs are already uploaded. Measure only draw + shader execution + finish.
-    bench.dispatch()
-    gm.glFinish()
-
-    count = 0
-    started = time.perf_counter()
-    while time.perf_counter() - started < min_seconds:
-        bench.dispatch()
-        gm.glFinish()
-        count += 1
-    elapsed = time.perf_counter() - started
-    return result_from_total("OpenGL shader only", n, elapsed, max(count, 1))
+def _synchronize() -> None:
+    """Complete selected-backend work before wall-clock measurements/readback."""
+    get_backend().synchronize()
 
 
-def benchmark_gpu_with_transfers(
-    bench: GpuMatmulBench,
-    a: np.ndarray,
-    b: np.ndarray,
-    n: int,
-    min_seconds: float,
+def _matrixman_matmul(a_cpu: np.ndarray, b_cpu: np.ndarray):
+    a = matrixman.to_device(torch.from_numpy(a_cpu))
+    b = matrixman.to_device(torch.from_numpy(b_cpu))
+    return a @ b
+
+
+def benchmark_matrixman_compute_only(
+    a_cpu: np.ndarray, b_cpu: np.ndarray, n: int, min_seconds: float
 ) -> BenchResult:
-    # Reuse allocations, but include input upload and output readback every pass.
+    """Measure selected-backend matmul with inputs already resident."""
+    a = matrixman.to_device(torch.from_numpy(a_cpu))
+    b = matrixman.to_device(torch.from_numpy(b_cpu))
+    _synchronize()
+    _ = a @ b
+    _synchronize()
     count = 0
     started = time.perf_counter()
     while time.perf_counter() - started < min_seconds:
-        bench.upload_inputs(a, b)
-        bench.dispatch()
-        gm.glFinish()
-        _ = bench.read_result()
+        _ = a @ b
+        _synchronize()
         count += 1
     elapsed = time.perf_counter() - started
-    return result_from_total("OpenGL incl upload/readback", n, elapsed, max(count, 1))
+    return result_from_total(f"MatrixMan/{get_backend().name} compute only", n, elapsed, max(count, 1))
 
 
-def verify_gpu(bench: GpuMatmulBench, reference: np.ndarray) -> tuple[float, bool]:
-    bench.dispatch()
-    gm.glFinish()
-    result = bench.read_result()
-    max_error = float(np.max(np.abs(result - reference)))
-    matches = bool(np.allclose(result, reference, rtol=5e-4, atol=5e-4))
+def benchmark_matrixman_with_transfers(
+    a_cpu: np.ndarray, b_cpu: np.ndarray, n: int, min_seconds: float
+) -> BenchResult:
+    """Measure uploads, selected-backend matmul, and explicit CPU readback."""
+    count = 0
+    phase_names = ("allocation/setup + HtoD", "matmul dispatch", "backend synchronization", "DtoH readback", "python reference release")
+    phases = {name: 0.0 for name in phase_names}
+    phase_calls = {name: 0 for name in phase_names}
+    cuda_profile = None
+    profile_before = None
+    if get_backend().name == "cuda":
+        from drivers.matrixman.backends.cuda import profiling as cuda_profile_module
+
+        if cuda_profile_module.is_enabled():
+            cuda_profile = cuda_profile_module
+            profile_before = {
+                label: dict(record) for label, record in cuda_profile.records.items()
+            }
+    started = time.perf_counter()
+    while time.perf_counter() - started < min_seconds:
+        phase_start = time.perf_counter()
+        left = matrixman.to_device(torch.from_numpy(a_cpu))
+        right = matrixman.to_device(torch.from_numpy(b_cpu))
+        phases["allocation/setup + HtoD"] += time.perf_counter() - phase_start
+        phase_calls["allocation/setup + HtoD"] += 1
+
+        phase_start = time.perf_counter()
+        result = left @ right
+        phases["matmul dispatch"] += time.perf_counter() - phase_start
+        phase_calls["matmul dispatch"] += 1
+
+        phase_start = time.perf_counter()
+        _synchronize()
+        phases["backend synchronization"] += time.perf_counter() - phase_start
+        phase_calls["backend synchronization"] += 1
+
+        phase_start = time.perf_counter()
+        _ = readback_tensor(result)
+        phases["DtoH readback"] += time.perf_counter() - phase_start
+        phase_calls["DtoH readback"] += 1
+
+        phase_start = time.perf_counter()
+        del result, left, right
+        release_elapsed = time.perf_counter() - phase_start
+        phases["python reference release"] += release_elapsed
+        phase_calls["python reference release"] += 1
+        count += 1
+    elapsed = time.perf_counter() - started
+    if cuda_profile is not None and profile_before is not None:
+        for label in ("Alloc", "HtoD", "Free", "DtoH"):
+            before = profile_before.get(label, {})
+            after = cuda_profile.records.get(label, {})
+            phases[f"CUDA profiler {label}"] = after.get("seconds", 0.0) - before.get("seconds", 0.0)
+            phase_calls[f"CUDA profiler {label}"] = int(after.get("calls", 0) - before.get("calls", 0))
+    return result_from_total(f"MatrixMan/{get_backend().name} incl upload/readback", n, elapsed, max(count, 1), phases=phases, phase_calls=phase_calls)
+
+
+def print_transfer_breakdown(n: int, result: BenchResult) -> None:
+    if not result.phases:
+        return
+    print(f"\nTransfer-phase breakdown ({result.label}, {n}x{n})")
+    print("  phase                                      total ms     avg ms")
+    print("  " + "-" * 62)
+    for name, seconds in result.phases.items():
+        if name.endswith(" calls"):
+            continue
+        calls = (result.phase_calls or {}).get(name, 0)
+        average = seconds / calls if calls else seconds
+        print(f"  {name:<40} {seconds * 1000.0:10.3f} {average * 1000.0:10.3f}")
+    h2d_seconds = result.phases.get("CUDA profiler HtoD")
+    dtoh_seconds = result.phases.get("CUDA profiler DtoH")
+    if h2d_seconds and dtoh_seconds is not None:
+        h2d_calls = (result.phase_calls or {}).get("CUDA profiler HtoD", 0)
+        dtoh_calls = (result.phase_calls or {}).get("CUDA profiler DtoH", 0)
+        h2d_bytes = 2 * n * n * 4 * max(1, h2d_calls // 2)
+        dtoh_bytes = n * n * 4 * max(1, dtoh_calls)
+        print(f"  HtoD bytes={h2d_bytes} bandwidth={h2d_bytes / h2d_seconds / 1048576.0:.2f} MiB/s")
+        print(f"  DtoH bytes={dtoh_bytes} bandwidth={dtoh_bytes / dtoh_seconds / 1048576.0:.2f} MiB/s")
+    else:
+        print("  Exact CUDA copy timing: enable MATRIXMAN_PROFILE=1 for Driver API attribution")
+
+
+def verify_matrixman(a_cpu: np.ndarray, b_cpu: np.ndarray, reference: np.ndarray) -> tuple[float, bool]:
+    result = _matrixman_matmul(a_cpu, b_cpu)
+    _synchronize()
+    result_cpu = readback_tensor(result).numpy()
+    max_error = float(np.max(np.abs(result_cpu - reference)))
+    matches = bool(np.allclose(result_cpu, reference, rtol=5e-4, atol=5e-4))
     return max_error, matches
 
 
@@ -215,14 +236,14 @@ def print_comparison_table(results: list[BenchResult]) -> None:
     print("\nFaster path by size:")
     for n in sorted({r.size for r in results}):
         cpu = next((r for r in results if r.size == n and r.label == "CPU NumPy" and not r.error), None)
-        gpu = next((r for r in results if r.size == n and r.label == "OpenGL shader only" and not r.error), None)
-        gpu_total = next((r for r in results if r.size == n and r.label == "OpenGL incl upload/readback" and not r.error), None)
+        gpu = next((r for r in results if r.size == n and "compute only" in r.label and not r.error), None)
+        gpu_total = next((r for r in results if r.size == n and "incl upload/readback" in r.label and not r.error), None)
         if cpu and gpu:
-            winner = "CPU" if cpu.avg_seconds < gpu.avg_seconds else "OpenGL shader only"
+            winner = "CPU" if cpu.avg_seconds < gpu.avg_seconds else gpu.label
             factor = max(cpu.avg_seconds, gpu.avg_seconds) / min(cpu.avg_seconds, gpu.avg_seconds)
             print(f"  {n}x{n}: {winner} is {factor:.2f}x faster than the other compute-only path")
         if cpu and gpu_total:
-            winner = "CPU" if cpu.avg_seconds < gpu_total.avg_seconds else "OpenGL total"
+            winner = "CPU" if cpu.avg_seconds < gpu_total.avg_seconds else gpu_total.label
             factor = max(cpu.avg_seconds, gpu_total.avg_seconds) / min(cpu.avg_seconds, gpu_total.avg_seconds)
             print(f"  {n}x{n}: {winner} is {factor:.2f}x faster when GPU transfers/readback are included")
 
@@ -232,25 +253,17 @@ def run_size(n: int, seconds_per_bench: float, seed: int) -> list[BenchResult]:
     a, b = make_benchmark_inputs(n, seed)
     reference, cpu = benchmark_cpu(a, b, seconds_per_bench)
 
-    bench = None
     try:
-        bench = GpuMatmulBench(n, a, b)
-        max_error, matches = verify_gpu(bench, reference)
-        gpu_compute = benchmark_gpu_compute_only(bench, n, seconds_per_bench)
-        gpu_total = benchmark_gpu_with_transfers(bench, a, b, n, seconds_per_bench)
+        max_error, matches = verify_matrixman(a, b, reference)
+        gpu_compute = benchmark_matrixman_compute_only(a, b, n, seconds_per_bench)
+        gpu_total = benchmark_matrixman_with_transfers(a, b, n, seconds_per_bench)
         gpu_compute.max_abs_error = max_error
         gpu_compute.matches = matches
         gpu_total.max_abs_error = max_error
         gpu_total.matches = matches
-        gl_error = gm.glGetError()
-        if gl_error:
-            gpu_compute.error = f"OpenGL error after benchmark: 0x{gl_error:04x}"
         return [cpu, gpu_compute, gpu_total]
     except Exception as exc:
-        return [cpu, BenchResult("OpenGL shader only", n, math.nan, math.nan, math.nan, error=str(exc))]
-    finally:
-        if bench is not None:
-            bench.cleanup()
+        return [cpu, BenchResult(f"MatrixMan/{get_backend().name} compute only", n, math.nan, math.nan, math.nan, error=str(exc))]
 
 
 def run_512_stress(seconds: float) -> None:
@@ -347,57 +360,35 @@ def run_512_stress(seconds: float) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CPU vs OpenGL GLSL matmul benchmark (OpenGL only)")
+    parser = argparse.ArgumentParser(
+        description="CPU vs selected MatrixMan backend matrix multiplication benchmark"
+    )
     parser.add_argument("--seconds-per-bench", type=float, default=3.0)
     parser.add_argument("--skip-stress", action="store_true")
     parser.add_argument("--stress-seconds", type=float, default=60.0)
     args = parser.parse_args()
 
     selected = get_backend()
-    if selected.name != "opengl":
-        print("cpu_gpu_benchmark currently implements the OpenGL benchmark only.")
-        print(f"Selected backend: {selected.name.upper()}")
-        print("No benchmark was run.")
-        return 0
+    print(f"Selected backend: {selected.name.upper()}")
+    print("Benchmark core: MatrixMan frontend matmul with explicit backend synchronization")
 
-    _load_opengl_benchmark_modules()
+    results: list[BenchResult] = []
+    for i, n in enumerate([256, 512], start=1):
+        results.extend(run_size(n, args.seconds_per_bench, seed=100 + i))
+    print_comparison_table(results)
+    for result in results:
+        if result.phases:
+            print_transfer_breakdown(result.size, result)
 
-    gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
-    window = None
-    context = None
-    try:
-        gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
-        gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MINOR_VERSION, 1)
-        gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_PROFILE_MASK, gm.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
-        window = gm.sdl.SDL_CreateWindow(
-            b"cpu_gpu_benchmark",
-            0,
-            0,
-            64,
-            64,
-            gm.SDL_WINDOW_OPENGL | gm.SDL_WINDOW_HIDDEN,
-        )
-        gm.sdl_check(bool(window), "SDL_CreateWindow failed")
-        context = gm.sdl.SDL_GL_CreateContext(window)
-        gm.sdl_check(bool(context), "SDL_GL_CreateContext failed")
-
-        gpu_stress.print_capabilities()
-        gpu_stress.print_telemetry_availability()
-
-        results: list[BenchResult] = []
-        for i, n in enumerate([256, 512], start=1):
-            results.extend(run_size(n, args.seconds_per_bench, seed=100 + i))
-        print_comparison_table(results)
-
-        if not args.skip_stress:
+    if not args.skip_stress:
+        if selected.name == "opengl":
+            _load_opengl_benchmark_modules()
+            gpu_stress.print_capabilities()
+            gpu_stress.print_telemetry_availability()
             run_512_stress(args.stress_seconds)
-        return 0
-    finally:
-        if context:
-            gm.sdl.SDL_GL_DeleteContext(context)
-        if window:
-            gm.sdl.SDL_DestroyWindow(window)
-        gm.sdl.SDL_Quit()
+        else:
+            print("Skipping legacy OpenGL stress: it is not a selected-backend benchmark.")
+    return 0
 
 
 if __name__ == "__main__":

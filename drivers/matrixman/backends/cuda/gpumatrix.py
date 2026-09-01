@@ -58,6 +58,7 @@ PTX = r"""
 .address_size 64
 
 .shared .align 4 .b8 conv3x3_weights[2304];
+.shared .align 4 .b8 conv1x1_weights[256];
 
 .visible .entry matrix_add(
     .param .u64 p_a,
@@ -1058,6 +1059,127 @@ CONV_DONE:
     ret;
 }
 
+.visible .entry conv2d_1x1_s1_c64(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<32>;
+    .reg .u64 %rd<9>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_c];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r6, [p_out_h];
+    ld.param.u32 %r7, [p_out_w];
+
+    // Read special registers before using them in arithmetic.  Each block
+    // owns one output-channel plane and its 128 threads cover the plane.
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %ntid.x;
+    mov.u32 %r10, %tid.x;
+    div.u32 %r11, %r8, %r5;
+    mul.lo.u32 %r12, %r11, %r5;
+    sub.u32 %r13, %r8, %r12;
+
+    // Cooperatively stage this output channel's 64 weights.  All threads
+    // converge at the barrier, including threads that do not load a weight.
+    mov.u64 %rd7, conv1x1_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r14, %rd8;
+    setp.ge.u32 %p0, %r10, 64;
+    @%p0 bra ONE_BY_ONE_WEIGHT_BARRIER;
+    mul.lo.u32 %r15, %r13, 64;
+    add.u32 %r15, %r15, %r10;
+    mul.wide.u32 %rd5, %r15, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r16, %r10, 4;
+    add.u32 %r17, %r14, %r16;
+    st.shared.f32 [%r17], %f1;
+ONE_BY_ONE_WEIGHT_BARRIER:
+    bar.sync 0;
+
+    mul.lo.u32 %r18, %r6, %r7;
+    mov.u32 %r19, %r10;
+ONE_BY_ONE_SPATIAL:
+    setp.ge.u32 %p1, %r19, %r18;
+    @%p1 bra ONE_BY_ONE_DONE;
+    div.u32 %r20, %r19, %r7;
+    rem.u32 %r21, %r19, %r7;
+    setp.eq.u64 %p2, %rd3, 0;
+    @%p2 bra ONE_BY_ONE_NO_BIAS;
+    mul.wide.u32 %rd5, %r13, 4;
+    add.u64 %rd6, %rd3, %rd5;
+    ld.global.f32 %f0, [%rd6];
+    bra ONE_BY_ONE_BIAS_DONE;
+ONE_BY_ONE_NO_BIAS:
+    mov.f32 %f0, 0.0;
+ONE_BY_ONE_BIAS_DONE:
+    mov.u32 %r22, 0;
+ONE_BY_ONE_IC:
+    setp.ge.u32 %p3, %r22, 64;
+    @%p3 bra ONE_BY_ONE_STORE;
+    mul.lo.u32 %r23, %r22, 4;
+    add.u32 %r24, %r14, %r23;
+    ld.shared.f32 %f1, [%r24];
+
+    // Contiguous NCHW input: ((n * 64 + ic) * H + y) * W + x.
+    mul.lo.u32 %r25, %r11, 64;
+    add.u32 %r25, %r25, %r22;
+    mul.lo.u32 %r25, %r25, %r3;
+    add.u32 %r25, %r25, %r20;
+    mul.lo.u32 %r25, %r25, %r4;
+    add.u32 %r25, %r25, %r21;
+    mul.wide.u32 %rd5, %r25, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    mul.f32 %f3, %f1, %f2;
+    add.f32 %f0, %f0, %f3;
+    add.u32 %r22, %r22, 1;
+    bra ONE_BY_ONE_IC;
+ONE_BY_ONE_STORE:
+    // Contiguous NCHW output: ((n * 64 + oc) * Hout + y) * Wout + x.
+    mul.lo.u32 %r25, %r11, 64;
+    add.u32 %r25, %r25, %r13;
+    mul.lo.u32 %r25, %r25, %r6;
+    add.u32 %r25, %r25, %r20;
+    mul.lo.u32 %r25, %r25, %r7;
+    add.u32 %r25, %r25, %r21;
+    mul.wide.u32 %rd5, %r25, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    add.u32 %r19, %r19, %r9;
+    bra ONE_BY_ONE_SPATIAL;
+ONE_BY_ONE_DONE:
+    ret;
+}
+
 .visible .entry conv2d_3x3_s1_p1_c64(
     .param .u64 p_input,
     .param .u64 p_weight,
@@ -1234,6 +1356,178 @@ FAST_STORE:
     add.u32 %r23, %r23, %r18;
     bra FAST_SPATIAL;
 FAST_DONE:
+    ret;
+}
+
+.visible .entry conv2d_3x3_s1_p1_c64_spatial(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<4>;
+    .reg .u64 %rd<9>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_c];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+
+    // Read launch registers before arithmetic.  A block identifies one
+    // (batch, output-channel, spatial-tile) tuple.
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    mul.lo.u32 %r20, %r8, %r9;
+    add.u32 %r21, %r20, 127;
+    div.u32 %r21, %r21, 128;
+    div.u32 %r22, %r17, %r21;
+    mul.lo.u32 %r23, %r22, %r21;
+    sub.u32 %r23, %r17, %r23;
+    div.u32 %r24, %r22, %r5;
+    mul.lo.u32 %r25, %r24, %r5;
+    sub.u32 %r25, %r22, %r25;
+
+    // Reload the 576 weights for this output channel into shared memory.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r26, %rd8;
+    mov.u32 %r27, %r19;
+SPATIAL_WEIGHT_LOAD:
+    setp.ge.u32 %p0, %r27, 576;
+    @%p0 bra SPATIAL_WEIGHT_LOAD_DONE;
+    mul.lo.u32 %r28, %r25, 576;
+    add.u32 %r28, %r28, %r27;
+    mul.wide.u32 %rd5, %r28, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r29, %r27, 4;
+    add.u32 %r30, %r26, %r29;
+    st.shared.f32 [%r30], %f1;
+    add.u32 %r27, %r27, %r18;
+    bra SPATIAL_WEIGHT_LOAD;
+SPATIAL_WEIGHT_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r31, %r23, 128;
+    add.u32 %r31, %r31, %r19;
+SPATIAL_OUTPUT:
+    setp.ge.u32 %p1, %r31, %r20;
+    @%p1 bra SPATIAL_DONE;
+    div.u32 %r32, %r31, %r9;
+    rem.u32 %r33, %r31, %r9;
+    setp.eq.u64 %p2, %rd3, 0;
+    @%p2 bra SPATIAL_NO_BIAS;
+    mul.wide.u32 %rd5, %r25, 4;
+    add.u64 %rd6, %rd3, %rd5;
+    ld.global.f32 %f0, [%rd6];
+    bra SPATIAL_BIAS_DONE;
+SPATIAL_NO_BIAS:
+    mov.f32 %f0, 0.0;
+SPATIAL_BIAS_DONE:
+    mov.u32 %r34, 0;
+SPATIAL_IC:
+    setp.ge.u32 %p3, %r34, 64;
+    @%p3 bra SPATIAL_STORE;
+    mov.u32 %r35, 0;
+SPATIAL_KY:
+    setp.ge.u32 %p4, %r35, 3;
+    @%p4 bra SPATIAL_NEXT_IC;
+    mov.u32 %r36, 0;
+SPATIAL_KX:
+    setp.ge.u32 %p5, %r36, 3;
+    @%p5 bra SPATIAL_NEXT_KY;
+    cvt.s32.u32 %s0, %r32;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s2, %r35;
+    add.s32 %s0, %s0, %s2;
+    setp.ge.s32 %p6, %s0, 0;
+    cvt.u32.s32 %r38, %s0;
+    setp.lt.u32 %p7, %r38, %r3;
+    and.pred %p6, %p6, %p7;
+    @!%p6 bra SPATIAL_NEXT_KX;
+    cvt.s32.u32 %s1, %r33;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r36;
+    add.s32 %s1, %s1, %s2;
+    setp.ge.s32 %p6, %s1, 0;
+    cvt.u32.s32 %r38, %s1;
+    setp.lt.u32 %p7, %r38, %r4;
+    and.pred %p6, %p6, %p7;
+    @!%p6 bra SPATIAL_NEXT_KX;
+
+    // Input index: ((n * 64 + ic) * H + iy) * W + ix.
+    mul.lo.u32 %r37, %r24, 64;
+    add.u32 %r37, %r37, %r34;
+    mul.lo.u32 %r37, %r37, %r3;
+    cvt.u32.s32 %r38, %s0;
+    add.u32 %r37, %r37, %r38;
+    mul.lo.u32 %r37, %r37, %r4;
+    cvt.u32.s32 %r38, %s1;
+    add.u32 %r37, %r37, %r38;
+    mul.wide.u32 %rd5, %r37, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd6];
+
+    // Weight index: (ic * 3 + ky) * 3 + kx.
+    mul.lo.u32 %r39, %r34, 9;
+    mul.lo.u32 %r40, %r35, 3;
+    add.u32 %r39, %r39, %r40;
+    add.u32 %r39, %r39, %r36;
+    mul.lo.u32 %r40, %r39, 4;
+    add.u32 %r41, %r26, %r40;
+    ld.shared.f32 %f1, [%r41];
+    mul.f32 %f3, %f2, %f1;
+    add.f32 %f0, %f0, %f3;
+SPATIAL_NEXT_KX:
+    add.u32 %r36, %r36, 1;
+    bra SPATIAL_KX;
+SPATIAL_NEXT_KY:
+    add.u32 %r35, %r35, 1;
+    bra SPATIAL_KY;
+SPATIAL_NEXT_IC:
+    add.u32 %r34, %r34, 1;
+    bra SPATIAL_IC;
+SPATIAL_STORE:
+    // Output index: ((n * 64 + oc) * Hout + oy) * Wout + ox.
+    mul.lo.u32 %r37, %r24, 64;
+    add.u32 %r37, %r37, %r25;
+    mul.lo.u32 %r37, %r37, %r8;
+    add.u32 %r37, %r37, %r32;
+    mul.lo.u32 %r37, %r37, %r9;
+    add.u32 %r37, %r37, %r33;
+    mul.wide.u32 %rd5, %r37, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    add.u32 %r31, %r31, %r18;
+    bra SPATIAL_OUTPUT;
+SPATIAL_DONE:
     ret;
 }
 
@@ -1729,7 +2023,8 @@ class CudaExecutionBackend:
                 "matrix_mul_elementwise, matrix_arange, matrix_add_scalar, "
                 "matrix_div_scalar, matrix_sigmoid, stack_copy, matrix_fill, "
                 "matrix_softmax, matrix_mul, conv2d_nchw, "
-                "conv2d_3x3_s1_p1_c64, batch_norm_inference, silu, "
+                "conv2d_3x3_s1_p1_c64, conv2d_3x3_s1_p1_c64_spatial, "
+                "conv2d_1x1_s1_c64, batch_norm_inference, silu, "
                 "split_copy, cat_copy, upsample_nearest2d"
             )
             if _truthy_environment("MATRIXMAN_CUDA_LEGACY_MODULE_LOAD"):
@@ -1773,6 +2068,8 @@ class CudaExecutionBackend:
             self.matmul_function = CUfunction()
             self.convolution_function = CUfunction()
             self.convolution_fast_function = CUfunction()
+            self.convolution_spatial_function = CUfunction()
+            self.convolution_1x1_function = CUfunction()
             self.batch_norm_function = CUfunction()
             self.silu_function = CUfunction()
             self.split_function = CUfunction()
@@ -1791,6 +2088,8 @@ class CudaExecutionBackend:
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.matmul_function), self.module, b"matrix_mul"), "get matrix_mul")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_function), self.module, b"conv2d_nchw"), "get conv2d_nchw")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_fast_function), self.module, b"conv2d_3x3_s1_p1_c64"), "get conv2d_3x3_s1_p1_c64")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_spatial_function), self.module, b"conv2d_3x3_s1_p1_c64_spatial"), "get conv2d_3x3_s1_p1_c64_spatial")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_function), self.module, b"conv2d_1x1_s1_c64"), "get conv2d_1x1_s1_c64")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.batch_norm_function), self.module, b"batch_norm_inference"), "get batch_norm_inference")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.silu_function), self.module, b"silu"), "get silu")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.split_function), self.module, b"split_copy"), "get split_copy")
@@ -1810,6 +2109,8 @@ class CudaExecutionBackend:
                 id(self.matmul_function): "MatMul",
                 id(self.convolution_function): "Conv2D",
                 id(self.convolution_fast_function): "Conv2D",
+                id(self.convolution_spatial_function): "Conv2D",
+                id(self.convolution_1x1_function): "Conv2D",
                 id(self.batch_norm_function): "BatchNorm",
                 id(self.silu_function): "SiLU",
                 id(self.split_function): "Split",
@@ -2166,9 +2467,13 @@ class CudaExecutionBackend:
         dilation_w: int,
         groups: int,
         specialized: bool = False,
+        specialized_1x1: bool = False,
+        specialized_3x3_spatial: bool = False,
     ) -> None:
-        if specialized and _specialized_conv_disabled():
+        if (specialized or specialized_1x1 or specialized_3x3_spatial) and _specialized_conv_disabled():
             specialized = False
+            specialized_1x1 = False
+            specialized_3x3_spatial = False
         dimensions = (n, c, h, w, k, r, s, out_h, out_w)
         if min(dimensions) <= 0:
             raise ValueError("convolution dimensions must be positive")
@@ -2183,6 +2488,22 @@ class CudaExecutionBackend:
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         ):
             raise ValueError("invalid specialized 3x3 Conv2D configuration")
+        if specialized_1x1 and not (
+            n == 1 and c == 64 and k == 64 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid specialized 1x1 Conv2D configuration")
+        if specialized_3x3_spatial and not (
+            c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid spatial specialized 3x3 Conv2D configuration")
+        if sum(bool(value) for value in (specialized, specialized_1x1, specialized_3x3_spatial)) > 1:
+            raise ValueError("multiple specialized Conv2D paths requested")
         profile_signature = (
             (
                 n, c, h, w, k, out_h, out_w, r, s,
@@ -2203,8 +2524,18 @@ class CudaExecutionBackend:
                 f"dilation_h/w={dilation_h}/{dilation_w}, groups={groups}, "
                 f"total_outputs={total_outputs}"
             )
+        fast_path = specialized or specialized_1x1 or specialized_3x3_spatial
+        function = (
+            self.convolution_fast_function
+            if specialized
+            else self.convolution_1x1_function
+            if specialized_1x1
+            else self.convolution_spatial_function
+            if specialized_3x3_spatial
+            else self.convolution_function
+        )
         self._launch(
-            self.convolution_fast_function if specialized else self.convolution_function,
+            function,
             [
                 input_pointer, weight_pointer, bias_pointer, output_pointer,
                 ctypes.c_uint(n), ctypes.c_uint(c), ctypes.c_uint(h), ctypes.c_uint(w),
@@ -2217,9 +2548,21 @@ class CudaExecutionBackend:
             ],
             # The specialized kernel assigns one block to each output plane;
             # _launch derives grid.x by dividing this count by the block size.
-            n * k * CUDA_BLOCK_SIZE if specialized else total_outputs,
+            (
+                n * k * ((out_h * out_w + CUDA_BLOCK_SIZE - 1) // CUDA_BLOCK_SIZE)
+                * CUDA_BLOCK_SIZE
+                if specialized_3x3_spatial
+                else n * k * CUDA_BLOCK_SIZE
+                if fast_path
+                else total_outputs
+            ),
             profile_signature=profile_signature,
-            profile_variant="specialized-3x3" if specialized else "generic",
+            profile_variant=(
+                "specialized-3x3" if specialized
+                else "specialized-1x1-c64" if specialized_1x1
+                else "specialized-3x3-spatial" if specialized_3x3_spatial
+                else "generic"
+            ),
         )
 
     def batch_norm(

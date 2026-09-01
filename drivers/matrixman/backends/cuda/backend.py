@@ -113,6 +113,43 @@ class CudaBackend(Backend):
             "cuCtxSynchronize",
         )
 
+    def matmul(self, left, right):
+        """Execute 2D matrix multiplication through the existing CUDA kernel."""
+        for name, value in (("left", left), ("right", right)):
+            if not hasattr(value, "_owner") or value._owner.layout.kind != "cuda_linear":
+                raise RuntimeError(f"MatrixMan/CUDA: mm requires a CUDA-backed {name} tensor")
+            if value.dtype != torch.float32 or len(value.shape) != 2:
+                raise NotImplementedError("MatrixMan/CUDA: mm supports 2D float32 tensors only")
+            if tuple(int(item) for item in value._logical_strides) != contiguous_strides(tuple(value.shape)):
+                raise NotImplementedError("MatrixMan/CUDA: mm requires contiguous logical inputs")
+            if int(value._storage_offset) != 0:
+                raise NotImplementedError("MatrixMan/CUDA: mm does not support nonzero storage offsets")
+        m, k = (int(item) for item in left.shape)
+        right_k, n = (int(item) for item in right.shape)
+        if k != right_k:
+            raise RuntimeError(
+                f"MatrixMan/CUDA: mm shapes cannot be multiplied ({m}x{k} and {right_k}x{n})"
+            )
+        output_pointer = self.execution.allocate(m * n * 4)
+        try:
+            self.execution.matmul(
+                left._owner.pointer,
+                right._owner.pointer,
+                output_pointer,
+                m,
+                k,
+                n,
+            )
+            return CudaTensorOwner(
+                self.execution,
+                output_pointer,
+                (m, n),
+                contiguous_strides((m, n)),
+            )
+        except Exception:
+            self.execution.free(output_pointer)
+            raise
+
     @staticmethod
     def _parameter_cache_key(value: torch.Tensor):
         try:
@@ -191,8 +228,27 @@ class CudaBackend(Backend):
         disable_specialized = os.environ.get(
             "MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV", ""
         ).strip().lower() not in {"", "0", "false", "no", "off"}
-        specialized = (
+        spatial_3x3 = os.environ.get(
+            "MATRIXMAN_CUDA_CONV3X3_VARIANT", "plane"
+        ).strip().lower() == "spatial"
+        specialized_3x3 = (
             not disable_specialized and
+            not spatial_3x3 and
+            c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_1x1 = (
+            not disable_specialized and
+            n == 1 and c == 64 and k == 64 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_spatial = (
+            not disable_specialized and
+            spatial_3x3 and
             c == 64 and k == 64 and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
             and pad_h == 1 and pad_w == 1
@@ -217,7 +273,9 @@ class CudaBackend(Backend):
                 input_tensor._owner.pointer, weight_pointer, bias_pointer, output_pointer,
                 n, c, h, w, k, r, s, out_h, out_w,
                 stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
-                specialized=specialized,
+                specialized=specialized_3x3,
+                specialized_1x1=specialized_1x1,
+                specialized_3x3_spatial=specialized_3x3_spatial,
             )
             strides = (k * out_h * out_w, out_h * out_w, out_w, 1)
             return CudaTensorOwner(

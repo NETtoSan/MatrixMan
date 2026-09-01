@@ -272,7 +272,7 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
         raise RuntimeError(
             f"gm45 unsupported operation: {func}. "
             "This prototype supports CPU upload, .cpu()/.to('cpu'), metadata-only "
-            "view/reshape/flatten/squeeze/unsqueeze/split, 2D square add/matmul, "
+            "view/reshape/flatten/squeeze/unsqueeze/split, 2D add/matmul, "
             "packed elementwise add, YOLO-subset stack, fill_ scalar, packed NCHW channel cat, packed 3D last-dim cat, "
             "Conv2D, eval BatchNorm, SiLU_, YOLO-subset max_pool2d values, and "
             "YOLO-subset nearest upsample, float32 arange, and YOLO-subset softmax."

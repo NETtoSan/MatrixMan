@@ -104,6 +104,7 @@ python3 -m drivers.matrixman.compatibility
 python3 -m drivers.matrixman --check
 python3 -m drivers.matrixman.diagnostics.matrixman_pytorch_demo
 python3 -m drivers.matrixman.diagnostics.matrixman_pytorch_demo --trace
+python3 -m drivers.matrixman.diagnostics.matrixman_mm_demo
 ```
 
 The compatibility commands report the active renderer, OpenGL limits,
@@ -181,8 +182,12 @@ python3 -m drivers.matrixman.diagnostics.cpu_gpu_benchmark --skip-stress
 python3 -m drivers.matrixman.backends.opengl.gpu_stress --seconds 10 --size 128
 ```
 
-The first command is a standalone shader test; the latter two are lower-level
-OpenGL benchmark/stress tools, not public MatrixMan model demonstrations.
+The first command is a standalone shader test. The benchmark uses the selected
+MatrixMan frontend/backend for its core comparison; its optional stress mode
+remains a legacy OpenGL-only stress test and is run only when OpenGL is
+selected. Use `MATRIXMAN_PROFILE=1` with the benchmark to include exact CUDA
+Driver API allocation/copy timing and transfer bandwidth attribution. These
+are not public MatrixMan model demonstrations.
 
 ## Hardware notes
 

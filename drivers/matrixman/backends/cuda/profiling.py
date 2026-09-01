@@ -19,6 +19,7 @@ batch_norm = defaultdict(float)
 conv2d = defaultdict(float)
 activation = defaultdict(float)
 parameter_cache = defaultdict(float)
+readback = defaultdict(float)
 conv2d_signatures = {}
 _exit_hook_registered = False
 
@@ -43,6 +44,7 @@ def reset() -> None:
     conv2d.clear()
     activation.clear()
     parameter_cache.clear()
+    readback.clear()
     conv2d_signatures.clear()
 
 
@@ -60,7 +62,7 @@ def register_exit_hook() -> None:
             active is not None
             and active.name == "cuda"
             and enabled
-            and (records or batch_norm or conv2d or activation or parameter_cache)
+            and (records or batch_norm or conv2d or activation or parameter_cache or readback)
         ):
             report()
 
@@ -121,6 +123,12 @@ def parameter_cache_event(name: str, byte_count: int = 0) -> None:
 def parameter_cache_adjust(name: str, delta: int) -> None:
     if enabled:
         parameter_cache[name] += int(delta)
+
+
+def readback_phase(name: str, elapsed: float) -> None:
+    if enabled:
+        readback[name] += float(elapsed)
+        readback[f"{name}_calls"] += 1
 
 
 def observe_conv2d_signature(
@@ -189,6 +197,21 @@ def report() -> None:
         print(f"  retained allocations: {int(parameter_cache['retained_allocations'])}")
         print(f"  retained bytes: {int(parameter_cache['retained_bytes'])}")
 
+    if readback:
+        print("CUDA readback reconstruction")
+        for label in (
+            "contiguous_fast_path",
+            "logical_reconstruction",
+            "cpu_tensor_reconstruction",
+            "generic_reconstruction",
+        ):
+            calls = int(readback[f"{label}_calls"])
+            seconds = readback[label]
+            print(
+                f"  {label}: calls={calls} total={seconds * 1000.0:.3f} ms "
+                f"avg={(seconds / calls * 1000.0) if calls else 0.0:.3f} ms"
+            )
+
     h2d = records.get("HtoD", {"calls": 0, "bytes": 0})
     attributed_calls = int(batch_norm["parameter_uploads"] + conv2d["weight_uploads"] + conv2d["bias_uploads"])
     attributed_bytes = int(batch_norm["parameter_uploads_bytes"] + conv2d["weight_uploads_bytes"] + conv2d["bias_uploads_bytes"])
@@ -213,7 +236,10 @@ def report() -> None:
             n, cin, hin, win, cout, hout, wout, kh, kw = signature[:9]
             groups = signature[-1]
             macs = n * cout * hout * wout * (cin // groups) * kh * kw
-            gmacs = macs / (seconds * 1e9) if seconds else 0.0
+            # ``seconds`` and ``calls`` are aggregate values for this
+            # signature.  Scale the per-call MAC count by the same number of
+            # calls before calculating aggregate throughput.
+            gmacs = (macs * calls) / (seconds * 1e9) if seconds else 0.0
             print(f"{_format_conv2d_signature(signature)} variant={variant}")
             print(
                 f"    calls={calls} total={total_ms:.3f} ms "

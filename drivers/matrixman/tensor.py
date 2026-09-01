@@ -71,14 +71,52 @@ def readback_tensor(tensor: "MatrixManTensor") -> torch.Tensor:
     owner = tensor._owner
     if owner.layout.kind == "cuda_linear":
         import numpy as np
+        import time
+
+        from .backends.cuda import profiling as cuda_profiling
 
         raw = owner.execution.from_device(owner.pointer, (owner.layout.numel,))
         if offset < 0 or (numel(shape) and offset + max_storage_index(shape, strides) >= owner.layout.numel):
             raise RuntimeError("MatrixMan CUDA readback view is outside storage")
+        element_count = numel(shape)
+        if (
+            tuple(strides) == contiguous_strides(shape)
+            and all(stride != 0 for stride in strides)
+            and offset + element_count <= owner.layout.numel
+        ):
+            started = time.perf_counter() if cuda_profiling.is_enabled() else None
+            if offset == 0:
+                result = torch.from_numpy(raw[:element_count].copy()).reshape(shape)
+            else:
+                # Retain the logical storage offset while avoiding indexed
+                # reconstruction: the physical prefix is copied in bulk.
+                base = torch.from_numpy(raw[: offset + element_count].copy())
+                result = torch.as_strided(base, shape, strides, offset)
+            if started is not None:
+                cuda_profiling.readback_phase(
+                    "contiguous_fast_path", time.perf_counter() - started
+                )
+            return result
+        reconstruction_started = time.perf_counter() if cuda_profiling.is_enabled() else None
         values_array = np.empty(shape, dtype=np.float32)
+        generic_started = reconstruction_started
         for index in np.ndindex(shape):
             values_array[index] = raw[offset + sum(i * stride for i, stride in zip(index, strides))]
-        return _cpu_layout_from_values(torch.from_numpy(values_array), shape, strides, offset)
+        if reconstruction_started is not None:
+            cuda_profiling.readback_phase(
+                "logical_reconstruction", time.perf_counter() - reconstruction_started
+            )
+        layout_started = time.perf_counter() if cuda_profiling.is_enabled() else None
+        result = _cpu_layout_from_values(torch.from_numpy(values_array), shape, strides, offset)
+        if layout_started is not None:
+            cuda_profiling.readback_phase(
+                "cpu_tensor_reconstruction", time.perf_counter() - layout_started
+            )
+        if generic_started is not None:
+            cuda_profiling.readback_phase(
+                "generic_reconstruction", time.perf_counter() - generic_started
+            )
+        return result
 
     if owner.layout.kind.startswith("matrix") or owner.layout.kind in {"packed_rgba", "empty"}:
         from .backends.opengl.tensor import readback_tensor as opengl_readback
