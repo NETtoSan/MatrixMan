@@ -179,7 +179,7 @@ class CudaBackend(Backend):
             profiling.parameter_cache_adjust("retained_allocations", -1)
             profiling.parameter_cache_adjust("retained_bytes", -entry[3])
 
-        pointer = self.execution.to_device(value.detach().numpy())
+        pointer = self.execution.to_device(value.detach().numpy(), category="parameter")
         nbytes = int(value.numel() * value.element_size())
         # Keep the source tensor alive while its storage identity is cached.
         # This prevents a later CPU allocation from reusing the same data_ptr

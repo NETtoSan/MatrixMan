@@ -4296,6 +4296,9 @@ class CudaExecutionBackend:
     def __init__(self, device_index: int = 0):
         if device_index != 0:
             raise ValueError("only CUDA device 0 is currently supported")
+        self._pool_enabled = not _truthy_environment("MATRIXMAN_CUDA_DISABLE_ALLOC_POOL")
+        self._free_blocks: dict[int, list[CUdeviceptr]] = {}
+        self._allocation_records: dict[int, tuple[int, str, str]] = {}
         self.driver = load_driver()
         configure_driver(self.driver)
         self.driver, self.info = detect_device(self.driver)
@@ -4471,6 +4474,7 @@ class CudaExecutionBackend:
     def close(self) -> None:
         if self.closed:
             return
+        self._drain_pool()
         if self.module:
             check(self.driver, self.driver.cuModuleUnload(self.module), "cuModuleUnload")
             self.module = CUmodule()
@@ -4485,24 +4489,87 @@ class CudaExecutionBackend:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
-    def allocate(self, nbytes: int) -> CUdeviceptr:
+    def _drain_pool(self) -> None:
+        """Release cached temporary blocks while the CUDA context is alive."""
+        for blocks in list(self._free_blocks.values()):
+            while blocks:
+                pointer = blocks.pop()
+                address = int(pointer.value)
+                record = self._allocation_records.get(address)
+                started = profiling.start()
+                try:
+                    check(self.driver, self.driver.cuMemFree_v2(pointer), "cuMemFree")
+                    if record is not None:
+                        profiling.allocation_pool_drained(record[0])
+                    profiling.allocation_driver_freed()
+                finally:
+                    profiling.observe("Free", started)
+                    self._allocation_records.pop(address, None)
+                    pointer.value = 0
+        self._free_blocks.clear()
+
+    def _allocate_driver(self, nbytes: int) -> CUdeviceptr:
+        pointer = CUdeviceptr()
+        result = self.driver.cuMemAlloc_v2(ctypes.byref(pointer), nbytes)
+        if result != CUDA_SUCCESS and self._pool_enabled and self._free_blocks:
+            self._drain_pool()
+            pointer = CUdeviceptr()
+            result = self.driver.cuMemAlloc_v2(ctypes.byref(pointer), nbytes)
+        check(self.driver, result, "cuMemAlloc")
+        return pointer
+
+    def allocate(self, nbytes: int, category: str = "temporary") -> CUdeviceptr:
         if nbytes <= 0:
             raise ValueError("device allocation size must be positive")
+        profiling.allocation_request(nbytes, category)
+        eligible = self._pool_enabled and category != "parameter"
+        if eligible:
+            blocks = self._free_blocks.get(int(nbytes))
+            if blocks:
+                pointer = blocks.pop()
+                if not blocks:
+                    self._free_blocks.pop(int(nbytes), None)
+                self._allocation_records[int(pointer.value)] = (int(nbytes), category, "live")
+                profiling.allocation_pool_hit(nbytes)
+                profiling.allocation_pool_reused(pointer, nbytes, category)
+                return pointer
+            profiling.allocation_pool_miss()
         started = profiling.start()
-        pointer = CUdeviceptr()
         try:
-            check(self.driver, self.driver.cuMemAlloc_v2(ctypes.byref(pointer), nbytes), "cuMemAlloc")
+            pointer = self._allocate_driver(nbytes)
+            self._allocation_records[int(pointer.value)] = (int(nbytes), category, "live")
+            profiling.allocation_succeeded(pointer, nbytes, category)
         finally:
             profiling.observe("Alloc", started, nbytes)
         return pointer
 
     def free(self, pointer: CUdeviceptr) -> None:
         if pointer and pointer.value:
+            profiling.allocation_free_request(pointer)
+            address = int(pointer.value)
+            record = self._allocation_records.get(address)
+            if (
+                self._pool_enabled
+                and record is not None
+                and record[1] != "parameter"
+                and record[2] == "live"
+            ):
+                nbytes, category, _state = record
+                cached_pointer = CUdeviceptr(address)
+                self._allocation_records[address] = (nbytes, category, "cached")
+                self._free_blocks.setdefault(nbytes, []).append(cached_pointer)
+                profiling.allocation_pool_returned(pointer)
+                pointer.value = 0
+                return
+            if record is not None and record[2] == "cached":
+                raise RuntimeError("CUDA temporary allocation was returned to the pool twice")
             started = profiling.start()
             try:
                 check(self.driver, self.driver.cuMemFree_v2(pointer), "cuMemFree")
+                profiling.allocation_freed(pointer)
             finally:
                 profiling.observe("Free", started)
+                self._allocation_records.pop(address, None)
                 pointer.value = 0
 
     @staticmethod
@@ -4513,9 +4580,9 @@ class CudaExecutionBackend:
             raise ValueError(f"{label} must be C-contiguous")
         return array
 
-    def to_device(self, array: np.ndarray) -> CUdeviceptr:
+    def to_device(self, array: np.ndarray, category: str = "activation") -> CUdeviceptr:
         array = self._float32_array(array, "host array")
-        pointer = self.allocate(array.nbytes)
+        pointer = self.allocate(array.nbytes, category)
         try:
             started = profiling.start()
             try:

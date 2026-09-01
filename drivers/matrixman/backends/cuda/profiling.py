@@ -21,6 +21,32 @@ activation = defaultdict(float)
 parameter_cache = defaultdict(float)
 readback = defaultdict(float)
 conv2d_signatures = {}
+allocation = {
+    "requests": 0,
+    "free_requests": 0,
+    "requested_bytes": 0,
+    "driver_allocations": 0,
+    "driver_allocated_bytes": 0,
+    "driver_frees": 0,
+    "live_count": 0,
+    "live_bytes": 0,
+    "peak_live_count": 0,
+    "peak_live_bytes": 0,
+    "requested_by_size": defaultdict(int),
+    "live_by_size": defaultdict(int),
+    "peak_live_by_size": defaultdict(int),
+    "live_pointers": {},
+    "category_requests": defaultdict(int),
+    "category_driver_allocations": defaultdict(int),
+    "category_driver_frees": defaultdict(int),
+    "pool_hits": 0,
+    "pool_misses": 0,
+    "pool_returns": 0,
+    "cached_blocks": 0,
+    "cached_bytes": 0,
+    "peak_cached_blocks": 0,
+    "peak_cached_bytes": 0,
+}
 _exit_hook_registered = False
 
 
@@ -46,6 +72,30 @@ def reset() -> None:
     parameter_cache.clear()
     readback.clear()
     conv2d_signatures.clear()
+    allocation["requests"] = 0
+    allocation["free_requests"] = 0
+    allocation["requested_bytes"] = 0
+    allocation["driver_allocations"] = 0
+    allocation["driver_allocated_bytes"] = 0
+    allocation["driver_frees"] = 0
+    allocation["live_count"] = 0
+    allocation["live_bytes"] = 0
+    allocation["peak_live_count"] = 0
+    allocation["peak_live_bytes"] = 0
+    allocation["requested_by_size"].clear()
+    allocation["live_by_size"].clear()
+    allocation["peak_live_by_size"].clear()
+    allocation["live_pointers"].clear()
+    allocation["category_requests"].clear()
+    allocation["category_driver_allocations"].clear()
+    allocation["category_driver_frees"].clear()
+    allocation["pool_hits"] = 0
+    allocation["pool_misses"] = 0
+    allocation["pool_returns"] = 0
+    allocation["cached_blocks"] = 0
+    allocation["cached_bytes"] = 0
+    allocation["peak_cached_blocks"] = 0
+    allocation["peak_cached_bytes"] = 0
 
 
 def register_exit_hook() -> None:
@@ -131,6 +181,118 @@ def readback_phase(name: str, elapsed: float) -> None:
         readback[f"{name}_calls"] += 1
 
 
+def allocation_request(nbytes: int, category: str) -> None:
+    """Record an allocation request without changing allocation behavior."""
+    if not enabled:
+        return
+    nbytes = int(nbytes)
+    allocation["requests"] += 1
+    allocation["requested_bytes"] += nbytes
+    allocation["requested_by_size"][nbytes] += 1
+    allocation["category_requests"][category] += 1
+
+
+def allocation_succeeded(pointer, nbytes: int, category: str) -> None:
+    """Record one successful cuMemAlloc and its currently-live ownership."""
+    if not enabled:
+        return
+    address = int(pointer.value)
+    nbytes = int(nbytes)
+    allocation["driver_allocations"] += 1
+    allocation["driver_allocated_bytes"] += nbytes
+    allocation["category_driver_allocations"][category] += 1
+    allocation["live_pointers"][address] = (nbytes, category)
+    allocation["live_count"] += 1
+    allocation["live_bytes"] += nbytes
+    allocation["live_by_size"][nbytes] += 1
+    allocation["peak_live_count"] = max(allocation["peak_live_count"], allocation["live_count"])
+    allocation["peak_live_bytes"] = max(allocation["peak_live_bytes"], allocation["live_bytes"])
+    allocation["peak_live_by_size"][nbytes] = max(
+        allocation["peak_live_by_size"][nbytes], allocation["live_by_size"][nbytes]
+    )
+
+
+def allocation_free_request(pointer) -> None:
+    if enabled and pointer and pointer.value:
+        allocation["free_requests"] += 1
+
+
+def allocation_freed(pointer) -> None:
+    """Record a successful cuMemFree for a tracked allocation."""
+    if not enabled:
+        return
+    address = int(pointer.value)
+    entry = allocation["live_pointers"].pop(address, None)
+    allocation["driver_frees"] += 1
+    if entry is None:
+        return
+    nbytes, category = entry
+    allocation["category_driver_frees"][category] += 1
+    allocation["live_count"] -= 1
+    allocation["live_bytes"] -= nbytes
+    allocation["live_by_size"][nbytes] -= 1
+
+
+def allocation_pool_miss() -> None:
+    if enabled:
+        allocation["pool_misses"] += 1
+
+
+def allocation_pool_hit(nbytes: int) -> None:
+    if enabled:
+        allocation["pool_hits"] += 1
+        allocation["cached_blocks"] -= 1
+        allocation["cached_bytes"] -= int(nbytes)
+
+
+def allocation_pool_returned(pointer) -> None:
+    """Move a live allocation into the temporary free pool."""
+    if not enabled:
+        return
+    address = int(pointer.value)
+    entry = allocation["live_pointers"].pop(address, None)
+    allocation["pool_returns"] += 1
+    if entry is None:
+        return
+    nbytes, _category = entry
+    allocation["live_count"] -= 1
+    allocation["live_bytes"] -= nbytes
+    allocation["live_by_size"][nbytes] -= 1
+    allocation["cached_blocks"] += 1
+    allocation["cached_bytes"] += nbytes
+    allocation["peak_cached_blocks"] = max(
+        allocation["peak_cached_blocks"], allocation["cached_blocks"]
+    )
+    allocation["peak_cached_bytes"] = max(
+        allocation["peak_cached_bytes"], allocation["cached_bytes"]
+    )
+
+
+def allocation_pool_reused(pointer, nbytes: int, category: str) -> None:
+    """Move a pooled allocation back into the live set."""
+    if not enabled:
+        return
+    address = int(pointer.value)
+    nbytes = int(nbytes)
+    allocation["live_pointers"][address] = (nbytes, category)
+    allocation["live_count"] += 1
+    allocation["live_bytes"] += nbytes
+    allocation["live_by_size"][nbytes] += 1
+    allocation["peak_live_count"] = max(allocation["peak_live_count"], allocation["live_count"])
+    allocation["peak_live_bytes"] = max(allocation["peak_live_bytes"], allocation["live_bytes"])
+
+
+def allocation_pool_drained(nbytes: int) -> None:
+    if enabled:
+        allocation["cached_blocks"] -= 1
+        allocation["cached_bytes"] -= int(nbytes)
+
+
+def allocation_driver_freed() -> None:
+    if enabled:
+        allocation["driver_frees"] += 1
+
+
 def observe_conv2d_signature(
     signature: tuple[int, ...], elapsed: float | None, variant: str = "generic"
 ) -> None:
@@ -211,6 +373,38 @@ def report() -> None:
                 f"  {label}: calls={calls} total={seconds * 1000.0:.3f} ms "
                 f"avg={(seconds / calls * 1000.0) if calls else 0.0:.3f} ms"
             )
+
+    if allocation["requests"] or allocation["driver_allocations"]:
+        print("CUDA allocation lifetime")
+        print(f"  allocation requests: {allocation['requests']}")
+        print(f"  free requests: {allocation['free_requests']}")
+        print(f"  requested bytes: {allocation['requested_bytes']}")
+        print(f"  live allocations: {allocation['live_count']}")
+        print(f"  live bytes: {allocation['live_bytes']}")
+        print(f"  peak live allocations: {allocation['peak_live_count']}")
+        print(f"  peak live bytes: {allocation['peak_live_bytes']}")
+        print(f"  cuMemAlloc calls: {allocation['driver_allocations']}")
+        print(f"  cuMemAlloc bytes: {allocation['driver_allocated_bytes']}")
+        print(f"  cuMemFree calls: {allocation['driver_frees']}")
+        print(f"  pool hits: {allocation['pool_hits']}")
+        print(f"  pool misses: {allocation['pool_misses']}")
+        print(f"  pool returns: {allocation['pool_returns']}")
+        print(f"  cached blocks: {allocation['cached_blocks']}")
+        print(f"  cached bytes: {allocation['cached_bytes']}")
+        print(f"  peak cached blocks: {allocation['peak_cached_blocks']}")
+        print(f"  peak cached bytes: {allocation['peak_cached_bytes']}")
+        print("  allocation requests by category")
+        for category, calls in sorted(allocation["category_requests"].items()):
+            driver_calls = allocation["category_driver_allocations"].get(category, 0)
+            driver_frees = allocation["category_driver_frees"].get(category, 0)
+            print(
+                f"    {category}: requests={calls} driver_allocations={driver_calls} "
+                f"driver_frees={driver_frees}"
+            )
+        print("  requested bytes by size")
+        for nbytes, calls in sorted(allocation["requested_by_size"].items()):
+            peak_blocks = allocation["peak_live_by_size"].get(nbytes, 0)
+            print(f"    {nbytes}: requests={calls} peak_live_blocks={peak_blocks}")
 
     h2d = records.get("HtoD", {"calls": 0, "bytes": 0})
     attributed_calls = int(batch_norm["parameter_uploads"] + conv2d["weight_uploads"] + conv2d["bias_uploads"])
