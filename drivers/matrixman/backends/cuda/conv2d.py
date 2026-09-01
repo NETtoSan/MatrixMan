@@ -488,7 +488,7 @@ def run_diagnostic() -> int:
             )
             run_specialized_1x1_cin36_case(height, width, output_channels)
 
-        def run_specialized_1x1_cin16_case(height, width, output_channels):
+        def run_specialized_1x1_cin16_case(height, width, output_channels, specialized=True):
             rng = np.random.RandomState(7400 + height * 100 + width + output_channels)
             input_case = rng.uniform(-1.0, 1.0, (1, 16, height, width)).astype(np.float32)
             weight_case = rng.uniform(-0.25, 0.25, (output_channels, 16, 1, 1)).astype(np.float32)
@@ -521,7 +521,7 @@ def run_diagnostic() -> int:
             difference = np.abs(actual_case - generic_case)
             matches = np.allclose(actual_case, expected_case, rtol=5e-4, atol=5e-4)
             print(
-                f"Specialized 1x1 cin16 [1,16,{height},{width}] -> "
+                f"{'Specialized' if specialized else 'Generic'} 1x1 cin16 [1,16,{height},{width}] -> "
                 f"[1,{output_channels},{height},{width}]: "
                 f"max_abs_diff={error.max():.6g} mean_abs_diff={error.mean():.6g} "
                 f"CPU match: {bool(matches)} "
@@ -537,6 +537,9 @@ def run_diagnostic() -> int:
                 f"[1,{output_channels},{height},{width}]...", flush=True
             )
             run_specialized_1x1_cin16_case(height, width, output_channels)
+
+        print("testing generic 1x1 cin16 Cout=1 fallback [1,16,4,4] -> [1,1,4,4]...", flush=True)
+        run_specialized_1x1_cin16_case(4, 4, 1, specialized=False)
 
         # Nearby 1x1 shapes must continue to use the generic kernel.
         input_case = np.arange(1, 1 + 32 * 4 * 4, dtype=np.float32).reshape(1, 32, 4, 4) / 100
@@ -570,6 +573,56 @@ def run_diagnostic() -> int:
         )
         if not matches:
             raise AssertionError("generic 1x1 fallback does not match CPU reference")
+
+        def run_specialized_1x1_cin72_case(height, width, output_channels):
+            rng = np.random.RandomState(7500 + height * 100 + width + output_channels)
+            input_case = rng.uniform(-1.0, 1.0, (1, 72, height, width)).astype(np.float32)
+            weight_case = rng.uniform(-0.25, 0.25, (output_channels, 72, 1, 1)).astype(np.float32)
+            bias_case = rng.uniform(-0.1, 0.1, (output_channels,)).astype(np.float32)
+            expected_case = F.conv2d(
+                torch.from_numpy(input_case), torch.from_numpy(weight_case),
+                torch.from_numpy(bias_case)
+            ).numpy()
+
+            def execute(specialized):
+                input_dev = cuda.to_device(input_case)
+                weight_dev = cuda.to_device(weight_case)
+                bias_dev = cuda.to_device(bias_case)
+                output_dev = cuda.allocate(expected_case.nbytes)
+                try:
+                    cuda.convolution(
+                        input_dev, weight_dev, bias_dev, output_dev,
+                        1, 72, height, width, output_channels, 1, 1, height, width,
+                        1, 1, 0, 0, 1, 1, 1,
+                        specialized_1x1_cin72=specialized,
+                    )
+                    return cuda.from_device(output_dev, expected_case.shape)
+                finally:
+                    for pointer in (input_dev, weight_dev, bias_dev, output_dev):
+                        cuda.free(pointer)
+
+            actual_case = execute(True)
+            generic_case = execute(False)
+            error = np.abs(actual_case - expected_case)
+            difference = np.abs(actual_case - generic_case)
+            matches = np.allclose(actual_case, expected_case, rtol=5e-4, atol=5e-4)
+            print(
+                f"Specialized 1x1 cin72 [1,72,{height},{width}] -> "
+                f"[1,{output_channels},{height},{width}]: "
+                f"max_abs_diff={error.max():.6g} mean_abs_diff={error.mean():.6g} "
+                f"CPU match: {bool(matches)} "
+                f"specialized-vs-generic max_abs_diff={difference.max():.6g} "
+                f"mean_abs_diff={difference.mean():.6g}"
+            )
+            if not matches or not np.allclose(actual_case, generic_case, rtol=5e-4, atol=5e-4):
+                raise AssertionError("specialized 1x1 cin72 Conv2D does not match CPU/generic reference")
+
+        for height, width, output_channels in ((20, 20, 48), (4, 4, 48)):
+            print(
+                f"testing specialized 1x1 cin72 [1,72,{height},{width}] -> "
+                f"[1,{output_channels},{height},{width}]...", flush=True
+            )
+            run_specialized_1x1_cin72_case(height, width, output_channels)
     return 0
 
 

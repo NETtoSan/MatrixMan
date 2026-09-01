@@ -58,7 +58,7 @@ PTX = r"""
 .address_size 64
 
 .shared .align 4 .b8 conv3x3_weights[2304];
-.shared .align 4 .b8 conv1x1_weights[256];
+.shared .align 4 .b8 conv1x1_weights[288];
 
 .visible .entry matrix_add(
     .param .u64 p_a,
@@ -2145,6 +2145,126 @@ CIN48_ONE_BY_ONE_DONE:
     ret;
 }
 
+.visible .entry conv2d_1x1_s1_cin72(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<32>;
+    .reg .u64 %rd<9>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_c];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r6, [p_out_h];
+    ld.param.u32 %r7, [p_out_w];
+
+    // Read special registers before using them in arithmetic.  Each block
+    // owns one output-channel plane and its 128 threads cover the plane.
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %ntid.x;
+    mov.u32 %r10, %tid.x;
+    div.u32 %r11, %r8, %r5;
+    mul.lo.u32 %r12, %r11, %r5;
+    sub.u32 %r13, %r8, %r12;
+
+    // Cooperatively stage this output channel's 72 weights.  All threads
+    // converge at the barrier, including threads that do not load a weight.
+    mov.u64 %rd7, conv1x1_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r14, %rd8;
+    setp.ge.u32 %p0, %r10, 72;
+    @%p0 bra CIN72_ONE_BY_ONE_WEIGHT_BARRIER;
+    mul.lo.u32 %r15, %r13, 72;
+    add.u32 %r15, %r15, %r10;
+    mul.wide.u32 %rd5, %r15, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r16, %r10, 4;
+    add.u32 %r17, %r14, %r16;
+    st.shared.f32 [%r17], %f1;
+CIN72_ONE_BY_ONE_WEIGHT_BARRIER:
+    bar.sync 0;
+
+    mul.lo.u32 %r18, %r6, %r7;
+    mov.u32 %r19, %r10;
+CIN72_ONE_BY_ONE_SPATIAL:
+    setp.ge.u32 %p1, %r19, %r18;
+    @%p1 bra CIN72_ONE_BY_ONE_DONE;
+    div.u32 %r20, %r19, %r7;
+    rem.u32 %r21, %r19, %r7;
+    setp.eq.u64 %p2, %rd3, 0;
+    @%p2 bra CIN72_ONE_BY_ONE_NO_BIAS;
+    mul.wide.u32 %rd5, %r13, 4;
+    add.u64 %rd6, %rd3, %rd5;
+    ld.global.f32 %f0, [%rd6];
+    bra CIN72_ONE_BY_ONE_BIAS_DONE;
+CIN72_ONE_BY_ONE_NO_BIAS:
+    mov.f32 %f0, 0.0;
+CIN72_ONE_BY_ONE_BIAS_DONE:
+    mov.u32 %r22, 0;
+CIN72_ONE_BY_ONE_IC:
+    setp.ge.u32 %p3, %r22, 72;
+    @%p3 bra CIN72_ONE_BY_ONE_STORE;
+    mul.lo.u32 %r23, %r22, 4;
+    add.u32 %r24, %r14, %r23;
+    ld.shared.f32 %f1, [%r24];
+
+    // Contiguous NCHW input: ((n * 72 + ic) * H + y) * W + x.
+    mul.lo.u32 %r25, %r11, 72;
+    add.u32 %r25, %r25, %r22;
+    mul.lo.u32 %r25, %r25, %r3;
+    add.u32 %r25, %r25, %r20;
+    mul.lo.u32 %r25, %r25, %r4;
+    add.u32 %r25, %r25, %r21;
+    mul.wide.u32 %rd5, %r25, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    mul.f32 %f3, %f1, %f2;
+    add.f32 %f0, %f0, %f3;
+    add.u32 %r22, %r22, 1;
+    bra CIN72_ONE_BY_ONE_IC;
+CIN72_ONE_BY_ONE_STORE:
+    // Contiguous NCHW output: ((n * Cout + oc) * Hout + y) * Wout + x.
+    mul.lo.u32 %r25, %r11, %r5;
+    add.u32 %r25, %r25, %r13;
+    mul.lo.u32 %r25, %r25, %r6;
+    add.u32 %r25, %r25, %r20;
+    mul.lo.u32 %r25, %r25, %r7;
+    add.u32 %r25, %r25, %r21;
+    mul.wide.u32 %rd5, %r25, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    add.u32 %r19, %r19, %r9;
+    bra CIN72_ONE_BY_ONE_SPATIAL;
+CIN72_ONE_BY_ONE_DONE:
+    ret;
+}
 .visible .entry conv2d_1x1_s1_cin36(
     .param .u64 p_input,
     .param .u64 p_weight,
@@ -4212,7 +4332,7 @@ class CudaExecutionBackend:
                 "conv2d_3x3_s1_p1_small_c10, conv2d_3x3_s1_p1_small_c12, "
                 "conv2d_3x3_s1_p1_small_c24, "
                 "conv2d_3x3_s1_p1_c64_spatial, "
-                "conv2d_1x1_s1_c64, conv2d_1x1_s1_cin16, conv2d_1x1_s1_cin24, conv2d_1x1_s1_cin36, conv2d_1x1_s1_cin48, batch_norm_inference, silu, "
+                "conv2d_1x1_s1_c64, conv2d_1x1_s1_cin16, conv2d_1x1_s1_cin24, conv2d_1x1_s1_cin36, conv2d_1x1_s1_cin48, conv2d_1x1_s1_cin72, batch_norm_inference, silu, "
                 "split_copy, cat_copy, upsample_nearest2d"
             )
             if _truthy_environment("MATRIXMAN_CUDA_LEGACY_MODULE_LOAD"):
@@ -4270,6 +4390,7 @@ class CudaExecutionBackend:
             self.convolution_1x1_cin24_function = CUfunction()
             self.convolution_1x1_cin36_function = CUfunction()
             self.convolution_1x1_cin48_function = CUfunction()
+            self.convolution_1x1_cin72_function = CUfunction()
             self.batch_norm_function = CUfunction()
             self.silu_function = CUfunction()
             self.split_function = CUfunction()
@@ -4302,6 +4423,7 @@ class CudaExecutionBackend:
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin24_function), self.module, b"conv2d_1x1_s1_cin24"), "get conv2d_1x1_s1_cin24")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin36_function), self.module, b"conv2d_1x1_s1_cin36"), "get conv2d_1x1_s1_cin36")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin48_function), self.module, b"conv2d_1x1_s1_cin48"), "get conv2d_1x1_s1_cin48")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin72_function), self.module, b"conv2d_1x1_s1_cin72"), "get conv2d_1x1_s1_cin72")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.batch_norm_function), self.module, b"batch_norm_inference"), "get batch_norm_inference")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.silu_function), self.module, b"silu"), "get silu")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.split_function), self.module, b"split_copy"), "get split_copy")
@@ -4335,6 +4457,7 @@ class CudaExecutionBackend:
                 id(self.convolution_1x1_cin24_function): "Conv2D",
                 id(self.convolution_1x1_cin36_function): "Conv2D",
                 id(self.convolution_1x1_cin48_function): "Conv2D",
+                id(self.convolution_1x1_cin72_function): "Conv2D",
                 id(self.batch_norm_function): "BatchNorm",
                 id(self.silu_function): "SiLU",
                 id(self.split_function): "Split",
@@ -4696,6 +4819,7 @@ class CudaExecutionBackend:
         specialized_1x1_cin24: bool = False,
         specialized_1x1_cin36: bool = False,
         specialized_1x1_cin48: bool = False,
+        specialized_1x1_cin72: bool = False,
         specialized_3x3_spatial: bool = False,
         specialized_3x3_plane: bool = False,
         specialized_3x3_c8_c64_plane: bool = False,
@@ -4711,13 +4835,14 @@ class CudaExecutionBackend:
         # plane kernel; new callers use the explicit legacy name.
         specialized_3x3_plane_legacy = specialized_3x3_plane_legacy or specialized
         specialized = False
-        if (specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_3x3_spatial or specialized_3x3_plane or specialized_3x3_c8_c64_plane or specialized_3x3_small_c8 or specialized_3x3_small_c10 or specialized_3x3_small_c12 or specialized_3x3_small_c24 or specialized_3x3_c24_c64_plane or specialized_3x3_c48_c64_plane) and _specialized_conv_disabled():
+        if (specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_1x1_cin72 or specialized_3x3_spatial or specialized_3x3_plane or specialized_3x3_c8_c64_plane or specialized_3x3_small_c8 or specialized_3x3_small_c10 or specialized_3x3_small_c12 or specialized_3x3_small_c24 or specialized_3x3_c24_c64_plane or specialized_3x3_c48_c64_plane) and _specialized_conv_disabled():
             specialized = False
             specialized_1x1 = False
             specialized_1x1_cin16 = False
             specialized_1x1_cin24 = False
             specialized_1x1_cin36 = False
             specialized_1x1_cin48 = False
+            specialized_1x1_cin72 = False
             specialized_3x3_spatial = False
             specialized_3x3_plane = False
             specialized_3x3_c8_c64_plane = False
@@ -4777,6 +4902,13 @@ class CudaExecutionBackend:
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         ):
             raise ValueError("invalid specialized 1x1 Cin=48 Conv2D configuration")
+        if specialized_1x1_cin72 and not (
+            n == 1 and c == 72 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid specialized 1x1 Cin=72 Conv2D configuration")
         if specialized_3x3_spatial and not (
             c == 64 and k == 64 and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
@@ -4829,7 +4961,7 @@ class CudaExecutionBackend:
                 and dilation_h == 1 and dilation_w == 1 and groups == 1
             ):
                 raise ValueError("invalid small-channel specialized 3x3 Conv2D configuration")
-        if sum(bool(value) for value in (specialized_3x3_plane_legacy, specialized_1x1, specialized_1x1_cin16, specialized_1x1_cin24, specialized_1x1_cin36, specialized_1x1_cin48, specialized_3x3_spatial, specialized_3x3_plane, specialized_3x3_c8_c64_plane, specialized_3x3_small_c8, specialized_3x3_small_c10, specialized_3x3_small_c12, specialized_3x3_small_c24, specialized_3x3_c24_c64_plane, specialized_3x3_c48_c64_plane)) > 1:
+        if sum(bool(value) for value in (specialized_3x3_plane_legacy, specialized_1x1, specialized_1x1_cin16, specialized_1x1_cin24, specialized_1x1_cin36, specialized_1x1_cin48, specialized_1x1_cin72, specialized_3x3_spatial, specialized_3x3_plane, specialized_3x3_c8_c64_plane, specialized_3x3_small_c8, specialized_3x3_small_c10, specialized_3x3_small_c12, specialized_3x3_small_c24, specialized_3x3_c24_c64_plane, specialized_3x3_c48_c64_plane)) > 1:
             raise ValueError("multiple specialized Conv2D paths requested")
         profile_signature = (
             (
@@ -4852,7 +4984,7 @@ class CudaExecutionBackend:
                 f"total_outputs={total_outputs}"
             )
         fast_path = (
-            specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_3x3_spatial
+            specialized_3x3_plane_legacy or specialized_1x1 or specialized_1x1_cin16 or specialized_1x1_cin24 or specialized_1x1_cin36 or specialized_1x1_cin48 or specialized_1x1_cin72 or specialized_3x3_spatial
             or specialized_3x3_plane or specialized_3x3_c8_c64_plane
             or specialized_3x3_small_c8
             or specialized_3x3_small_c10 or specialized_3x3_small_c12
@@ -4872,6 +5004,8 @@ class CudaExecutionBackend:
             if specialized_1x1_cin36
             else self.convolution_1x1_cin48_function
             if specialized_1x1_cin48
+            else self.convolution_1x1_cin72_function
+            if specialized_1x1_cin72
             else self.convolution_plane_function
             if specialized_3x3_plane
             else self.convolution_c8_c64_plane_function
@@ -4922,6 +5056,7 @@ class CudaExecutionBackend:
                 else "specialized-1x1-cin24" if specialized_1x1_cin24
                 else "specialized-1x1-cin36" if specialized_1x1_cin36
                 else "specialized-1x1-cin48" if specialized_1x1_cin48
+                else "specialized-1x1-cin72" if specialized_1x1_cin72
                 else "specialized-3x3-spatial" if specialized_3x3_spatial
                 else "specialized-3x3-plane" if specialized_3x3_plane
                 else "specialized-3x3-c8-c64-plane" if specialized_3x3_c8_c64_plane

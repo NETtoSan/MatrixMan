@@ -249,7 +249,7 @@ class CudaBackend(Backend):
         specialized_1x1_cin16 = (
             not disable_specialized and
             input_tensor.is_contiguous()
-            and n == 1 and c == 16 and r == 1 and s == 1
+            and n == 1 and c == 16 and k >= 8 and r == 1 and s == 1
             and stride_h == 1 and stride_w == 1
             and pad_h == 0 and pad_w == 0
             and dilation_h == 1 and dilation_w == 1 and groups == 1
@@ -274,6 +274,14 @@ class CudaBackend(Backend):
             not disable_specialized and
             input_tensor.is_contiguous()
             and n == 1 and c == 48 and r == 1 and s == 1
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 0 and pad_w == 0
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_1x1_cin72 = (
+            not disable_specialized and
+            input_tensor.is_contiguous()
+            and n == 1 and c == 72 and r == 1 and s == 1
             and stride_h == 1 and stride_w == 1
             and pad_h == 0 and pad_w == 0
             and dilation_h == 1 and dilation_w == 1 and groups == 1
@@ -373,6 +381,7 @@ class CudaBackend(Backend):
                 specialized_1x1_cin24=specialized_1x1_cin24,
                 specialized_1x1_cin36=specialized_1x1_cin36,
                 specialized_1x1_cin48=specialized_1x1_cin48,
+                specialized_1x1_cin72=specialized_1x1_cin72,
                 specialized_3x3_spatial=specialized_3x3_spatial,
                 specialized_3x3_plane=specialized_3x3_plane,
                 specialized_3x3_c8_c64_plane=specialized_3x3_c8_c64_plane,
