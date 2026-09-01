@@ -19,8 +19,9 @@ from demo.yolo_helpers import detections, first_tensor, preprocess_frame
 from drivers import matrixman
 from drivers.matrixman.backend import get_backend
 
-#matrixman.prefer("opengl")
-#matrixman.profiling = True
+matrixman.prefer("opengl")
+matrixman.profiling = True
+matrixman.trace = True
 
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent

@@ -56,10 +56,17 @@ def _cpu_layout_from_values(values, shape, strides, storage_offset):
     return result
 
 
-def readback_tensor(tensor: "MatrixManTensor") -> torch.Tensor:
+def readback_tensor(tensor: "MatrixManTensor", *, audit_op: str | None = None, audit_reason: str = "explicit readback") -> torch.Tensor:
     """Explicitly copy a MatrixMan tensor to an ordinary CPU tensor."""
     if not isinstance(tensor, MatrixManTensor):
         raise TypeError("MatrixMan CPU readback requires a MatrixManTensor")
+    from . import audit
+    audit.record(
+        "explicit_cpu_transfer" if audit_op else "explicit_readback",
+        op=audit_op,
+        tensor=tensor,
+        reason=audit_reason,
+    )
     if tensor.dtype != torch.float32:
         raise NotImplementedError(
             f"MatrixMan CPU readback supports float32 only, got {tensor.dtype}"

@@ -54,7 +54,11 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
         memory_format = kwargs.get("memory_format")
         if memory_format not in {None, torch.preserve_format}:
             raise NotImplementedError("MatrixMan CPU readback supports preserve_format only")
-        return readback_tensor(source)
+        return readback_tensor(
+            source,
+            audit_op="aten._to_copy.default",
+            audit_reason="explicit MatrixMan-to-CPU transfer",
+        )
     if backend.name == "opengl":
         from .backends.opengl import dispatch as opengl_dispatch
 

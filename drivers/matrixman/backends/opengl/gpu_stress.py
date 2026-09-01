@@ -497,6 +497,7 @@ def main() -> int:
         gm.sdl_check(bool(window), "SDL_CreateWindow failed")
         context = gm.sdl.SDL_GL_CreateContext(window)
         gm.sdl_check(bool(context), "SDL_GL_CreateContext failed")
+        gm.initialize_context_functions()
         return run_stress(args.seconds, args.size, args.validate_interval, args.regen_interval)
     finally:
         if context:

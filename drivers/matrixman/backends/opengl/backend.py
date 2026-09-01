@@ -27,10 +27,8 @@ class OpenGLBackend(Backend):
 
     @classmethod
     def probe(cls) -> bool:
-        try:
-            runtime.init()
-        except Exception:
-            return False
+        # Let the selector retain an actionable loader/context failure reason.
+        runtime.init()
         return runtime.is_active()
 
     def matmul(self, a, b):

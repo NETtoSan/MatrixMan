@@ -84,23 +84,39 @@ def init() -> None:
         return
 
     from . import diagnostics
+    from ... import audit
+    audit.register_exit_summary()
     from ...privateuse import register_privateuse1_backend
 
     register_privateuse1_backend()
     diagnostics.trace("MatrixMan/OpenGL init -> SDL hidden compatibility-profile context")
-    gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
-    gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
-    gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MINOR_VERSION, 1)
-    gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_PROFILE_MASK, gm.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
-    window = gm.sdl.SDL_CreateWindow(
-        b"gm45_backend", 0, 0, 64, 64, gm.SDL_WINDOW_OPENGL | gm.SDL_WINDOW_HIDDEN
-    )
-    gm.sdl_check(bool(window), "SDL_CreateWindow failed")
-    context = gm.sdl.SDL_GL_CreateContext(window)
-    gm.sdl_check(bool(context), "SDL_GL_CreateContext failed")
+    sdl_initialized = False
+    window = None
+    context = None
+    try:
+        gm.sdl_check(gm.sdl.SDL_Init(gm.SDL_INIT_VIDEO) == 0, "SDL_Init failed")
+        sdl_initialized = True
+        gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
+        gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_MINOR_VERSION, 1)
+        gm.sdl.SDL_GL_SetAttribute(gm.SDL_GL_CONTEXT_PROFILE_MASK, gm.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
+        window = gm.sdl.SDL_CreateWindow(
+            b"gm45_backend", 0, 0, 64, 64, gm.SDL_WINDOW_OPENGL | gm.SDL_WINDOW_HIDDEN
+        )
+        gm.sdl_check(bool(window), "SDL_CreateWindow failed")
+        context = gm.sdl.SDL_GL_CreateContext(window)
+        gm.sdl_check(bool(context), "SDL_GL_CreateContext failed")
+        gm.initialize_context_functions()
 
-    fbo = ctypes.c_uint()
-    gm.glGenFramebuffers(1, ctypes.byref(fbo))
+        fbo = ctypes.c_uint()
+        gm.glGenFramebuffers(1, ctypes.byref(fbo))
+    except Exception:
+        if context:
+            gm.sdl.SDL_GL_DeleteContext(context)
+        if window:
+            gm.sdl.SDL_DestroyWindow(window)
+        if sdl_initialized:
+            gm.sdl.SDL_Quit()
+        raise
     _runtime = _GlRuntime(
         window=window, context=context, fbo=fbo,
         add_programs={}, matmul_programs={}, conv_programs={}, conv_tile_programs={},
@@ -172,6 +188,8 @@ def shutdown() -> None:
     gm.sdl.SDL_DestroyWindow(_runtime.window)
     gm.sdl.SDL_Quit()
     _runtime = None
+    from ... import audit
+    audit.summary()
 
 
 def runtime_required() -> _GlRuntime:

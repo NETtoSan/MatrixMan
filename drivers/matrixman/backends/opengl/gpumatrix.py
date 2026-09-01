@@ -13,16 +13,46 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
+from pathlib import Path
 import sys
 
 import numpy as np
 
 
-def load_library(name: str) -> ctypes.CDLL:
-    path = ctypes.util.find_library(name)
-    if not path:
-        raise RuntimeError(f"could not find {name}")
-    return ctypes.CDLL(path)
+def load_library(name: str):
+    """Load SDL/OpenGL while preserving the historical Unix lookup names."""
+    if os.name != "nt":
+        path = ctypes.util.find_library(name)
+        if not path:
+            raise RuntimeError(f"could not find {name}")
+        return ctypes.CDLL(path)
+
+    if name == "SDL2":
+        repository_root = Path(__file__).resolve().parents[4]
+        candidates = tuple(dict.fromkeys(str(path) for path in (
+            repository_root / "SDL2.dll",
+            Path.cwd().resolve() / "SDL2.dll",
+            ctypes.util.find_library("SDL2"),
+            "SDL2.dll",
+            "SDL2",
+        ) if path))
+        loader = ctypes.CDLL  # SDL's public API uses cdecl.
+    elif name == "GL":
+        candidates = ("opengl32.dll",)
+        loader = ctypes.WinDLL  # OpenGL exports use WINAPI/APIENTRY on Win32.
+    else:
+        candidates = (name,)
+        loader = ctypes.CDLL
+
+    errors = []
+    for candidate in candidates:
+        try:
+            return loader(candidate)
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    detail = "; ".join(errors) if errors else "no candidates"
+    raise RuntimeError(f"could not load {name} on Windows ({detail})")
 
 
 sdl = load_library("SDL2")
@@ -98,7 +128,9 @@ def sdl_check(ok: bool, action: str) -> None:
 def proc(name: str, restype, *argtypes):
     addr = sdl.SDL_GL_GetProcAddress(name.encode("ascii"))
     if addr:
-        return ctypes.CFUNCTYPE(restype, *argtypes)(addr)
+        # GL function pointers use APIENTRY (stdcall on 32-bit Windows).
+        factory = ctypes.WINFUNCTYPE if os.name == "nt" else ctypes.CFUNCTYPE
+        return factory(restype, *argtypes)(addr)
     try:
         return gl_proc(name, restype, *argtypes)
     except AttributeError as exc:
@@ -132,8 +164,7 @@ glTexImage2D = gl_proc(
     ctypes.c_uint,
     ctypes.c_void_p,
 )
-glActiveTexture = gl_proc("glActiveTexture", None, ctypes.c_uint)
-glUseProgram = gl_proc("glUseProgram", None, ctypes.c_uint)
+glActiveTexture = glUseProgram = None
 glBegin = gl_proc("glBegin", None, ctypes.c_uint)
 glEnd = gl_proc("glEnd", None)
 glFlush = gl_proc("glFlush", None)
@@ -153,54 +184,43 @@ glFinish = gl_proc("glFinish", None)
 glDeleteTextures = gl_proc("glDeleteTextures", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))
 glGetError = gl_proc("glGetError", ctypes.c_uint)
 
-glCreateShader = proc("glCreateShader", ctypes.c_uint, ctypes.c_uint)
-glShaderSource = proc(
-    "glShaderSource",
-    None,
-    ctypes.c_uint,
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_char_p),
-    ctypes.POINTER(ctypes.c_int),
-)
-glCompileShader = proc("glCompileShader", None, ctypes.c_uint)
-glGetShaderiv = proc("glGetShaderiv", None, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
-glGetShaderInfoLog = proc(
-    "glGetShaderInfoLog",
-    None,
-    ctypes.c_uint,
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int),
-    ctypes.c_char_p,
-)
-glCreateProgram = proc("glCreateProgram", ctypes.c_uint)
-glAttachShader = proc("glAttachShader", None, ctypes.c_uint, ctypes.c_uint)
-glLinkProgram = proc("glLinkProgram", None, ctypes.c_uint)
-glGetProgramiv = proc("glGetProgramiv", None, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
-glGetProgramInfoLog = proc(
-    "glGetProgramInfoLog",
-    None,
-    ctypes.c_uint,
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int),
-    ctypes.c_char_p,
-)
-glDeleteShader = proc("glDeleteShader", None, ctypes.c_uint)
-glDeleteProgram = proc("glDeleteProgram", None, ctypes.c_uint)
-glGetUniformLocation = proc("glGetUniformLocation", ctypes.c_int, ctypes.c_uint, ctypes.c_char_p)
-glUniform1i = proc("glUniform1i", None, ctypes.c_int, ctypes.c_int)
-glGenFramebuffers = proc("glGenFramebuffers", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))
-glBindFramebuffer = proc("glBindFramebuffer", None, ctypes.c_uint, ctypes.c_uint)
-glFramebufferTexture2D = proc(
-    "glFramebufferTexture2D",
-    None,
-    ctypes.c_uint,
-    ctypes.c_uint,
-    ctypes.c_uint,
-    ctypes.c_uint,
-    ctypes.c_int,
-)
-glCheckFramebufferStatus = proc("glCheckFramebufferStatus", ctypes.c_uint, ctypes.c_uint)
-glDeleteFramebuffers = proc("glDeleteFramebuffers", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))
+glCreateShader = glShaderSource = glCompileShader = glGetShaderiv = None
+glGetShaderInfoLog = glCreateProgram = glAttachShader = glLinkProgram = None
+glGetProgramiv = glGetProgramInfoLog = glDeleteShader = glDeleteProgram = None
+glGetUniformLocation = glUniform1i = glGenFramebuffers = glBindFramebuffer = None
+glFramebufferTexture2D = glCheckFramebufferStatus = glDeleteFramebuffers = None
+
+
+def initialize_context_functions() -> None:
+    """Bind OpenGL 2.x/FBO entry points after an SDL context is current."""
+    global glCreateShader, glShaderSource, glCompileShader, glGetShaderiv
+    global glGetShaderInfoLog, glCreateProgram, glAttachShader, glLinkProgram
+    global glGetProgramiv, glGetProgramInfoLog, glDeleteShader, glDeleteProgram
+    global glActiveTexture, glUseProgram, glGetUniformLocation, glUniform1i
+    global glGenFramebuffers, glBindFramebuffer
+    global glFramebufferTexture2D, glCheckFramebufferStatus, glDeleteFramebuffers
+
+    glCreateShader = proc("glCreateShader", ctypes.c_uint, ctypes.c_uint)
+    glShaderSource = proc("glShaderSource", None, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int))
+    glCompileShader = proc("glCompileShader", None, ctypes.c_uint)
+    glGetShaderiv = proc("glGetShaderiv", None, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
+    glGetShaderInfoLog = proc("glGetShaderInfoLog", None, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p)
+    glCreateProgram = proc("glCreateProgram", ctypes.c_uint)
+    glAttachShader = proc("glAttachShader", None, ctypes.c_uint, ctypes.c_uint)
+    glLinkProgram = proc("glLinkProgram", None, ctypes.c_uint)
+    glGetProgramiv = proc("glGetProgramiv", None, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
+    glGetProgramInfoLog = proc("glGetProgramInfoLog", None, ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p)
+    glDeleteShader = proc("glDeleteShader", None, ctypes.c_uint)
+    glDeleteProgram = proc("glDeleteProgram", None, ctypes.c_uint)
+    glActiveTexture = proc("glActiveTexture", None, ctypes.c_uint)
+    glUseProgram = proc("glUseProgram", None, ctypes.c_uint)
+    glGetUniformLocation = proc("glGetUniformLocation", ctypes.c_int, ctypes.c_uint, ctypes.c_char_p)
+    glUniform1i = proc("glUniform1i", None, ctypes.c_int, ctypes.c_int)
+    glGenFramebuffers = proc("glGenFramebuffers", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))
+    glBindFramebuffer = proc("glBindFramebuffer", None, ctypes.c_uint, ctypes.c_uint)
+    glFramebufferTexture2D = proc("glFramebufferTexture2D", None, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_int)
+    glCheckFramebufferStatus = proc("glCheckFramebufferStatus", ctypes.c_uint, ctypes.c_uint)
+    glDeleteFramebuffers = proc("glDeleteFramebuffers", None, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))
 
 
 VERTEX_SHADER = b"""
@@ -465,11 +485,16 @@ def main() -> int:
 
         context = sdl.SDL_GL_CreateContext(window)
         sdl_check(bool(context), "SDL_GL_CreateContext failed")
+        initialize_context_functions()
 
+        vendor = glGetString(0x1F00)
         renderer = glGetString(0x1F01)
         version = glGetString(0x1F02)
+        glsl = glGetString(0x8B8C)
+        print("OpenGL vendor:  ", vendor.decode() if vendor else "unknown")
         print("OpenGL renderer:", renderer.decode() if renderer else "unknown")
         print("OpenGL version: ", version.decode() if version else "unknown")
+        print("GLSL version:   ", glsl.decode() if glsl else "unknown")
 
         n = 4
         a = np.arange(1, n * n + 1, dtype=np.float32).reshape(n, n)

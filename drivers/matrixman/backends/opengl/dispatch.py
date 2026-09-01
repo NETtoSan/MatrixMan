@@ -181,6 +181,32 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             _trace("  -> GLSL fragment shader write: out = scalar")
             return _render_fill_scalar(args)
 
+        if func is torch.ops.aten.new_full.default:
+            _kernel_log("NewFull")
+            _trace("  -> MatrixMan/OpenGL new_full allocation + scalar fill")
+            if "memory_format" in kwargs and kwargs["memory_format"] is not None:
+                raise RuntimeError("gm45 new_full does not support memory_format")
+            from .factories import new_full_gm45
+
+            return new_full_gm45(
+                args[0],
+                args[1],
+                args[2],
+                dtype=kwargs.get("dtype"),
+                layout=kwargs.get("layout"),
+                device=kwargs.get("device"),
+                pin_memory=kwargs.get("pin_memory"),
+            )
+
+        if func is torch.ops.aten.arange.out:
+            _kernel_log("ArangeOut")
+            _trace("  -> MatrixMan/OpenGL arange shader into provided out tensor")
+            if len(args) != 1 or "out" not in kwargs:
+                raise RuntimeError("gm45 arange.out requires end and out arguments")
+            from .factories import arange_out
+
+            return arange_out(args[0], out=kwargs["out"])
+
         if func is torch.ops.aten.max_pool2d_with_indices.default:
             _kernel_log("MaxPool")
             _trace("  -> MatrixManTensor.__torch_dispatch__")

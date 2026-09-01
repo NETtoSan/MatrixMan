@@ -40,14 +40,18 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
     opengl_available = False
     opengl_backend = None
     opengl_info = {}
+    opengl_probed = False
+    opengl_probe_reason = None
     if requested == "opengl" or cuda_info is None:
+        opengl_probed = True
         try:
             from .backends.opengl.backend import OpenGLBackend
 
             opengl_available = OpenGLBackend.probe()
             opengl_backend = OpenGLBackend
-        except Exception:
+        except Exception as exc:
             opengl_available = False
+            opengl_probe_reason = str(exc) or exc.__class__.__name__
         if opengl_available:
             # Telemetry/classification must not turn a valid context into an
             # unavailable backend. The context probe is the availability test.
@@ -78,11 +82,11 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
             available=opengl_available,
             enabled=True,
             implemented=True,
-            probed=opengl_backend is not None,
+            probed=opengl_probed,
             probe_reason=(
                 "CUDA selected before OpenGL probe"
-                if opengl_backend is None and cuda_info is not None and requested != "opengl"
-                else None
+                if not opengl_probed
+                else opengl_probe_reason
             ),
             backend=opengl_backend,
             device=opengl_info.get("renderer"),

@@ -59,6 +59,23 @@ def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, 
         diagnostics.trace("  Python stack:\n" + stack.rstrip())
     shape = tuple(int(v) for v in size)
     if dtype == torch.uint8 and numel(shape) == 0:
+        from ... import audit
+        audit.record(
+            "allowed_bookkeeping",
+            op="aten.empty.memory_format",
+            shape=shape,
+            dtype=dtype,
+            numel=0,
+            reason="zero-sized framework bookkeeping tensor",
+        )
+        audit.record(
+            "placeholder_metadata",
+            op="aten.empty.memory_format",
+            shape=shape,
+            dtype=dtype,
+            numel=0,
+            reason="zero-sized metadata/index placeholder",
+        )
         diagnostics.trace("gm45.empty -> zero-sized uint8 framework bookkeeping tensor on CPU; no tensor arithmetic")
         return torch.empty(shape, dtype=torch.uint8, device="cpu")
     if dtype not in {None, torch.float32}:
@@ -75,6 +92,39 @@ def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, 
     owner = operation_context.output_texture(shape)
     diagnostics.trace(f"gm45.empty -> allocated texture #{owner.texture} shape={list(shape)}")
     return MatrixManTensor._from_owner(owner, shape)
+
+
+def new_full_gm45(
+    source,
+    size,
+    fill_value,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    """Allocate and scalar-fill a tensor using the source tensor's options."""
+    if not isinstance(source, MatrixManTensor):
+        raise RuntimeError("gm45 new_full requires a MatrixManTensor source")
+    resolved_dtype = source.dtype if dtype is None else dtype
+    resolved_layout = source.layout if layout is None else layout
+    resolved_device = source.device if device is None else device
+    _validate_factory_options(
+        "new_full", resolved_dtype, resolved_layout, resolved_device, bool(pin_memory)
+    )
+    result = empty_gm45(
+        size,
+        dtype=resolved_dtype,
+        layout=resolved_layout,
+        device=resolved_device,
+        pin_memory=bool(pin_memory),
+    )
+    if result.numel() == 0:
+        return result
+    from .ops.concat import _render_fill_scalar
+
+    return _render_fill_scalar((result, fill_value))
 
 
 def arange_program(params: tuple) -> int:
@@ -130,14 +180,27 @@ def _arange_length(start: float, end: float, step: float) -> int:
     return max(0, int(math.ceil((end - start) / step)))
 
 
-def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None) -> MatrixManTensor:
+def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None, out=None) -> MatrixManTensor:
     _validate_factory_options("arange", dtype, layout, device, bool(pin_memory))
     start_f, end_f, step_f = float(start), float(end), float(step)
     length = _arange_length(start_f, end_f, step_f)
     shape = (length,)
+    if out is not None:
+        if not isinstance(out, MatrixManTensor):
+            raise RuntimeError("gm45 arange.out requires a MatrixManTensor out")
+        if out.dtype != torch.float32 or str(out.device) not in {"matrixman", "matrixman:0", "privateuseone", "privateuseone:0"}:
+            raise RuntimeError("gm45 arange.out supports only float32 MatrixManTensor output")
+        if out.layout != torch.strided or not out.is_contiguous() or out._storage_offset != 0:
+            raise RuntimeError("gm45 arange.out requires contiguous strided output with storage_offset=0")
+        if tuple(int(v) for v in out.shape) != shape:
+            raise RuntimeError(
+                f"gm45 arange.out cannot resize output from {list(out.shape)} to {list(shape)}"
+            )
     if length == 0:
+        if out is not None:
+            return out
         return MatrixManTensor._from_owner(_new_zero_element_placeholder(shape), shape)
-    out_owner = operation_context.output_texture(shape)
+    out_owner = out._owner if out is not None else operation_context.output_texture(shape)
     params = (length, start_f, step_f, out_owner.layout.texture_width)
     program = arange_program(params)
     rt = runtime.runtime_required()
@@ -156,6 +219,8 @@ def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin
     err = gm.glGetError()
     if err:
         raise RuntimeError(f"gm45 OpenGL error after arange: 0x{err:04x}")
+    if out is not None:
+        return out
     return MatrixManTensor._from_owner(out_owner, shape)
 
 
@@ -171,6 +236,12 @@ def arange_start_step(start, end, step=1, **kwargs):
     return render_arange(start, end, step, **kwargs)
 
 
+def arange_out(end, *, out):
+    if not isinstance(out, MatrixManTensor):
+        raise RuntimeError("gm45 arange.out requires a MatrixManTensor out")
+    return render_arange(0, end, 1, dtype=out.dtype, layout=out.layout, device=out.device, out=out)
+
+
 def install_privateuse1_factory_kernels() -> None:
     global _aten_privateuse1_lib
     if _aten_privateuse1_lib is not None:
@@ -180,4 +251,5 @@ def install_privateuse1_factory_kernels() -> None:
     lib.impl("arange", arange_default)
     lib.impl("arange.start", arange_start)
     lib.impl("arange.start_step", arange_start_step)
+    lib.impl("arange.out", arange_out)
     _aten_privateuse1_lib = lib
