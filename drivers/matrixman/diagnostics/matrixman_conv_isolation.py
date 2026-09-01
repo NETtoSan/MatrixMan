@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
@@ -35,7 +36,55 @@ def stats(cpu, gpu):
 
 def report(name, cpu, gpu):
     a, b, c = stats(cpu, gpu)
+    cpu_abs, gpu_abs = cpu.abs(), gpu.abs()
+    relative = (gpu - cpu).abs() / torch.maximum(cpu.abs(), torch.tensor(1e-6, dtype=cpu.dtype))
+    useful = cpu.abs() > 1e-6
+    masked = relative[useful]
     print(f"{name}: shape={list(cpu.shape)} max={a:.6g} mean={b:.6g} rmse={c:.6g} allclose={torch.allclose(cpu, gpu, atol=1e-5, rtol=1e-5)}")
+    print(f"  tolerances: default={torch.allclose(cpu, gpu)} rtol=1e-5/atol=1e-6={torch.allclose(cpu, gpu, rtol=1e-5, atol=1e-6)} rtol=1e-4/atol=1e-5={torch.allclose(cpu, gpu, rtol=1e-4, atol=1e-5)} rtol=1e-3/atol=1e-5={torch.allclose(cpu, gpu, rtol=1e-3, atol=1e-5)}")
+    print(f"  magnitudes: CPU abs_max={float(cpu_abs.max()):.6g} abs_mean={float(cpu_abs.mean()):.6g}; GPU abs_max={float(gpu_abs.max()):.6g} abs_mean={float(gpu_abs.mean()):.6g}")
+    if masked.numel():
+        print(f"  relative error (|CPU|>1e-6): max={float(masked.max()):.6g} mean={float(masked.mean()):.6g} samples={masked.numel()}")
+
+
+def shader_order_reference(cpu_input, weight):
+    """Small float32 channel->kernel accumulation reference."""
+    x = cpu_input.numpy()
+    w = weight.numpy()
+    n, cin, h, width = x.shape
+    cout = w.shape[0]
+    result = np.zeros((n, cout, h, width), dtype=np.float32)
+    for batch in range(n):
+        for output_channel in range(cout):
+            for row in range(h):
+                for col in range(width):
+                    acc = np.float32(0.0)
+                    for channel in range(cin):
+                        for ky in range(3):
+                            for kx in range(3):
+                                iy, ix = row + ky - 1, col + kx - 1
+                                if 0 <= iy < h and 0 <= ix < width:
+                                    acc = np.float32(acc + np.float32(x[batch, channel, iy, ix] * w[output_channel, channel, ky, kx]))
+                    result[batch, output_channel, row, col] = acc
+    return torch.from_numpy(result)
+
+
+def simple_case(channels=8):
+    cpu_input = torch.ones((1, channels, 8, 8), dtype=torch.float32)
+    weight = torch.ones((channels, channels, 3, 3), dtype=torch.float32)
+    gpu = gm45.to_device(cpu_input)
+    cpu_out = F.conv2d(cpu_input, weight, None, stride=1, padding=1)
+    gpu_out = F.conv2d(gpu, weight, None, stride=1, padding=1).cpu()
+    center = gpu_out[0, :, 4, 4]
+    print(f"simple all-ones C={channels}: center_expected={9 * channels} center_min={float(center.min()):.6g} center_max={float(center.max()):.6g}")
+    report("  all-ones", cpu_out, gpu_out)
+
+
+def spatial_summary(cpu, gpu, label):
+    error = (gpu - cpu).abs()
+    h, w = error.shape[-2:]
+    regions = {"center": error[..., h // 2, w // 2], "corner": error[..., 0, 0], "border": error[..., 0, 1:-1]}
+    print(f"{label} spatial error: " + ", ".join(f"{key}={float(value.mean()):.6g}" for key, value in regions.items()))
 
 
 def exact_case():
@@ -138,8 +187,13 @@ def synthetic_case(in_channels, out_channels, height, width):
     gpu_input = gm45.to_device(cpu_input)
     cpu_out = F.conv2d(cpu_input, weight, None, stride=1, padding=1)
     gpu_out = F.conv2d(gpu_input, weight, None, stride=1, padding=1).cpu()
-    a, b, c = stats(cpu_out, gpu_out)
-    print(f"synthetic input=[1,{in_channels},{height},{width}] weight=[{out_channels},{in_channels},3,3] output={list(cpu_out.shape)} max={a:.6g} mean={b:.6g} rmse={c:.6g} allclose={torch.allclose(cpu_out, gpu_out, atol=1e-5, rtol=1e-5)}")
+    print(f"synthetic input=[1,{in_channels},{height},{width}] weight=[{out_channels},{in_channels},3,3]")
+    report("  result", cpu_out, gpu_out)
+    if in_channels in {8, 16} and height == 8:
+        shader = shader_order_reference(cpu_input, weight)
+        print(f"  shader-order reference max_abs_to_CPU={stats(cpu_out, shader)[0]:.6g} max_abs_to_MatrixMan={stats(gpu_out, shader)[0]:.6g}")
+    if in_channels in {32, 64} and height == 32:
+        spatial_summary(cpu_out, gpu_out, f"  C={in_channels}")
 
 
 def main():
@@ -154,6 +208,15 @@ def main():
         synthetic_case(in_channels, out_channels, 32, 32)
     for size in (64, 128, 160):
         synthetic_case(64, 64, size, size)
+    print("Shader-order reference check")
+    synthetic_case(8, 8, 8, 8)
+    print("Accumulation-length sweep (16x16)")
+    for channels in (1, 2, 4, 8, 16, 24, 31, 32, 33, 48, 64):
+        synthetic_case(channels, channels, 16, 16)
+    print("Packing-boundary sweep (16x16)")
+    for channels in (15, 16, 17, 31, 32, 33, 63, 64, 65):
+        synthetic_case(channels, channels, 16, 16)
+    simple_case()
     gm45.shutdown()
 
 

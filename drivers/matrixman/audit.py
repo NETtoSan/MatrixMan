@@ -43,9 +43,11 @@ def record(category: str, *, op: str | None = None, tensor=None, shape=None,
         itemsize = getattr(dtype, "itemsize", None)
         if itemsize:
             _bytes[category] += numel * int(itemsize)
-    warning = category == "unexpected_cpu_materialization"
-    prefix = "[MatrixMan/AUDIT][WARNING]" if warning else "[MatrixMan/AUDIT]"
-    print(f"{prefix} category={category}")
+    warning = category == "unexpected_cpu_materialization" or (cpu_arithmetic and numel > 0)
+    prefix = "[MatrixMan/Audit][WARNING]" if warning else "[MatrixMan/Audit]"
+    print(f"{prefix} {category}")
+    if not warning:
+        return
     print(f"  op={op or 'unknown'}")
     print(f"  shape={shape}")
     print(f"  dtype={dtype or 'unknown'}")
@@ -57,7 +59,7 @@ def record(category: str, *, op: str | None = None, tensor=None, shape=None,
     for line in traceback.format_stack(limit=6)[:-1]:
         print("  " + line.rstrip())
     if cpu_arithmetic and numel > 0:
-        print("[MatrixMan/AUDIT][WARNING] nonzero CPU arithmetic observed on MatrixMan-originating data")
+        print("  warning_detail=nonzero CPU arithmetic observed on MatrixMan-originating data")
 
 
 def summary() -> None:

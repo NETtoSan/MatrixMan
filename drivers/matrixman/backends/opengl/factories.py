@@ -50,15 +50,9 @@ def _validate_factory_options(op_name: str, dtype, layout, device, pin_memory) -
 
 def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, memory_format=None):
     del memory_format
-    diagnostics.trace(
-        "gm45.empty request:\n"
-        f"  size={list(size)} dtype={dtype} layout={layout} device={device} pin_memory={pin_memory}"
-    )
-    if diagnostics.debug_enabled():
-        stack = "".join(traceback.format_stack(limit=12))
-        diagnostics.trace("  Python stack:\n" + stack.rstrip())
     shape = tuple(int(v) for v in size)
-    if dtype == torch.uint8 and numel(shape) == 0:
+    known_bookkeeping = dtype == torch.uint8 and numel(shape) == 0
+    if known_bookkeeping:
         from ... import audit
         audit.record(
             "allowed_bookkeeping",
@@ -76,8 +70,15 @@ def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, 
             numel=0,
             reason="zero-sized metadata/index placeholder",
         )
-        diagnostics.trace("gm45.empty -> zero-sized uint8 framework bookkeeping tensor on CPU; no tensor arithmetic")
         return torch.empty(shape, dtype=torch.uint8, device="cpu")
+
+    diagnostics.trace(
+        "gm45.empty request:\n"
+        f"  size={list(size)} dtype={dtype} layout={layout} device={device} pin_memory={pin_memory}"
+    )
+    if diagnostics.debug_enabled():
+        stack = "".join(traceback.format_stack(limit=12))
+        diagnostics.trace("  Python stack:\n" + stack.rstrip())
     if dtype not in {None, torch.float32}:
         raise RuntimeError(f"gm45 empty supports only float32, got {dtype}")
     if layout not in {None, torch.strided}:
