@@ -928,7 +928,6 @@ DONE:
     ld.param.u32 %r16, [p_groups];
     cvt.s32.u32 %s6, %r3;
     cvt.s32.u32 %s7, %r4;
-
     // Legacy NVIDIA 390 JIT requires explicit special-register reads.
     mov.u32 %r17, %ctaid.x;
     mov.u32 %r18, %ntid.x;
@@ -1180,7 +1179,7 @@ ONE_BY_ONE_DONE:
     ret;
 }
 
-.visible .entry conv2d_3x3_s1_p1_c64(
+.visible .entry conv2d_3x3_s1_p1_c64_plane_legacy(
     .param .u64 p_input,
     .param .u64 p_weight,
     .param .u64 p_bias,
@@ -1358,6 +1357,1714 @@ FAST_STORE:
 FAST_DONE:
     ret;
 }
+
+.visible .entry conv2d_3x3_s1_p1_c8_c64_plane(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 8 * 3 * 3 = 72 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+C8C64_LOAD:
+    setp.ge.u32 %p0, %r22, 72;
+    @%p0 bra C8C64_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 72;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra C8C64_LOAD;
+C8C64_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+C8C64_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra C8C64_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra C8C64_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra C8C64_BIAS_DONE;
+C8C64_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+C8C64_BIAS_DONE:
+    mov.u32 %r29, 0;
+C8C64_IC:
+    setp.ge.u32 %p3, %r29, 8;
+    @%p3 bra C8C64_STORE;
+    mov.u32 %r30, 0;
+C8C64_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra C8C64_NEXT_IC;
+    mov.u32 %r31, 0;
+C8C64_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra C8C64_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 8 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+C8C64_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra C8C64_KX;
+C8C64_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra C8C64_KY;
+C8C64_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra C8C64_IC;
+C8C64_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra C8C64_SPATIAL;
+C8C64_DONE:
+    ret;
+}
+
+.visible .entry conv2d_3x3_s1_p1_small_c8(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 8 * 3 * 3 = 72 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+SMALLC8_LOAD:
+    setp.ge.u32 %p0, %r22, 72;
+    @%p0 bra SMALLC8_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 72;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra SMALLC8_LOAD;
+SMALLC8_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+SMALLC8_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra SMALLC8_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra SMALLC8_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra SMALLC8_BIAS_DONE;
+SMALLC8_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+SMALLC8_BIAS_DONE:
+    mov.u32 %r29, 0;
+SMALLC8_IC:
+    setp.ge.u32 %p3, %r29, 8;
+    @%p3 bra SMALLC8_STORE;
+    mov.u32 %r30, 0;
+SMALLC8_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra SMALLC8_NEXT_IC;
+    mov.u32 %r31, 0;
+SMALLC8_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra SMALLC8_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 8 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+SMALLC8_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra SMALLC8_KX;
+SMALLC8_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra SMALLC8_KY;
+SMALLC8_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra SMALLC8_IC;
+SMALLC8_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra SMALLC8_SPATIAL;
+SMALLC8_DONE:
+    ret;
+}
+
+.visible .entry conv2d_3x3_s1_p1_small_c10(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 10 * 3 * 3 = 90 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+SMALLC10_LOAD:
+    setp.ge.u32 %p0, %r22, 90;
+    @%p0 bra SMALLC10_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 90;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra SMALLC10_LOAD;
+SMALLC10_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+SMALLC10_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra SMALLC10_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra SMALLC10_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra SMALLC10_BIAS_DONE;
+SMALLC10_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+SMALLC10_BIAS_DONE:
+    mov.u32 %r29, 0;
+SMALLC10_IC:
+    setp.ge.u32 %p3, %r29, 10;
+    @%p3 bra SMALLC10_STORE;
+    mov.u32 %r30, 0;
+SMALLC10_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra SMALLC10_NEXT_IC;
+    mov.u32 %r31, 0;
+SMALLC10_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra SMALLC10_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 8 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+SMALLC10_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra SMALLC10_KX;
+SMALLC10_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra SMALLC10_KY;
+SMALLC10_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra SMALLC10_IC;
+SMALLC10_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra SMALLC10_SPATIAL;
+SMALLC10_DONE:
+    ret;
+}
+
+
+
+.visible .entry conv2d_3x3_s1_p1_small_c12(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 12 * 3 * 3 = 108 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+SMALLC12_LOAD:
+    setp.ge.u32 %p0, %r22, 108;
+    @%p0 bra SMALLC12_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 108;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra SMALLC12_LOAD;
+SMALLC12_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+SMALLC12_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra SMALLC12_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra SMALLC12_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra SMALLC12_BIAS_DONE;
+SMALLC12_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+SMALLC12_BIAS_DONE:
+    mov.u32 %r29, 0;
+SMALLC12_IC:
+    setp.ge.u32 %p3, %r29, 12;
+    @%p3 bra SMALLC12_STORE;
+    mov.u32 %r30, 0;
+SMALLC12_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra SMALLC12_NEXT_IC;
+    mov.u32 %r31, 0;
+SMALLC12_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra SMALLC12_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 8 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+SMALLC12_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra SMALLC12_KX;
+SMALLC12_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra SMALLC12_KY;
+SMALLC12_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra SMALLC12_IC;
+SMALLC12_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra SMALLC12_SPATIAL;
+SMALLC12_DONE:
+    ret;
+}
+
+
+
+.visible .entry conv2d_3x3_s1_p1_small_c24(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 24 * 3 * 3 = 216 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+SMALLC24_LOAD:
+    setp.ge.u32 %p0, %r22, 216;
+    @%p0 bra SMALLC24_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 216;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra SMALLC24_LOAD;
+SMALLC24_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+SMALLC24_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra SMALLC24_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra SMALLC24_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra SMALLC24_BIAS_DONE;
+SMALLC24_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+SMALLC24_BIAS_DONE:
+    mov.u32 %r29, 0;
+SMALLC24_IC:
+    setp.ge.u32 %p3, %r29, 24;
+    @%p3 bra SMALLC24_STORE;
+    mov.u32 %r30, 0;
+SMALLC24_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra SMALLC24_NEXT_IC;
+    mov.u32 %r31, 0;
+SMALLC24_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra SMALLC24_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 8 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 8;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+SMALLC24_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra SMALLC24_KX;
+SMALLC24_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra SMALLC24_KY;
+SMALLC24_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra SMALLC24_IC;
+SMALLC24_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra SMALLC24_SPATIAL;
+SMALLC24_DONE:
+    ret;
+}
+
+
+.visible .entry conv2d_3x3_s1_p1_c24_c64_plane(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 24 * 3 * 3 = 216 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+C24C64_LOAD:
+    setp.ge.u32 %p0, %r22, 216;
+    @%p0 bra C24C64_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 216;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra C24C64_LOAD;
+C24C64_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+C24C64_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra C24C64_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra C24C64_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra C24C64_BIAS_DONE;
+C24C64_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+C24C64_BIAS_DONE:
+    mov.u32 %r29, 0;
+C24C64_IC:
+    setp.ge.u32 %p3, %r29, 24;
+    @%p3 bra C24C64_STORE;
+    mov.u32 %r30, 0;
+C24C64_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra C24C64_NEXT_IC;
+    mov.u32 %r31, 0;
+C24C64_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra C24C64_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 24 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 24;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 24;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+C24C64_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra C24C64_KX;
+C24C64_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra C24C64_KY;
+C24C64_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra C24C64_IC;
+C24C64_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra C24C64_SPATIAL;
+C24C64_DONE:
+    ret;
+}
+
+
+.visible .entry conv2d_3x3_s1_p1_c48_c64_plane(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    // One output channel needs only 48 * 3 * 3 = 432 weights.
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+C48C64_LOAD:
+    setp.ge.u32 %p0, %r22, 432;
+    @%p0 bra C48C64_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 432;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra C48C64_LOAD;
+C48C64_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+C48C64_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra C48C64_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra C48C64_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra C48C64_BIAS_DONE;
+C48C64_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+C48C64_BIAS_DONE:
+    mov.u32 %r29, 0;
+C48C64_IC:
+    setp.ge.u32 %p3, %r29, 48;
+    @%p3 bra C48C64_STORE;
+    mov.u32 %r30, 0;
+C48C64_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra C48C64_NEXT_IC;
+    mov.u32 %r31, 0;
+C48C64_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra C48C64_NEXT_KY;
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    mul.lo.u32 %r33, %r32, 4;
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    // Input index: ((n * 48 + ic) * H + iy) * W + ix.
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r36, %r20, 48;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r36, %r20, 48;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    add.u32 %r36, %r36, %r34;
+    mul.lo.u32 %r36, %r36, %r4;
+    add.u32 %r36, %r36, %r35;
+    mul.wide.u32 %rd5, %r36, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+C48C64_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra C48C64_KX;
+C48C64_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra C48C64_KY;
+C48C64_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra C48C64_IC;
+C48C64_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra C48C64_SPATIAL;
+C48C64_DONE:
+    ret;
+}
+
+
+.visible .entry conv2d_3x3_s1_p1_c64_plane(
+    .param .u64 p_input,
+    .param .u64 p_weight,
+    .param .u64 p_bias,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_k,
+    .param .u32 p_r,
+    .param .u32 p_s,
+    .param .u32 p_out_h,
+    .param .u32 p_out_w,
+    .param .u32 p_stride_h,
+    .param .u32 p_stride_w,
+    .param .u32 p_pad_h,
+    .param .u32 p_pad_w,
+    .param .u32 p_dil_h,
+    .param .u32 p_dil_w,
+    .param .u32 p_groups
+)
+{
+    .reg .pred %p<8>;
+    .reg .u32 %r<48>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_weight];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u64 %rd4, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_c];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_k];
+    ld.param.u32 %r8, [p_out_h];
+    ld.param.u32 %r9, [p_out_w];
+    cvt.s32.u32 %s6, %r3;
+    cvt.s32.u32 %s7, %r4;
+    // A block owns one output-channel plane.  Each thread owns two spatial
+    // positions separated by one block, preserving the existing 128-thread
+    // plane mapping while sharing each staged weight between two outputs.
+    mov.u32 %r17, %ctaid.x;
+    mov.u32 %r18, %ntid.x;
+    mov.u32 %r19, %tid.x;
+    div.u32 %r20, %r17, %r5;
+    rem.u32 %r21, %r17, %r5;
+
+    mov.u64 %rd7, conv3x3_weights;
+    cvta.to.shared.u64 %rd8, %rd7;
+    cvt.u32.u64 %r42, %rd8;
+    mov.u32 %r22, %r19;
+PLANE2_LOAD:
+    setp.ge.u32 %p0, %r22, 576;
+    @%p0 bra PLANE2_LOAD_DONE;
+    mul.lo.u32 %r23, %r21, 576;
+    add.u32 %r23, %r23, %r22;
+    mul.wide.u32 %rd5, %r23, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.lo.u32 %r34, %r22, 4;
+    add.u32 %r35, %r42, %r34;
+    st.shared.f32 [%r35], %f1;
+    add.u32 %r22, %r22, %r18;
+    bra PLANE2_LOAD;
+PLANE2_LOAD_DONE:
+    bar.sync 0;
+
+    mul.lo.u32 %r22, %r8, %r9;
+    mov.u32 %r23, %r19;
+PLANE2_SPATIAL:
+    setp.ge.u32 %p1, %r23, %r22;
+    @%p1 bra PLANE2_DONE;
+    add.u32 %r24, %r23, %r18;
+    setp.lt.u32 %p2, %r24, %r22;
+    div.u32 %r25, %r23, %r9;
+    rem.u32 %r26, %r23, %r9;
+    div.u32 %r27, %r24, %r9;
+    rem.u32 %r28, %r24, %r9;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    setp.eq.u64 %p0, %rd3, 0;
+    @%p0 bra PLANE2_NO_BIAS;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd8, %rd3, %rd6;
+    ld.global.f32 %f0, [%rd8];
+    mov.f32 %f5, %f0;
+    bra PLANE2_BIAS_DONE;
+PLANE2_NO_BIAS:
+    mov.f32 %f0, 0.0;
+    mov.f32 %f5, 0.0;
+PLANE2_BIAS_DONE:
+    mov.u32 %r29, 0;
+PLANE2_IC:
+    setp.ge.u32 %p3, %r29, 64;
+    @%p3 bra PLANE2_STORE;
+    // Compute the base of this input-channel plane once.  Both spatial
+    // accumulators reuse it for every kernel point.
+    mul.lo.u32 %r36, %r20, 64;
+    add.u32 %r36, %r36, %r29;
+    mul.lo.u32 %r36, %r36, %r3;
+    mul.lo.u32 %r36, %r36, %r4;
+    mov.u32 %r30, 0;
+PLANE2_KY:
+    setp.ge.u32 %p4, %r30, 3;
+    @%p4 bra PLANE2_NEXT_IC;
+    mov.u32 %r31, 0;
+PLANE2_KX:
+    setp.ge.u32 %p5, %r31, 3;
+    @%p5 bra PLANE2_NEXT_KY;
+
+    // p6 is output-0 validity; p7 is output-1 validity.  Predication keeps
+    // out-of-range edge and corner loads from touching global memory.
+    setp.ge.s32 %p6, %s0, 0;
+    setp.lt.s32 %p7, %s0, %s6;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s1, 0;
+    setp.lt.s32 %p4, %s1, %s7;
+    and.pred %p7, %p7, %p4;
+    and.pred %p6, %p6, %p7;
+    setp.ge.s32 %p7, %s2, 0;
+    setp.lt.s32 %p4, %s2, %s6;
+    and.pred %p7, %p7, %p4;
+    setp.ge.s32 %p4, %s3, 0;
+    setp.lt.s32 %p5, %s3, %s7;
+    and.pred %p4, %p4, %p5;
+    and.pred %p7, %p7, %p4;
+
+    mul.lo.u32 %r32, %r29, 9;
+    mul.lo.u32 %r33, %r30, 3;
+    add.u32 %r32, %r32, %r33;
+    add.u32 %r32, %r32, %r31;
+    // Load the shared weight once and use it for both spatial outputs.
+    mul.lo.u32 %r34, %r32, 4;
+    add.u32 %r35, %r42, %r34;
+    ld.shared.f32 %f1, [%r35];
+
+    cvt.u32.s32 %r34, %s0;
+    cvt.u32.s32 %r35, %s1;
+    mul.lo.u32 %r37, %r34, %r4;
+    add.u32 %r37, %r37, %r35;
+    add.u32 %r37, %r37, %r36;
+    mul.wide.u32 %rd5, %r37, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p6 ld.global.f32 %f2, [%rd6];
+    @%p6 mul.f32 %f4, %f2, %f1;
+    @%p6 add.f32 %f0, %f0, %f4;
+
+    cvt.u32.s32 %r34, %s2;
+    cvt.u32.s32 %r35, %s3;
+    mul.lo.u32 %r37, %r34, %r4;
+    add.u32 %r37, %r37, %r35;
+    add.u32 %r37, %r37, %r36;
+    mul.wide.u32 %rd5, %r37, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    @%p7 ld.global.f32 %f2, [%rd6];
+    @%p7 mul.f32 %f4, %f2, %f1;
+    @%p7 add.f32 %f5, %f5, %f4;
+PLANE2_NEXT_KX:
+    add.u32 %r31, %r31, 1;
+    add.s32 %s1, %s1, 1;
+    add.s32 %s3, %s3, 1;
+    bra PLANE2_KX;
+PLANE2_NEXT_KY:
+    mov.u32 %r31, 0;
+    add.u32 %r30, %r30, 1;
+    sub.s32 %s1, %s1, 3;
+    sub.s32 %s3, %s3, 3;
+    add.s32 %s0, %s0, 1;
+    add.s32 %s2, %s2, 1;
+    bra PLANE2_KY;
+PLANE2_NEXT_IC:
+    mov.u32 %r30, 0;
+    cvt.s32.u32 %s0, %r25;
+    sub.s32 %s0, %s0, 1;
+    cvt.s32.u32 %s1, %r26;
+    sub.s32 %s1, %s1, 1;
+    cvt.s32.u32 %s2, %r27;
+    sub.s32 %s2, %s2, 1;
+    cvt.s32.u32 %s3, %r28;
+    sub.s32 %s3, %s3, 1;
+    add.u32 %r29, %r29, 1;
+    bra PLANE2_IC;
+PLANE2_STORE:
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r25;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r26;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    st.global.f32 [%rd6], %f0;
+    mul.lo.u32 %r32, %r20, %r5;
+    add.u32 %r32, %r32, %r21;
+    mul.lo.u32 %r32, %r32, %r8;
+    add.u32 %r32, %r32, %r27;
+    mul.lo.u32 %r32, %r32, %r9;
+    add.u32 %r32, %r32, %r28;
+    mul.wide.u32 %rd5, %r32, 4;
+    add.u64 %rd6, %rd4, %rd5;
+    @%p2 st.global.f32 [%rd6], %f5;
+    add.u32 %r23, %r23, 256;
+    bra PLANE2_SPATIAL;
+PLANE2_DONE:
+    ret;
+}
+
 
 .visible .entry conv2d_3x3_s1_p1_c64_spatial(
     .param .u64 p_input,
@@ -2023,7 +3730,12 @@ class CudaExecutionBackend:
                 "matrix_mul_elementwise, matrix_arange, matrix_add_scalar, "
                 "matrix_div_scalar, matrix_sigmoid, stack_copy, matrix_fill, "
                 "matrix_softmax, matrix_mul, conv2d_nchw, "
-                "conv2d_3x3_s1_p1_c64, conv2d_3x3_s1_p1_c64_spatial, "
+                "conv2d_3x3_s1_p1_c64_plane_legacy, conv2d_3x3_s1_p1_c64_plane, "
+                "conv2d_3x3_s1_p1_c8_c64_plane, conv2d_3x3_s1_p1_small_c8, "
+                "conv2d_3x3_s1_p1_c24_c64_plane, conv2d_3x3_s1_p1_c48_c64_plane, "
+                "conv2d_3x3_s1_p1_small_c10, conv2d_3x3_s1_p1_small_c12, "
+                "conv2d_3x3_s1_p1_small_c24, "
+                "conv2d_3x3_s1_p1_c64_spatial, "
                 "conv2d_1x1_s1_c64, batch_norm_inference, silu, "
                 "split_copy, cat_copy, upsample_nearest2d"
             )
@@ -2067,7 +3779,15 @@ class CudaExecutionBackend:
             self.softmax_function = CUfunction()
             self.matmul_function = CUfunction()
             self.convolution_function = CUfunction()
-            self.convolution_fast_function = CUfunction()
+            self.convolution_plane_legacy_function = CUfunction()
+            self.convolution_plane_function = CUfunction()
+            self.convolution_c8_c64_plane_function = CUfunction()
+            self.convolution_small_c8_function = CUfunction()
+            self.convolution_small_c10_function = CUfunction()
+            self.convolution_small_c12_function = CUfunction()
+            self.convolution_small_c24_function = CUfunction()
+            self.convolution_c24_c64_plane_function = CUfunction()
+            self.convolution_c48_c64_plane_function = CUfunction()
             self.convolution_spatial_function = CUfunction()
             self.convolution_1x1_function = CUfunction()
             self.batch_norm_function = CUfunction()
@@ -2087,7 +3807,15 @@ class CudaExecutionBackend:
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.softmax_function), self.module, b"matrix_softmax"), "get matrix_softmax")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.matmul_function), self.module, b"matrix_mul"), "get matrix_mul")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_function), self.module, b"conv2d_nchw"), "get conv2d_nchw")
-            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_fast_function), self.module, b"conv2d_3x3_s1_p1_c64"), "get conv2d_3x3_s1_p1_c64")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_plane_legacy_function), self.module, b"conv2d_3x3_s1_p1_c64_plane_legacy"), "get conv2d_3x3_s1_p1_c64_plane_legacy")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_plane_function), self.module, b"conv2d_3x3_s1_p1_c64_plane"), "get conv2d_3x3_s1_p1_c64_plane")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_c8_c64_plane_function), self.module, b"conv2d_3x3_s1_p1_c8_c64_plane"), "get conv2d_3x3_s1_p1_c8_c64_plane")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_small_c8_function), self.module, b"conv2d_3x3_s1_p1_small_c8"), "get conv2d_3x3_s1_p1_small_c8")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_small_c10_function), self.module, b"conv2d_3x3_s1_p1_small_c10"), "get conv2d_3x3_s1_p1_small_c10")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_small_c12_function), self.module, b"conv2d_3x3_s1_p1_small_c12"), "get conv2d_3x3_s1_p1_small_c12")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_small_c24_function), self.module, b"conv2d_3x3_s1_p1_small_c24"), "get conv2d_3x3_s1_p1_small_c24")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_c24_c64_plane_function), self.module, b"conv2d_3x3_s1_p1_c24_c64_plane"), "get conv2d_3x3_s1_p1_c24_c64_plane")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_c48_c64_plane_function), self.module, b"conv2d_3x3_s1_p1_c48_c64_plane"), "get conv2d_3x3_s1_p1_c48_c64_plane")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_spatial_function), self.module, b"conv2d_3x3_s1_p1_c64_spatial"), "get conv2d_3x3_s1_p1_c64_spatial")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_function), self.module, b"conv2d_1x1_s1_c64"), "get conv2d_1x1_s1_c64")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.batch_norm_function), self.module, b"batch_norm_inference"), "get batch_norm_inference")
@@ -2108,7 +3836,15 @@ class CudaExecutionBackend:
                 id(self.softmax_function): "Softmax",
                 id(self.matmul_function): "MatMul",
                 id(self.convolution_function): "Conv2D",
-                id(self.convolution_fast_function): "Conv2D",
+                id(self.convolution_plane_legacy_function): "Conv2D",
+                id(self.convolution_plane_function): "Conv2D",
+                id(self.convolution_c8_c64_plane_function): "Conv2D",
+                id(self.convolution_small_c8_function): "Conv2D",
+                id(self.convolution_small_c10_function): "Conv2D",
+                id(self.convolution_small_c12_function): "Conv2D",
+                id(self.convolution_small_c24_function): "Conv2D",
+                id(self.convolution_c24_c64_plane_function): "Conv2D",
+                id(self.convolution_c48_c64_plane_function): "Conv2D",
                 id(self.convolution_spatial_function): "Conv2D",
                 id(self.convolution_1x1_function): "Conv2D",
                 id(self.batch_norm_function): "BatchNorm",
@@ -2469,11 +4205,33 @@ class CudaExecutionBackend:
         specialized: bool = False,
         specialized_1x1: bool = False,
         specialized_3x3_spatial: bool = False,
+        specialized_3x3_plane: bool = False,
+        specialized_3x3_c8_c64_plane: bool = False,
+        specialized_3x3_small_c8: bool = False,
+        specialized_3x3_small_c10: bool = False,
+        specialized_3x3_small_c12: bool = False,
+        specialized_3x3_small_c24: bool = False,
+        specialized_3x3_c24_c64_plane: bool = False,
+        specialized_3x3_c48_c64_plane: bool = False,
+        specialized_3x3_plane_legacy: bool = False,
     ) -> None:
-        if (specialized or specialized_1x1 or specialized_3x3_spatial) and _specialized_conv_disabled():
+        # ``specialized=True`` remains a compatibility alias for the original
+        # plane kernel; new callers use the explicit legacy name.
+        specialized_3x3_plane_legacy = specialized_3x3_plane_legacy or specialized
+        specialized = False
+        if (specialized_3x3_plane_legacy or specialized_1x1 or specialized_3x3_spatial or specialized_3x3_plane or specialized_3x3_c8_c64_plane or specialized_3x3_small_c8 or specialized_3x3_small_c10 or specialized_3x3_small_c12 or specialized_3x3_small_c24 or specialized_3x3_c24_c64_plane or specialized_3x3_c48_c64_plane) and _specialized_conv_disabled():
             specialized = False
             specialized_1x1 = False
             specialized_3x3_spatial = False
+            specialized_3x3_plane = False
+            specialized_3x3_c8_c64_plane = False
+            specialized_3x3_small_c8 = False
+            specialized_3x3_small_c10 = False
+            specialized_3x3_small_c12 = False
+            specialized_3x3_small_c24 = False
+            specialized_3x3_c24_c64_plane = False
+            specialized_3x3_c48_c64_plane = False
+            specialized_3x3_plane_legacy = False
         dimensions = (n, c, h, w, k, r, s, out_h, out_w)
         if min(dimensions) <= 0:
             raise ValueError("convolution dimensions must be positive")
@@ -2481,13 +4239,13 @@ class CudaExecutionBackend:
             raise ValueError("convolution stride and dilation must be positive")
         if groups <= 0 or c % groups or k % groups:
             raise ValueError("convolution groups must divide input and output channels")
-        if specialized and not (
+        if specialized_3x3_plane_legacy and not (
             c == 64 and k == 64 and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
             and pad_h == 1 and pad_w == 1
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         ):
-            raise ValueError("invalid specialized 3x3 Conv2D configuration")
+            raise ValueError("invalid legacy specialized 3x3 Conv2D configuration")
         if specialized_1x1 and not (
             n == 1 and c == 64 and k == 64 and r == 1 and s == 1
             and stride_h == 1 and stride_w == 1
@@ -2502,7 +4260,52 @@ class CudaExecutionBackend:
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         ):
             raise ValueError("invalid spatial specialized 3x3 Conv2D configuration")
-        if sum(bool(value) for value in (specialized, specialized_1x1, specialized_3x3_spatial)) > 1:
+        if specialized_3x3_plane and not (
+            c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid plane specialized 3x3 Conv2D configuration")
+        if specialized_3x3_c8_c64_plane and not (
+            n == 1 and c == 8 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid c8/c64 plane specialized 3x3 Conv2D configuration")
+        for flag, input_channels in (
+            (specialized_3x3_c24_c64_plane, 24),
+            (specialized_3x3_c48_c64_plane, 48),
+        ):
+            if flag and not (
+                n == 1 and c == input_channels and k == 64 and r == 3 and s == 3
+                and stride_h == 1 and stride_w == 1
+                and pad_h == 1 and pad_w == 1
+                and dilation_h == 1 and dilation_w == 1 and groups == 1
+            ):
+                raise ValueError("invalid fixed-Cin plane specialized 3x3 Conv2D configuration")
+        if specialized_3x3_small_c8 and not (
+            n == 1 and c == 8 and k == 8 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        ):
+            raise ValueError("invalid small c8 specialized 3x3 Conv2D configuration")
+        for flag, channels in (
+            (specialized_3x3_small_c10, 10),
+            (specialized_3x3_small_c12, 12),
+            (specialized_3x3_small_c24, 24),
+        ):
+            if flag and not (
+                n == 1 and c == channels and k == channels
+                and r == 3 and s == 3
+                and stride_h == 1 and stride_w == 1
+                and pad_h == 1 and pad_w == 1
+                and dilation_h == 1 and dilation_w == 1 and groups == 1
+            ):
+                raise ValueError("invalid small-channel specialized 3x3 Conv2D configuration")
+        if sum(bool(value) for value in (specialized_3x3_plane_legacy, specialized_1x1, specialized_3x3_spatial, specialized_3x3_plane, specialized_3x3_c8_c64_plane, specialized_3x3_small_c8, specialized_3x3_small_c10, specialized_3x3_small_c12, specialized_3x3_small_c24, specialized_3x3_c24_c64_plane, specialized_3x3_c48_c64_plane)) > 1:
             raise ValueError("multiple specialized Conv2D paths requested")
         profile_signature = (
             (
@@ -2524,12 +4327,35 @@ class CudaExecutionBackend:
                 f"dilation_h/w={dilation_h}/{dilation_w}, groups={groups}, "
                 f"total_outputs={total_outputs}"
             )
-        fast_path = specialized or specialized_1x1 or specialized_3x3_spatial
+        fast_path = (
+            specialized_3x3_plane_legacy or specialized_1x1 or specialized_3x3_spatial
+            or specialized_3x3_plane or specialized_3x3_c8_c64_plane
+            or specialized_3x3_small_c8
+            or specialized_3x3_small_c10 or specialized_3x3_small_c12
+            or specialized_3x3_small_c24
+            or specialized_3x3_c24_c64_plane or specialized_3x3_c48_c64_plane
+        )
         function = (
-            self.convolution_fast_function
-            if specialized
+            self.convolution_plane_legacy_function
+            if specialized_3x3_plane_legacy
             else self.convolution_1x1_function
             if specialized_1x1
+            else self.convolution_plane_function
+            if specialized_3x3_plane
+            else self.convolution_c8_c64_plane_function
+            if specialized_3x3_c8_c64_plane
+            else self.convolution_small_c8_function
+            if specialized_3x3_small_c8
+            else self.convolution_small_c10_function
+            if specialized_3x3_small_c10
+            else self.convolution_small_c12_function
+            if specialized_3x3_small_c12
+            else self.convolution_small_c24_function
+            if specialized_3x3_small_c24
+            else self.convolution_c24_c64_plane_function
+            if specialized_3x3_c24_c64_plane
+            else self.convolution_c48_c64_plane_function
+            if specialized_3x3_c48_c64_plane
             else self.convolution_spatial_function
             if specialized_3x3_spatial
             else self.convolution_function
@@ -2558,9 +4384,17 @@ class CudaExecutionBackend:
             ),
             profile_signature=profile_signature,
             profile_variant=(
-                "specialized-3x3" if specialized
+                "specialized-3x3-plane-legacy" if specialized_3x3_plane_legacy
                 else "specialized-1x1-c64" if specialized_1x1
                 else "specialized-3x3-spatial" if specialized_3x3_spatial
+                else "specialized-3x3-plane" if specialized_3x3_plane
+                else "specialized-3x3-c8-c64-plane" if specialized_3x3_c8_c64_plane
+                else "specialized-3x3-small-c8" if specialized_3x3_small_c8
+                else "specialized-3x3-small-c10" if specialized_3x3_small_c10
+                else "specialized-3x3-small-c12" if specialized_3x3_small_c12
+                else "specialized-3x3-small-c24" if specialized_3x3_small_c24
+                else "specialized-3x3-c24-c64-plane" if specialized_3x3_c24_c64_plane
+                else "specialized-3x3-c48-c64-plane" if specialized_3x3_c48_c64_plane
                 else "generic"
             ),
         )

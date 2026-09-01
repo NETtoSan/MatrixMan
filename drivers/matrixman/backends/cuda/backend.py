@@ -228,12 +228,12 @@ class CudaBackend(Backend):
         disable_specialized = os.environ.get(
             "MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV", ""
         ).strip().lower() not in {"", "0", "false", "no", "off"}
-        spatial_3x3 = os.environ.get(
+        conv3x3_variant = os.environ.get(
             "MATRIXMAN_CUDA_CONV3X3_VARIANT", "plane"
-        ).strip().lower() == "spatial"
-        specialized_3x3 = (
+        ).strip().lower()
+        specialized_3x3_plane_legacy = (
             not disable_specialized and
-            not spatial_3x3 and
+            conv3x3_variant == "plane_legacy" and
             c == 64 and k == 64 and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
             and pad_h == 1 and pad_w == 1
@@ -248,8 +248,70 @@ class CudaBackend(Backend):
         )
         specialized_3x3_spatial = (
             not disable_specialized and
-            spatial_3x3 and
+            conv3x3_variant == "spatial" and
             c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_plane = (
+            not disable_specialized and
+            conv3x3_variant in {"", "plane"} and
+            c == 64 and k == 64 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_c8_c64_plane = (
+            not disable_specialized and
+            n == 1 and c == 8 and k == 64 and h == 80 and w == 80
+            and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_small_c8 = (
+            not disable_specialized and
+            input_tensor.is_contiguous() and
+            c == 8 and k == 8
+            and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_small_c10 = (
+            not disable_specialized and input_tensor.is_contiguous()
+            and c == 10 and k == 10 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_small_c12 = (
+            not disable_specialized and input_tensor.is_contiguous()
+            and c == 12 and k == 12 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_small_c24 = (
+            not disable_specialized and input_tensor.is_contiguous()
+            and c == 24 and k == 24 and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_c24_c64_plane = (
+            not disable_specialized and
+            n == 1 and c == 24 and k == 64 and h == 40 and w == 40
+            and r == 3 and s == 3
+            and stride_h == 1 and stride_w == 1
+            and pad_h == 1 and pad_w == 1
+            and dilation_h == 1 and dilation_w == 1 and groups == 1
+        )
+        specialized_3x3_c48_c64_plane = (
+            not disable_specialized and
+            n == 1 and c == 48 and k == 64 and h == 20 and w == 20
+            and r == 3 and s == 3
             and stride_h == 1 and stride_w == 1
             and pad_h == 1 and pad_w == 1
             and dilation_h == 1 and dilation_w == 1 and groups == 1
@@ -273,9 +335,17 @@ class CudaBackend(Backend):
                 input_tensor._owner.pointer, weight_pointer, bias_pointer, output_pointer,
                 n, c, h, w, k, r, s, out_h, out_w,
                 stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
-                specialized=specialized_3x3,
+                specialized=specialized_3x3_plane_legacy,
                 specialized_1x1=specialized_1x1,
                 specialized_3x3_spatial=specialized_3x3_spatial,
+                specialized_3x3_plane=specialized_3x3_plane,
+                specialized_3x3_c8_c64_plane=specialized_3x3_c8_c64_plane,
+                specialized_3x3_small_c8=specialized_3x3_small_c8,
+                specialized_3x3_small_c10=specialized_3x3_small_c10,
+                specialized_3x3_small_c12=specialized_3x3_small_c12,
+                specialized_3x3_small_c24=specialized_3x3_small_c24,
+                specialized_3x3_c24_c64_plane=specialized_3x3_c24_c64_plane,
+                specialized_3x3_c48_c64_plane=specialized_3x3_c48_c64_plane,
             )
             strides = (k * out_h * out_w, out_h * out_w, out_w, 1)
             return CudaTensorOwner(
