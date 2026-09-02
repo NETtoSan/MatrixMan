@@ -6,6 +6,7 @@ import ctypes
 from dataclasses import dataclass
 
 from . import gpumatrix as gm
+from ...config import config
 
 
 @dataclass
@@ -141,6 +142,32 @@ def init() -> None:
     )
     from . import profiling
     profiling.initialize_gpu_timing()
+    if config.tileLimit == "auto":
+        try:
+            from ...diagnostics.opengl_tile_limit import autotune_tile_limit
+
+            info = {
+                "vendor": _gl_text(gm.glGetString(0x1F00)),
+                "renderer": _gl_text(gm.glGetString(0x1F01)),
+                "opengl": _gl_text(gm.glGetString(0x1F02)),
+                "glsl": _gl_text(gm.glGetString(0x8B8C)),
+            }
+            resolved = autotune_tile_limit(info, refresh=config.tileAutotuneRefresh)
+            config.resolveTileLimit(resolved)
+            print(f"MatrixMan OpenGL: tileLimit=auto resolvedTileLimit={resolved}")
+        except Exception as exc:
+            config.resolveTileLimit(256)
+            print(f"MatrixMan OpenGL warning: tile autotuning failed ({exc}); using validated fallback 256")
+    else:
+        config.resolveTileLimit(config.tileLimit)
+
+
+def _gl_text(value) -> str:
+    if value is None:
+        return "unavailable"
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
 
 
 def shutdown() -> None:

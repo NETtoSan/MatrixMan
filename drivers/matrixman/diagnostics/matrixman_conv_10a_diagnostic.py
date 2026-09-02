@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-import os
 
 from drivers import matrixman
+from drivers.matrixman.config import config
 from drivers.matrixman.backend import get_backend
 
 
@@ -55,10 +55,10 @@ def _mismatch_report(actual: torch.Tensor, expected: torch.Tensor, label: str) -
 
 def _run_tiny_check(gpu_input, weight, *, spatial_reuse: bool) -> bool:
     expected = F.conv2d(gpu_input.cpu(), weight, padding=1)
-    os.environ.pop("MATRIXMAN_CONV_SPATIAL_REUSE", None)
+    config.convSpatialReuse = False
     baseline = F.conv2d(gpu_input, weight, padding=1).cpu()
     if spatial_reuse:
-        os.environ["MATRIXMAN_CONV_SPATIAL_REUSE"] = "1"
+        config.convSpatialReuse = True
     actual = F.conv2d(gpu_input, weight, padding=1).cpu()
     passed = torch.allclose(actual, expected, rtol=1e-4, atol=1e-4)
     print("  tiny deterministic Conv [1,4,4,4] -> [1,4,4,4]:")
@@ -85,14 +85,14 @@ def main() -> int:
         matrixman.profile_reset()
     try:
         gpu_input = matrixman.to_device(source)
-        os.environ.pop("MATRIXMAN_CONV_SPATIAL_REUSE", None)
+        config.convSpatialReuse = False
         if is_opengl:
             matrixman.profile_reset()
         baseline = F.conv2d(gpu_input, weight, padding=1).cpu()
         baseline_gpu = profiling.gpu_timings.get("Conv2D", {}).get("total") if is_opengl else None
 
         if is_opengl:
-            os.environ["MATRIXMAN_CONV_SPATIAL_REUSE"] = "1"
+            config.convSpatialReuse = True
             matrixman.profile_reset()
         actual = F.conv2d(gpu_input, weight, padding=1).cpu()
         fast_gpu = profiling.gpu_timings.get("Conv2D spatial reuse", {}).get("total") if is_opengl else None

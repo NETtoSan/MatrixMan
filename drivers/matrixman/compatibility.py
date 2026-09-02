@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from . import backend
 from .backend import get_backend
+from .config import config
 
 
 GL_VENDOR = 0x1F00
@@ -335,8 +336,8 @@ def _consolidation_metrics(actual: np.ndarray, expected: np.ndarray) -> tuple[fl
 
 def _test_consolidation() -> bool:
     atlas = 512
-    width_limit = int(os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH", 256))
-    height_limit = int(os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT", 256))
+    width_limit = int(config.diagTileWidth or 256)
+    height_limit = int(config.diagTileHeight or 256)
     if width_limit <= 0 or height_limit <= 0:
         raise RuntimeError("diagnostic tile dimensions must be positive")
     tiles_x = (atlas + width_limit - 1) // width_limit
@@ -560,26 +561,22 @@ def main() -> int:
         try:
             os.environ["MATRIXMAN_DIAGNOSTIC_TILES"] = "1"
             os.environ["MATRIXMAN_DIAGNOSTIC_RECT_TILES"] = "1"
+            config.reloadFromEnvironment()
             print("MatrixMan fresh-context tiled convolution test")
-            limit_text = os.environ.get("MATRIXMAN_TILE_LIMIT", "256")
-            try:
-                limit = int(limit_text)
-            except ValueError:
-                print(f"Invalid MATRIXMAN_TILE_LIMIT: {limit_text!r}")
+            if config.tileLimit == "auto":
+                print("MATRIXMAN_TILE_LIMIT=auto is not valid for this manual compatibility test")
                 return 1
-            if limit <= 0:
-                print("Invalid MATRIXMAN_TILE_LIMIT: must be positive")
-                return 1
+            limit = int(config.tileLimit)
             try:
-                diag_width = int(os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH", limit))
-                diag_height = int(os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT", limit))
-            except ValueError:
+                diag_width = int(config.diagTileWidth or limit)
+                diag_height = int(config.diagTileHeight or limit)
+            except (TypeError, ValueError):
                 print("Invalid diagnostic tile dimensions: must be positive integers")
                 return 1
             if diag_width <= 0 or diag_height <= 0:
                 print("Invalid diagnostic tile dimensions: must be positive")
                 return 1
-            workload_name = os.environ.get("MATRIXMAN_DIAG_CONV_WORKLOAD", "heavy").strip().lower() or "heavy"
+            workload_name = config.diagConvWorkload or "heavy"
             try:
                 workload = _diagnostic_workload(workload_name)
             except RuntimeError as exc:
@@ -591,9 +588,9 @@ def main() -> int:
             tiles_x = (atlas_width + diag_width - 1) // diag_width
             tiles_y = (atlas_height + diag_height - 1) // diag_height
             print(f"MATRIXMAN_TILE_LIMIT: {limit}")
-            print(f"MATRIXMAN_TILE_SYNC: {os.environ.get('MATRIXMAN_TILE_SYNC', 'per_tile')}")
+            print(f"MATRIXMAN_TILE_SYNC: {config.tileSync}")
             print(f"MATRIXMAN_DIAG_TILE_WIDTH/HEIGHT: {diag_width}x{diag_height}")
-            print(f"MATRIXMAN_DIAG_TILE_ORDER: {os.environ.get('MATRIXMAN_DIAG_TILE_ORDER', 'normal')}")
+            print(f"MATRIXMAN_DIAG_TILE_ORDER: {config.diagTileOrder or 'normal'}")
             print(f"MATRIXMAN_DIAG_CONV_WORKLOAD: {workload_name}")
             print(
                 f"Conv2D: input=[1,{workload['cin']},{workload['spatial']},{workload['spatial']}] "

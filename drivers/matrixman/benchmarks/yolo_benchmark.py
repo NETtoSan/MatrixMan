@@ -89,6 +89,7 @@ def main() -> int:
     settings = _parse_env(args.env)
     for name, value in settings.items():
         os.environ[name] = value
+    matrixman.config.reloadFromEnvironment()
     from ultralytics import YOLO
 
     model_path = args.model.expanduser().resolve()
@@ -125,7 +126,7 @@ def main() -> int:
                 if not matrixman.is_matrixman_tensor(output):
                     raise RuntimeError("model output did not remain a MatrixMan tensor")
                 readback_started = time.perf_counter()
-                reduction_enabled = os.environ.get("MATRIXMAN_GPU_POSTPROCESS", "").strip().lower() not in {"", "0", "false", "no", "off"}
+                reduction_enabled = matrixman.config.gpuPostprocess
                 if reduction_enabled:
                     reduced_output = matrixman.gpu_postprocess_detection(output)
                     prediction = reduced_output.cpu()

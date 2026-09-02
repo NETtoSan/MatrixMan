@@ -99,6 +99,28 @@ must not be treated as safe GM45 defaults. The optional
 `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC=1` experiment skips only the audited
 pre-consolidation barrier; it does not change the production default.
 
+## Physical tile validation diagnostic
+
+To validate physical Conv render sizes on the current OpenGL GPU and driver,
+run:
+
+```text
+python -m drivers.matrixman.diagnostics.opengl_tile_limit
+```
+
+The invocation is identical on Linux and Windows PowerShell. The diagnostic
+reports OpenGL limits, estimates memory before each candidate, runs real
+MatrixMan Conv workloads against a CPU reference, and isolates each candidate
+in a child process with a timeout. It reports the largest tile size validated
+by that run; this is diagnostic evidence, not a universal recommendation. The
+YOLO-shaped `[1,64,80,80]` / `320x320` packed Conv case is included to show the
+256 tiled versus 512 direct behavior where the GPU supports both.
+
+Optional overrides use the same Python arguments on both platforms, for
+example `--sizes 256,512,1024 --max-size 1024 --timeout 30`. The existing
+GM45-safe production defaults remain `MATRIXMAN_TILE_LIMIT=256` and
+`MATRIXMAN_TILE_SYNC=per_tile`.
+
 ## Compatibility and profiling
 
 Startup probes OpenGL availability and selects the OpenGL backend when a

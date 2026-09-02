@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ctypes
 import math
-import os
 import time
 
 import numpy as np
@@ -18,6 +17,7 @@ import torch
 from . import gpumatrix as gm, profiling
 from . import resources as _resources
 from .storage import StorageLayout, packed_atlas_size
+from ...config import config
 
 
 # Conservative GM45-validated default; larger physical draws may be unstable.
@@ -25,6 +25,7 @@ CONV_PHYSICAL_TILE_LIMIT = 256
 _tile_diagnostic_snapshots: list[dict] = []
 _last_tile_geometry: list[dict] = []
 _last_tile_output_texture: int | None = None
+_last_dispatch_metadata: dict | None = None
 _GL_SCISSOR_TEST = 0x0C11
 gm.gl.glScissor.restype = None
 gm.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -174,8 +175,7 @@ def _conv_program(params: tuple) -> tuple[int, int, int, int]:
 
 
 def _spatial_reuse_enabled() -> bool:
-    value = os.environ.get("MATRIXMAN_CONV_SPATIAL_REUSE", "0")
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(config.convSpatialReuse)
 
 
 def _conv_spatial_reuse_supported(input_tensor, out_owner, params, tile_limit: int) -> bool:
@@ -470,42 +470,28 @@ def _as_pair(value, name: str) -> tuple[int, int]:
 
 
 def _tile_sync_mode() -> str:
-    mode = os.environ.get("MATRIXMAN_TILE_SYNC", "per_tile").strip().lower() or "per_tile"
-    if mode not in {"per_tile", "end", "flush", "none"}:
-        raise RuntimeError(
-            "MATRIXMAN_TILE_SYNC must be one of: per_tile, end, flush, none"
-        )
-    return mode
+    return config.tileSync
 
 
 def _skip_pre_consolidation_sync() -> bool:
-    value = os.environ.get("MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC", "0")
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(config.skipPreConsolidationSync)
 
 
 def _tile_limit() -> int:
     """Return the experimental limit without changing the safe default."""
-    b = _backend()
-    raw = os.environ.get("MATRIXMAN_TILE_LIMIT")
-    if raw is None or not raw.strip():
-        return int(getattr(b, "CONV_PHYSICAL_TILE_LIMIT", CONV_PHYSICAL_TILE_LIMIT))
-    try:
-        limit = int(raw)
-    except ValueError as exc:
-        raise RuntimeError("MATRIXMAN_TILE_LIMIT must be a positive integer") from exc
-    if limit <= 0:
-        raise RuntimeError("MATRIXMAN_TILE_LIMIT must be a positive integer")
-    return limit
+    if config.tileLimit == "auto":
+        return int(config.resolvedTileLimit)
+    return int(config.tileLimit)
 
 
 def _tile_limits() -> tuple[int, int]:
     limit = _tile_limit()
     # Independent dimensions are intentionally diagnostic-only.  Normal
     # execution always retains the square production limit.
-    if os.environ.get("MATRIXMAN_DIAGNOSTIC_RECT_TILES") != "1":
+    if not config.diagnosticRectTiles:
         return limit, limit
-    width_raw = os.environ.get("MATRIXMAN_DIAG_TILE_WIDTH")
-    height_raw = os.environ.get("MATRIXMAN_DIAG_TILE_HEIGHT")
+    width_raw = config.diagTileWidth
+    height_raw = config.diagTileHeight
     if width_raw is None and height_raw is None:
         return limit, limit
     try:
@@ -524,9 +510,9 @@ def _tile_limits() -> tuple[int, int]:
 
 def _tile_grid_order(tiles_x: int, tiles_y: int) -> list[tuple[int, int]]:
     normal = [(tile_x, tile_y) for tile_y in range(tiles_y) for tile_x in range(tiles_x)]
-    if os.environ.get("MATRIXMAN_DIAGNOSTIC_RECT_TILES") != "1":
+    if not config.diagnosticRectTiles:
         return normal
-    order = os.environ.get("MATRIXMAN_DIAG_TILE_ORDER", "normal").strip().lower() or "normal"
+    order = config.diagTileOrder or "normal"
     if order == "normal":
         return normal
     if order == "reverse":
@@ -563,8 +549,19 @@ def _conv_gpu_metadata(input_tensor, out_owner, params, tiled: bool, physical_ti
     }
 
 
+def diagnostic_tile_geometry() -> dict:
+    """Return the most recent Conv physical dispatch geometry.
+
+    This is intentionally diagnostic-only telemetry.  It does not influence
+    dispatch policy or expose a new production execution path.
+    """
+    metadata = dict(_last_dispatch_metadata or {})
+    metadata["tiles"] = [dict(item) for item in _last_tile_geometry]
+    return metadata
+
+
 def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params):
-    global _last_tile_output_texture
+    global _last_tile_output_texture, _last_dispatch_metadata
     b = _backend()
     sync_mode = _tile_sync_mode()
     full_w, full_h = out_owner.layout.texture_width, out_owner.layout.texture_height
@@ -574,6 +571,8 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
     tiles_y = math.ceil(full_h / height_limit)
     tile_order = _tile_grid_order(tiles_x, tiles_y)
     gpu_metadata = _conv_gpu_metadata(input_tensor, out_owner, params, True, tiles_x * tiles_y)
+    _last_dispatch_metadata = dict(gpu_metadata)
+    _last_dispatch_metadata.update({"tile_limit": (width_limit, height_limit)})
     if b._profile_enabled:
         b._profile_counters["tiled_conv_calls"] += 1
         b._profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
@@ -634,7 +633,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                 gm.glFlush()
         # Diagnostic readback is deliberately delayed until every production
         # tile render has completed. It cannot alter inter-tile scheduling.
-        if os.environ.get("MATRIXMAN_DIAGNOSTIC_TILES") == "1":
+        if config.diagnosticTiles:
             for index, tile in enumerate(tile_owners):
                 geometry = _last_tile_geometry[index]
                 diagnostic = b._read_texture(
@@ -722,13 +721,15 @@ def _consolidate_tiles(tile_owners, geometries, out_owner, full_w, full_h, width
                 raise RuntimeError(f"gm45 tiled convolution copy OpenGL error: 0x{err:04x}")
 
 
-def execute(args):
-    b = _backend()
-    tile_limit = _tile_limit()
-    conv_started = time.perf_counter()
+def _validate_convolution(args, b):
+    """Validate Conv2D arguments and allocate the packed output texture."""
     input_tensor, weight_tensor, bias_tensor = args[0], args[1], args[2]
-    stride, padding, dilation = _as_pair(args[3], "stride"), _as_pair(args[4], "padding"), _as_pair(args[5], "dilation")
-    transposed, output_padding, groups = bool(args[6]), _as_pair(args[7], "output_padding"), int(args[8])
+    stride = _as_pair(args[3], "stride")
+    padding = _as_pair(args[4], "padding")
+    dilation = _as_pair(args[5], "dilation")
+    transposed = bool(args[6])
+    output_padding = _as_pair(args[7], "output_padding")
+    groups = int(args[8])
     if not isinstance(input_tensor, b.MatrixManTensor):
         raise RuntimeError("gm45 convolution requires input to be a MatrixManTensor")
     if input_tensor._owner.layout.kind != "packed_rgba":
@@ -774,8 +775,13 @@ def execute(args):
     out_w = (in_w + 2 * padding[1] - kernel_w) // stride[1] + 1
     out_shape = (1, out_c, out_h, out_w)
     out_owner = b._new_empty_packed_texture(out_shape)
-    if b._profile_enabled:
-        b._profile_conv["prepare"] += time.perf_counter() - conv_started
+    return (input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
+            out_owner, (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w,
+                         groups))
+
+
+def _upload_convolution_parameters(weight_tensor, bias_tensor, b):
+    """Upload/cache CPU Conv2D parameters as packed OpenGL textures."""
     upload_started = time.perf_counter()
     weight_owner = _resources.cached_parameter_texture(weight_tensor, "weight")
     if bias_tensor is not None:
@@ -784,11 +790,22 @@ def execute(args):
         bias_owner = _resources.upload_raw_packed_array(np.zeros((1,), dtype=np.float32), "bias")
     if b._profile_enabled:
         b._profile_conv["parameter_upload"] += time.perf_counter() - upload_started
-    params = (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w, stride[0], stride[1], padding[0], padding[1], bias_tensor is not None, groups, input_tensor._storage_offset, input_tensor._owner.layout.texture_width, input_tensor._owner.layout.texture_height, weight_owner.layout.texture_width, weight_owner.layout.texture_height, bias_owner.layout.texture_width, out_owner.layout.texture_width)
-    if _spatial_reuse_enabled() and _conv_spatial_reuse_supported(input_tensor, out_owner, params, tile_limit):
-        return _render_convolution_spatial(input_tensor, out_owner, weight_owner, bias_owner, params)
-    if out_owner.layout.texture_width > tile_limit or out_owner.layout.texture_height > tile_limit:
-        return _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params)
+    return weight_owner, bias_owner
+
+
+def _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_owner, weight_owner, bias_owner, params, out_shape, b):
+    """Render a non-tiled Conv2D into the final packed output texture."""
+    global _last_dispatch_metadata, _last_tile_geometry
+    _last_tile_geometry.clear()
+    _last_dispatch_metadata = _conv_gpu_metadata(input_tensor, out_owner, params, False, 1)
+    _last_dispatch_metadata.update({"tile_limit": (out_owner.layout.texture_width, out_owner.layout.texture_height)})
+    _last_tile_geometry.append({
+        "grid": (0, 0), "origin": (0, 0),
+        "width": out_owner.layout.texture_width,
+        "height": out_owner.layout.texture_height,
+        "texture_size": (out_owner.layout.texture_width, out_owner.layout.texture_height),
+        "texture": out_owner.texture,
+    })
     b._kernel_log(f"Conv2D {b._shape_text(input_tensor.shape)} -> {b._shape_text(out_shape)}")
     shader_setup_started = time.perf_counter()
     program, input_loc, weight_loc, bias_loc = _conv_program(params)
@@ -817,3 +834,27 @@ def execute(args):
     if (err := gm.glGetError()):
         raise RuntimeError(f"gm45 OpenGL error after convolution: 0x{err:04x}")
     return b.MatrixManTensor._from_owner(out_owner, out_shape)
+
+
+def execute(args):
+    b = _backend()
+    tile_limit = _tile_limit()
+    conv_started = time.perf_counter()
+
+    (input_tensor, weight_tensor, bias_tensor,
+     stride, padding, out_shape, out_owner, dimensions) = _validate_convolution(args, b)
+
+    if b._profile_enabled:
+        b._profile_conv["prepare"] += time.perf_counter() - conv_started
+
+    weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
+    in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w, groups = dimensions
+    params = (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w, stride[0], stride[1], padding[0], padding[1], bias_tensor is not None, groups, input_tensor._storage_offset, input_tensor._owner.layout.texture_width, input_tensor._owner.layout.texture_height, weight_owner.layout.texture_width, weight_owner.layout.texture_height, bias_owner.layout.texture_width, out_owner.layout.texture_width)
+
+    if _spatial_reuse_enabled() and _conv_spatial_reuse_supported(input_tensor, out_owner, params, tile_limit):
+        return _render_convolution_spatial(input_tensor, out_owner, weight_owner, bias_owner, params)
+
+    if out_owner.layout.texture_width > tile_limit or out_owner.layout.texture_height > tile_limit:
+        return _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params)
+
+    return _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_owner, weight_owner, bias_owner, params, out_shape, b)

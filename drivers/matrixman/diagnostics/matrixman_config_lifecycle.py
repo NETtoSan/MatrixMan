@@ -44,6 +44,59 @@ assert len(calls) == 1
 print('selection_calls=1')
 """
 
+_SELECTOR_CONFIG_CHECK = """
+from drivers import matrixman
+import drivers.matrixman.selector as selector
+from drivers.matrixman.selector import BackendCapability
+from drivers.matrixman.backend import Backend
+
+class FakeBackend(Backend):
+    name = 'opengl'
+
+calls = []
+def fake_probe(requested=''):
+    calls.append(requested)
+    return {
+        'cuda': BackendCapability('cuda', True, True, True, backend=FakeBackend),
+        'opengl': BackendCapability('opengl', True, True, True, backend=FakeBackend),
+    }
+selector.probe_capabilities = fake_probe
+matrixman.config.reloadFromEnvironment()
+selector.select_backend()
+expected = matrixman.config.backend
+expected = '' if expected == 'auto' else expected
+assert calls == [expected], (calls, expected)
+print('selector_request=' + repr(calls[0]))
+"""
+
+_TILE_AUTO_SELECTOR_CHECK = """
+import os
+os.environ.pop('MATRIXMAN_' + 'BACK' + 'END', None)
+os.environ['MATRIXMAN_TILE_LIMIT'] = 'auto'
+from drivers import matrixman
+import drivers.matrixman.selector as selector
+from drivers.matrixman.selector import BackendCapability
+from drivers.matrixman.backend import Backend
+
+class FakeBackend(Backend):
+    name = 'opengl'
+
+calls = []
+def fake_probe(requested=''):
+    calls.append(requested)
+    return {
+        'cuda': BackendCapability('cuda', False, True, True),
+        'opengl': BackendCapability('opengl', True, True, True, backend=FakeBackend),
+    }
+selector.probe_capabilities = fake_probe
+matrixman.config.reloadFromEnvironment()
+assert matrixman.config.tileLimit == 'auto'
+assert matrixman.config.backend == 'auto'
+selector.select_backend()
+assert calls == [''], calls
+print('tile_auto_independent=True')
+"""
+
 _PROFILE_HOOK_CHECK = """
 import atexit
 registered = []
@@ -159,6 +212,25 @@ def main() -> int:
         print(result.stderr.strip() or result.stdout.strip())
         return 1
     print("  prefer-before-use selection count: PASS")
+    result = _run(_SELECTOR_CONFIG_CHECK, "auto")
+    if result.returncode:
+        print("  unset backend normal selection: FAIL")
+        print(result.stderr.strip() or result.stdout.strip())
+        return 1
+    print("  unset backend normal selection: PASS")
+    for backend in ("opengl", "cuda"):
+        result = _run(_SELECTOR_CONFIG_CHECK, backend, {"MATRIXMAN_BACKEND": backend})
+        if result.returncode:
+            print(f"  explicit {backend} backend selection: FAIL")
+            print(result.stderr.strip() or result.stdout.strip())
+            return 1
+        print(f"  explicit {backend} backend selection: PASS")
+    result = _run(_TILE_AUTO_SELECTOR_CHECK, "auto")
+    if result.returncode:
+        print("  tileLimit=auto backend independence: FAIL")
+        print(result.stderr.strip() or result.stdout.strip())
+        return 1
+    print("  tileLimit=auto backend independence: PASS")
     result = _run(_PROFILE_HOOK_CHECK, "auto")
     if result.returncode:
         print("  profiler import/registration isolation: FAIL")

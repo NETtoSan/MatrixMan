@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 
 from .backend import Backend, active_backend, set_backend
 from .backends.cuda.backend import CudaBackend
 from .backends.cuda.gpumatrix import detect_device
-from .config import preferred_backend, profiling_enabled
+from .config import config, profiling_enabled
 from .privateuse import register_privateuse1_backend
 
 
@@ -128,12 +127,11 @@ def name_label(name: str) -> str:
 
 def select_backend() -> Backend:
     """Probe known backends, report the registry, and select an enabled backend."""
-    python_preference = preferred_backend()
-    requested = (
-        python_preference
-        if python_preference is not None
-        else os.environ.get("MATRIXMAN_BACKEND", "").strip().lower()
-    )
+    requested = config.backend
+    # ``auto`` is the public spelling for the pre-refactor unset state. It is
+    # not a backend implementation and must therefore enter normal probing.
+    if requested == "auto":
+        requested = ""
     capabilities = probe_capabilities(requested)
     _print_probe(capabilities)
 

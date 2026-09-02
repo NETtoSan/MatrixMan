@@ -21,7 +21,7 @@ from drivers.matrixman.backend import get_backend
 
 #matrixman.prefer("opengl")
 matrixman.profiling = True
-matrixman.trace = True
+#matrixman.trace = True
 
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
@@ -74,17 +74,21 @@ def main() -> int:
                 display_frame = cv2.resize(frame, (args.imgsz, args.imgsz), interpolation=cv2.INTER_LINEAR)
                 cpu_input = preprocess_frame(frame, args.imgsz)
                 gpu_input = matrixman.to_device(cpu_input)
+
                 with torch.no_grad():
                     prediction = first_tensor(net(gpu_input))
                 if not matrixman.is_matrixman_tensor(prediction):
                     raise RuntimeError("model output did not remain a MatrixManTensor")
+
                 prediction = prediction.cpu()
                 result, _ = detections(prediction, args.imgsz, args.imgsz, names, args.conf, args.iou)
+
                 for (x1, y1, x2, y2), score, _cls, label in result:
                     box = tuple(int(v) for v in (x1, y1, x2, y2))
                     cv2.rectangle(display_frame, box[:2], box[2:], (0, 255, 0), 2)
                     cv2.putText(display_frame, f"{label} {score:.2f}", (box[0], max(12, box[1] - 4)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+                
                 elapsed = time.perf_counter() - frame_started
                 print(f"frame {frame_count}: detections={len(result)} total={elapsed:.3f}s FPS={1 / max(elapsed, 1e-9):.2f}")
                 if not args.no_display:
@@ -103,4 +107,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # Ctrl+C is a normal way to stop the demo; avoid dumping the
+        # implementation traceback while preserving main() cleanup.
+        print("\nInterrupted by user.")
+        raise SystemExit(130)

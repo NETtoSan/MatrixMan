@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import os
 import sys
 
 import numpy as np
 
 from . import profiling
-from ...config import trace_log
+from ...config import config, trace_log
 
 
 CUresult = ctypes.c_int
@@ -38,23 +37,15 @@ CUDA_BLOCK_SIZE = 128
 
 
 def _cuda_debug_enabled() -> bool:
-    return _truthy_environment("MATRIXMAN_CUDA_DEBUG")
-
-
-def _truthy_environment(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() not in {
-        "", "0", "false", "no", "off"
-    }
+    return bool(config.cudaDebug)
 
 
 def _specialized_conv_disabled() -> bool:
-    return os.environ.get("MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV", "").strip().lower() not in {
-        "", "0", "false", "no", "off"
-    }
+    return bool(config.cudaDisableSpecializedConv)
 
 
 def _async_queue_disabled() -> bool:
-    return _truthy_environment("MATRIXMAN_CUDA_DISABLE_ASYNC_QUEUE")
+    return bool(config.cudaDisableAsyncQueue)
 
 
 PTX = r"""
@@ -4376,7 +4367,7 @@ class CudaExecutionBackend:
     def __init__(self, device_index: int = 0):
         if device_index != 0:
             raise ValueError("only CUDA device 0 is currently supported")
-        self._pool_enabled = not _truthy_environment("MATRIXMAN_CUDA_DISABLE_ALLOC_POOL")
+        self._pool_enabled = not config.cudaDisableAllocPool
         self._async_queue_enabled = not _async_queue_disabled()
         profiling.set_async_mode(self._async_queue_enabled)
         self._free_blocks: dict[int, list[CUdeviceptr]] = {}
@@ -4423,7 +4414,7 @@ class CudaExecutionBackend:
                 "conv2d_1x1_s1_c64, conv2d_1x1_s1_cin16, conv2d_1x1_s1_cin24, conv2d_1x1_s1_cin36, conv2d_1x1_s1_cin48, conv2d_1x1_s1_cin72, batch_norm_inference, silu, "
                 "split_copy, cat_copy, upsample_nearest2d"
             )
-            if _truthy_environment("MATRIXMAN_CUDA_LEGACY_MODULE_LOAD"):
+            if config.cudaLegacyModuleLoad:
                 load_result = self.driver.cuModuleLoadData(
                     ctypes.byref(self.module), ctypes.cast(ptx, ctypes.c_void_p)
                 )
@@ -4443,7 +4434,7 @@ class CudaExecutionBackend:
                 self.driver.cuGetErrorString(load_result, ctypes.byref(error_message))
                 name = error_name.value.decode(errors="replace") if error_name.value else str(load_result)
                 message = error_message.value.decode(errors="replace") if error_message.value else "unknown error"
-                loader = "cuModuleLoadData" if _truthy_environment("MATRIXMAN_CUDA_LEGACY_MODULE_LOAD") else "cuModuleLoadDataEx"
+                loader = "cuModuleLoadData" if config.cudaLegacyModuleLoad else "cuModuleLoadDataEx"
                 detail = f"\nPTX JIT error log:\n{jit_error or '(empty)'}" if loader.endswith("Ex") else ""
                 raise RuntimeError(f"{loader} ({module_description}): {name} ({message}){detail}")
             if _cuda_debug_enabled() and info_log.value:

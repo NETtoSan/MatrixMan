@@ -4,23 +4,24 @@ from __future__ import annotations
 
 import functools
 import atexit
-import os
 import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 
 from . import gpumatrix as gm
-from ...config import profiling_enabled
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() not in {"", "0", "false", "no", "off"}
+from ...config import config, profiling_enabled
 
 
 enabled = profiling_enabled()
-detail = _env_flag("MATRIXMAN_PROFILE_DETAIL")
-gpu_timing_enabled = _env_flag("MATRIXMAN_GPU_TIMING")
+
+
+def _gpu_timing_enabled() -> bool:
+    return bool(config.gpuTiming)
+
+
+def _profile_detail() -> bool:
+    return bool(config.profileDetail)
 started = time.perf_counter()
 ops: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "total": 0.0, "max": 0.0})
 counters: dict[str, float] = defaultdict(float)
@@ -56,7 +57,7 @@ def set_enabled(value: bool) -> None:
     enabled = bool(value)
     if enabled:
         register_exit_hook()
-    if enabled or gpu_timing_enabled:
+    if enabled or _gpu_timing_enabled():
         gm.glBegin = _profile_gl_begin
         gm.glFinish = _profile_gl_finish
         gm.glFlush = _profile_gl_flush
@@ -104,7 +105,7 @@ def initialize_gpu_timing() -> None:
     global _gpu_timer_capable, _gpu_timer_api, _gpu_timer_reason
     global _gpu_timer_gen, _gpu_timer_delete, _gpu_timer_begin, _gpu_timer_end
     global _gpu_timer_available, _gpu_timer_result
-    if not gpu_timing_enabled:
+    if not _gpu_timing_enabled():
         _gpu_timer_reason = "disabled (set MATRIXMAN_GPU_TIMING=1)"
         return
     try:
@@ -232,7 +233,7 @@ def _profile_gl_begin(mode):
 
 
 def _profile_gl_finish():
-    if not enabled and not gpu_timing_enabled:
+    if not enabled and not _gpu_timing_enabled():
         return _profile_gl_finish.original()
     begin = time.perf_counter()
     result = _profile_gl_finish.original()
@@ -256,7 +257,7 @@ def _profile_gl_flush():
 _profile_gl_begin.original = gm.glBegin
 _profile_gl_finish.original = gm.glFinish
 _profile_gl_flush.original = gm.glFlush
-if enabled or gpu_timing_enabled:
+if enabled or _gpu_timing_enabled():
     gm.glBegin = _profile_gl_begin
     gm.glFinish = _profile_gl_finish
     gm.glFlush = _profile_gl_flush
@@ -277,14 +278,14 @@ def dispatch_timer(fn):
             record["calls"] += 1
             record["total"] += elapsed
             record["max"] = max(record["max"], elapsed)
-            if detail:
+            if _profile_detail():
                 print(f"[MatrixMan profile] {name}: {elapsed:.6f}s")
     return wrapped
 
 
 def report() -> None:
     collect_gpu_timing()
-    if not enabled and not gpu_timing_enabled:
+    if not enabled and not _gpu_timing_enabled():
         return
     elapsed = time.perf_counter() - started
     print("\nMatrixMan profile\n-----------------")
@@ -304,8 +305,8 @@ def report() -> None:
     print(f"  glFlush: {int(counters['glFlush_calls'])} ({counters['glFlush_seconds']:.3f}s)")
     print(f"  pre-consolidation glFinish executed: {int(counters['pre_consolidation_sync_calls'])}")
     print(f"  pre-consolidation glFinish skipped: {int(counters['pre_consolidation_sync_skips'])}")
-    print(f"  tiled convolution sync mode: {os.environ.get('MATRIXMAN_TILE_SYNC', 'per_tile')}")
-    print(f"  physical tile limit: {os.environ.get('MATRIXMAN_TILE_LIMIT', '256')}")
+    print(f"  tiled convolution sync mode: {config.tileSync}")
+    print(f"  physical tile limit: {config.resolvedTileLimit}")
     print("GPU timing:")
     print(f"  timer-query capability: {'available' if _gpu_timer_capable else 'unavailable'}")
     print(f"  API: {_gpu_timer_api}")

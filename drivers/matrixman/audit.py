@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import atexit
-import os
 import traceback
 from collections import Counter
 
+from .config import config
 
-_enabled = os.environ.get("MATRIXMAN_AUDIT_CPU_LEAKS", "").strip().lower() not in {"", "0", "false", "no", "off"}
 _counts = Counter()
 _elements = Counter()
 _bytes = Counter()
@@ -17,7 +16,7 @@ _summary_printed = False
 
 
 def enabled() -> bool:
-    return _enabled
+    return bool(config.auditCpuLeaks)
 
 
 def count(category: str) -> int:
@@ -27,7 +26,7 @@ def count(category: str) -> int:
 def record(category: str, *, op: str | None = None, tensor=None, shape=None,
            dtype=None, numel=None, storage=None, reason: str = "",
            cpu_arithmetic: bool = False) -> None:
-    if not _enabled:
+    if not enabled():
         return
     if tensor is not None:
         shape = list(int(v) for v in tensor.shape)
@@ -64,7 +63,7 @@ def record(category: str, *, op: str | None = None, tensor=None, shape=None,
 
 def summary() -> None:
     global _summary_printed
-    if not _enabled:
+    if not enabled():
         return
     if _summary_printed:
         return
@@ -79,6 +78,6 @@ def summary() -> None:
 
 def register_exit_summary() -> None:
     global _registered
-    if _enabled and not _registered:
+    if enabled() and not _registered:
         atexit.register(summary)
         _registered = True
