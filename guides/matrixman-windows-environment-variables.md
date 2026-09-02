@@ -47,7 +47,7 @@ per-terminal settings are recommended.
 | `MATRIXMAN_DEBUG` | OpenGL diagnostics | OpenGL low-level debug output | off | `1` |
 | `MATRIXMAN_PROFILE_DETAIL` | OpenGL profiling | Detailed profiler report | off | `1` |
 | `MATRIXMAN_GPU_TIMING` | OpenGL profiling | Deferred GPU timer queries | off | `1` |
-| `MATRIXMAN_TILE_LIMIT` | OpenGL convolution | Square physical tile limit | backend default (256) | `512` |
+| `MATRIXMAN_TILE_LIMIT` | OpenGL convolution | Physical tile limit or validated `auto` selection | `256` | `512` or `auto` |
 | `MATRIXMAN_TILE_SYNC` | OpenGL convolution | Inter-tile synchronization mode | `per_tile` | `end` |
 | `MATRIXMAN_CONV_SPATIAL_REUSE` | OpenGL convolution | Experimental spatial reuse | off | `1` |
 | `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` | OpenGL convolution | Skip pre-consolidation sync experiment | off | `1` |
@@ -65,10 +65,11 @@ per-terminal settings are recommended.
 | `MATRIXMAN_CUDA_CONV3X3_VARIANT` | CUDA convolution | Select 3x3 variant | `plane` | `plane_legacy` |
 | `MATRIXMAN_CUDA_LEGACY_MODULE_LOAD` | CUDA loader | Use `cuModuleLoadData` instead of `cuModuleLoadDataEx` | off | `1` |
 | `MATRIXMAN_AUDIT_CPU_LEAKS` | shared audit | Enable CPU materialization audit | off | `1` |
+| `MATRIXMAN_TILE_AUTOTUNE_REFRESH` | OpenGL autotuning | Force a fresh tile autotune | off | `1` |
 
 Boolean variables use the common MatrixMan truth rule: unset, empty, `0`,
-`false`, `no`, and `off` are false; other non-empty values are true, except
-where a source explicitly requires the literal string `1` (noted below).
+`false`, `no`, and `off` are false; `1`, `true`, `yes`, and `on` are true.
+Other values are rejected by the centralized configuration parser.
 
 ## Shared / Backend Selection Variables
 
@@ -89,14 +90,15 @@ Sources: `backends/opengl/diagnostics.py`, `profiling.py`, `convolution.py`,
   `MATRIXMAN_CONV_SPATIAL_REUSE` are booleans. They affect diagnostics,
   profiler detail/timer queries, or an experimental convolution path; keep them
   off for ordinary runs.
-- `MATRIXMAN_TILE_LIMIT` is a positive integer. Invalid or non-positive values
-  raise an error. Unset uses the backend's 256 default.
+- `MATRIXMAN_TILE_LIMIT` is a positive integer or `auto`. Invalid or
+  non-positive values raise an error. `auto` validates and caches a
+  device/driver-specific OpenGL limit; unset uses the 256 default.
 - `MATRIXMAN_TILE_SYNC` accepts `per_tile`, `end`, `flush`, or `none`; invalid
   values raise an error. It changes synchronization/performance, not intended
   numerical semantics.
 - `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` is a boolean experiment.
 - `MATRIXMAN_DIAGNOSTIC_TILES` and `MATRIXMAN_DIAGNOSTIC_RECT_TILES` are
-  diagnostic switches enabled only by the literal `1` in the relevant paths.
+  boolean diagnostic switches.
 - `MATRIXMAN_DIAG_TILE_WIDTH` and `MATRIXMAN_DIAG_TILE_HEIGHT` are positive
   integers used only when rectangular diagnostics are enabled; invalid values
   raise an error.
@@ -141,6 +143,7 @@ Exact source map:
 | `MATRIXMAN_CUDA_CONV3X3_VARIANT` | `drivers/matrixman/backends/cuda/backend.py` |
 | `MATRIXMAN_CUDA_LEGACY_MODULE_LOAD` | `drivers/matrixman/backends/cuda/gpumatrix.py` |
 | `MATRIXMAN_AUDIT_CPU_LEAKS` | `drivers/matrixman/audit.py` |
+| `MATRIXMAN_TILE_AUTOTUNE_REFRESH` | `drivers/matrixman/config.py`, `drivers/matrixman/backends/opengl/runtime.py`, `drivers/matrixman/diagnostics/opengl_tile_limit.py` |
 
 ## CUDA Variables
 
@@ -249,7 +252,7 @@ diagnostic mode in later work.
 
 ## Source Audit
 
-- **Unique `MATRIXMAN_*` names found:** 25.
+- **Unique active `MATRIXMAN_*` names found:** 26.
 - **Source files containing environment reads:** `drivers/matrixman/audit.py`,
   `selector.py`, `config.py`, `compatibility.py`,
   `config.py`, `backends/opengl/diagnostics.py`,
@@ -265,5 +268,6 @@ diagnostic mode in later work.
   diagnostic-only; CUDA variant values other than `plane_legacy` fall through
   to normal kernel selection rather than being rejected.
 
-All 25 currently consumed `MATRIXMAN_*` variables are represented in the Quick
-Reference table and described above.
+All 26 currently consumed `MATRIXMAN_*` variables are represented in the Quick
+Reference table and described above. The canonical mapping and lifecycle
+reference is [`matrixman-configuration.md`](matrixman-configuration.md).

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import traceback
+from contextlib import contextmanager
 from collections import Counter
 
 from .config import config
@@ -13,10 +14,71 @@ _elements = Counter()
 _bytes = Counter()
 _registered = False
 _summary_printed = False
+_readbacks: list[dict] = []
+_readback_context = None
 
 
 def enabled() -> bool:
     return bool(config.auditCpuLeaks)
+
+
+@contextmanager
+def readback_context(category: str):
+    """Label an explicit readback without changing its execution behavior."""
+    global _readback_context
+    previous = _readback_context
+    _readback_context = category
+    try:
+        yield
+    finally:
+        _readback_context = previous
+
+
+def record_readback(*, tensor, op: str | None, reason: str) -> None:
+    if not enabled():
+        return
+    owner = getattr(tensor, "_owner", None)
+    layout = getattr(owner, "layout", None)
+    itemsize = 4
+    _readbacks.append({
+        "category": _readback_context or "explicit",
+        "op": op,
+        "reason": reason,
+        "shape": [int(v) for v in tensor.shape],
+        "bytes": int(tensor.numel()) * itemsize,
+        "physical_bytes": int(getattr(layout, "texture_width", 0)) * int(getattr(layout, "texture_height", 0)) * 16,
+        "frame": getattr(_active_frame, "value", None),
+    })
+
+
+_active_frame = __import__("threading").local()
+
+
+@contextmanager
+def frame(number: int):
+    previous = getattr(_active_frame, "value", None)
+    _active_frame.value = number
+    try:
+        yield
+    finally:
+        _active_frame.value = previous
+
+
+def readback_report() -> dict:
+    records = list(_readbacks)
+    return {
+        "count": len(records),
+        "logical_bytes": sum(item["bytes"] for item in records),
+        "physical_bytes": sum(item["physical_bytes"] for item in records),
+        "by_category": {category: sum(1 for item in records if item["category"] == category)
+                        for category in sorted({item["category"] for item in records})},
+        "records": records,
+    }
+
+
+def reset_readbacks() -> None:
+    """Discard prior readback records, normally after benchmark warmup."""
+    _readbacks.clear()
 
 
 def count(category: str) -> int:

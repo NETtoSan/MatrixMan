@@ -7,6 +7,8 @@ import time
 import cv2
 import torch
 
+from drivers.matrixman.benchmarks.cpu_audit import stage
+
 
 def first_tensor(value):
     if isinstance(value, torch.Tensor):
@@ -55,35 +57,40 @@ def detections(prediction, width: int, height: int, names: dict,
                conf_threshold: float, iou_threshold: float, *, verbose: bool = False):
     """Decode [1, 4+classes, anchors], convert boxes, and run CPU NMS."""
     started = time.perf_counter()
-    if prediction.ndim == 3:
-        prediction = prediction[0]
-    if prediction.ndim != 2 or prediction.shape[0] < 6:
-        return [], 0
-    if prediction.shape[0] < prediction.shape[1]:
-        prediction = prediction.transpose(0, 1)
-    boxes = prediction[:, :4]
-    scores = prediction[:, 4:]
-    confidence, classes = scores.max(dim=1).values, scores.argmax(dim=1)
-    keep = confidence >= conf_threshold
-    kept = int(keep.sum().item())
+    with stage("detection_decode_shape"):
+        if prediction.ndim == 3:
+            prediction = prediction[0]
+        if prediction.ndim != 2 or prediction.shape[0] < 6:
+            return [], 0
+        if prediction.shape[0] < prediction.shape[1]:
+            prediction = prediction.transpose(0, 1)
+    with stage("confidence_filter"):
+        boxes = prediction[:, :4]
+        scores = prediction[:, 4:]
+        confidence, classes = scores.max(dim=1).values, scores.argmax(dim=1)
+        keep = confidence >= conf_threshold
+        kept = int(keep.sum().item())
     if not keep.any():
         return [], 0
     boxes, confidence, classes = boxes[keep], confidence[keep], classes[keep]
-    cx, cy, w, h = boxes.unbind(1)
-    converted = torch.stack(((cx - w / 2).clamp(0, width - 1),
-                             (cy - h / 2).clamp(0, height - 1),
-                             (cx + w / 2).clamp(0, width - 1),
-                             (cy + h / 2).clamp(0, height - 1)), 1)
-    selected_by_class = []
-    for cls in classes.unique(sorted=True).tolist():
-        indices = torch.nonzero(classes == cls, as_tuple=False).flatten()
-        selected_by_class.append(indices[_nms(converted[indices], confidence[indices], iou_threshold)])
-    selected = torch.cat(selected_by_class) if selected_by_class else torch.empty(0, dtype=torch.long)
-    selected = selected[confidence[selected].argsort(descending=True)]
-    result = [
-        (box.tolist(), float(score), int(cls), names.get(int(cls), str(int(cls))))
-        for box, score, cls in zip(converted[selected], confidence[selected], classes[selected])
-    ]
+    with stage("box_conversion"):
+        cx, cy, w, h = boxes.unbind(1)
+        converted = torch.stack(((cx - w / 2).clamp(0, width - 1),
+                                 (cy - h / 2).clamp(0, height - 1),
+                                 (cx + w / 2).clamp(0, width - 1),
+                                 (cy + h / 2).clamp(0, height - 1)), 1)
+    with stage("nms"):
+        selected_by_class = []
+        for cls in classes.unique(sorted=True).tolist():
+            indices = torch.nonzero(classes == cls, as_tuple=False).flatten()
+            selected_by_class.append(indices[_nms(converted[indices], confidence[indices], iou_threshold)])
+        selected = torch.cat(selected_by_class) if selected_by_class else torch.empty(0, dtype=torch.long)
+        selected = selected[confidence[selected].argsort(descending=True)]
+    with stage("result_packaging"):
+        result = [
+            (box.tolist(), float(score), int(cls), names.get(int(cls), str(int(cls))))
+            for box, score, cls in zip(converted[selected], confidence[selected], classes[selected])
+        ]
     if verbose:
         print(f"  postprocess: candidates={int(prediction.shape[0])} thresholded={kept} "
               f"detections={len(result)} duration={time.perf_counter() - started:.3f}s")

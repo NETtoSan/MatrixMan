@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from demo.yolo_helpers import detections, first_tensor, preprocess_frame, reduced_detections
 from drivers import matrixman
 from drivers.matrixman.backend import get_backend
+from drivers.matrixman.benchmarks.cpu_audit import frame_stages, memory_snapshot, stage
 
 
 def _parse_env(values: list[str]) -> dict[str, str]:
@@ -52,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", default="default", help="label this run for baseline/optimization comparisons")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE", help="backend control; may be repeated")
     parser.add_argument("--json", type=Path, default=Path("textlogs/yolo_benchmark.json"))
+    parser.add_argument("--cpu-audit", action="store_true", help="record process CPU time, readbacks, threads, and RSS")
     return parser.parse_args()
 
 
@@ -90,6 +92,9 @@ def main() -> int:
     for name, value in settings.items():
         os.environ[name] = value
     matrixman.config.reloadFromEnvironment()
+    if args.cpu_audit:
+        matrixman.config.auditCpuLeaks = True
+        matrixman.config.profile = True
     from ultralytics import YOLO
 
     model_path = args.model.expanduser().resolve()
@@ -106,7 +111,10 @@ def main() -> int:
         if not cap.isOpened():
             raise RuntimeError(f"could not open video: {video_path}")
         matrixman.profile_reset()
+        audit_start = memory_snapshot() if args.cpu_audit else None
+        memory_samples = []
         warmup_done = 0
+        stream_frame = 0
         measured = []
         try:
             while warmup_done < args.warmup or len(measured) < args.frames:
@@ -115,34 +123,54 @@ def main() -> int:
                     break
                 is_warmup = warmup_done < args.warmup
                 frame_started = time.perf_counter()
-                cpu_input = preprocess_frame(frame, args.imgsz)
+                from drivers.matrixman import audit
                 upload_started = time.perf_counter()
-                gpu_input = matrixman.to_device(cpu_input)
-                upload_time = time.perf_counter() - upload_started
-                inference_started = time.perf_counter()
-                with torch.no_grad():
-                    output = first_tensor(net(gpu_input))
-                inference_time = time.perf_counter() - inference_started
-                if not matrixman.is_matrixman_tensor(output):
-                    raise RuntimeError("model output did not remain a MatrixMan tensor")
-                readback_started = time.perf_counter()
-                reduction_enabled = matrixman.config.gpuPostprocess
-                if reduction_enabled:
-                    reduced_output = matrixman.gpu_postprocess_detection(output)
-                    prediction = reduced_output.cpu()
-                    readback_bytes = reduced_output._owner.layout.texture_width * reduced_output._owner.layout.texture_height * 16
-                else:
-                    prediction = output.cpu()
-                    readback_bytes = output._owner.layout.texture_width * output._owner.layout.texture_height * 16
-                readback_time = time.perf_counter() - readback_started
-                postprocess_started = time.perf_counter()
-                decode = reduced_detections if reduction_enabled else detections
-                result, candidates = decode(prediction, args.imgsz, args.imgsz, names, args.conf, args.iou)
-                postprocess_time = time.perf_counter() - postprocess_started
+                with audit.frame(stream_frame), frame_stages(args.cpu_audit) as stages:
+                    with stage("preprocessing"):
+                        cpu_input = preprocess_frame(frame, args.imgsz)
+                    with stage("host_to_gpu_upload"):
+                        gpu_input = matrixman.to_device(cpu_input)
+                    upload_time = (
+                        stages.values["host_to_gpu_upload"]["wall_seconds"]
+                        if stages is not None else time.perf_counter() - upload_started
+                    )
+                    inference_started = time.perf_counter()
+                    with stage("matrixman_dispatch"):
+                        with torch.no_grad():
+                            output = first_tensor(net(gpu_input))
+                    inference_time = time.perf_counter() - inference_started
+                    if not matrixman.is_matrixman_tensor(output):
+                        raise RuntimeError("model output did not remain a MatrixMan tensor")
+                    reduction_enabled = matrixman.config.gpuPostprocess
+                    readback_started = time.perf_counter()
+                    with stage("explicit_readback"):
+                        with audit.readback_context("final_output"):
+                            if reduction_enabled:
+                                reduced_output = matrixman.gpu_postprocess_detection(output)
+                                prediction = reduced_output.cpu()
+                                readback_bytes = reduced_output._owner.layout.texture_width * reduced_output._owner.layout.texture_height * 16
+                            else:
+                                prediction = output.cpu()
+                                readback_bytes = output._owner.layout.texture_width * output._owner.layout.texture_height * 16
+                    readback_time = (
+                        stages.values["explicit_readback"]["wall_seconds"]
+                        if stages is not None else time.perf_counter() - readback_started
+                    )
+                    postprocess_started = time.perf_counter()
+                    with stage("cpu_postprocess"):
+                        decode = reduced_detections if reduction_enabled else detections
+                        result, candidates = decode(prediction, args.imgsz, args.imgsz, names, args.conf, args.iou)
+                    postprocess_time = (
+                        stages.values["cpu_postprocess"]["wall_seconds"]
+                        if stages is not None else time.perf_counter() - postprocess_started
+                    )
                 if is_warmup:
                     warmup_done += 1
                     if warmup_done == args.warmup:
                         matrixman.profile_reset()
+                        if args.cpu_audit:
+                            audit.reset_readbacks()
+                    stream_frame += 1
                     continue
                 measured.append({
                     "index": len(measured),
@@ -154,10 +182,18 @@ def main() -> int:
                     "readback_bytes": readback_bytes,
                     "candidates_before_nms": candidates,
                     "detections": len(result),
+                    "stages": ({name: dict(value) for name, value in stages.values.items()}
+                               if stages is not None else {}),
                 })
+                if args.cpu_audit:
+                    memory_samples.append({"frame": len(measured) - 1, **memory_snapshot()})
+                stream_frame += 1
         finally:
             cap.release()
         profile = _profile_snapshot()
+        audit_end = memory_snapshot() if args.cpu_audit else None
+        from drivers.matrixman import audit
+        readbacks = audit.readback_report() if args.cpu_audit else None
         matrixman.profile_report()
         totals = [frame["total_seconds"] for frame in measured]
         result = {
@@ -175,9 +211,26 @@ def main() -> int:
                 "measured_frames": len(measured),
                 "mean_total_seconds": sum(totals) / len(totals) if totals else None,
                 "mean_fps": len(totals) / sum(totals) if totals and sum(totals) else None,
+                "mean_stage_seconds": {
+                    name: {
+                        metric: sum(frame["stages"].get(name, {}).get(metric, 0.0) for frame in measured) / len(measured)
+                        for metric in ("wall_seconds", "cpu_seconds")
+                    }
+                    for name in sorted({name for frame in measured for name in frame["stages"]})
+                },
             },
             "profile": profile,
         }
+        if args.cpu_audit:
+            result["cpu_audit"] = {
+                "process_cpu_seconds": time.process_time(),
+                "logical_cpus": os.cpu_count(),
+                "start_memory": audit_start,
+                "end_memory": audit_end,
+                "memory_samples": memory_samples,
+                "readbacks": readbacks,
+                "unsupported_operations": matrixman.unsupported_report(),
+            }
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(f"benchmark JSON: {args.json}")
