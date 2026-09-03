@@ -94,6 +94,24 @@ class CudaBackend(Backend):
     def __init__(self):
         factories.install_privateuse1_factory_kernels()
         self.execution = CudaExecutionBackend()
+        kernel_override = (
+            config.cudaConv3x3Variant
+            if config.cudaConv3x3Variant == "plane_legacy"
+            else "none"
+        )
+        print("MatrixMan CUDA runtime:")
+        print(
+            f"  async queue: {'enabled' if self.execution._async_queue_enabled else 'disabled'}"
+        )
+        print(
+            f"  allocation pool: {'enabled' if self.execution._pool_enabled else 'disabled'}"
+        )
+        print(
+            "  deferred release: "
+            f"{'enabled' if self.execution._async_queue_enabled else 'disabled'}"
+        )
+        print(f"  profiling: {'enabled' if profiling.is_enabled() else 'disabled'}")
+        print(f"  kernel override: {kernel_override}")
         # Raw parameter pointers are owned by this backend for its lifetime;
         # activation/output owners remain independently managed by tensors.
         self._parameter_cache = {}

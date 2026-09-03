@@ -1,7 +1,8 @@
 """Public OpenGL backend entrypoint and compatibility exports."""
 
 from ...backend import Backend
-from . import diagnostics, factories, gpumatrix as gm, profiling, runtime, tensor as tensor_module
+from ...config import config
+from . import adapter, diagnostics, factories, gpumatrix as gm, profiling, runtime, tensor as tensor_module
 from . import metadata, operation_context, resources
 from .ops import matmul, postprocessing
 from ...tensor import (
@@ -61,23 +62,23 @@ def device_info() -> dict[str, str]:
     renderer_text = text(values["renderer"])
     vendor_text = text(values["vendor"])
     policy = classify_renderer(vendor_text, renderer_text)
+    preference = runtime._adapter_preference or adapter.request_preference(config.useDGPU)
+    preference = adapter.finalize_preference(preference, vendor_text, renderer_text)
     return {
         key: text(value)
         for key, value in values.items()
-    } | {"device_policy": policy}
+    } | {
+        "device_policy": policy,
+        "gpu_preference": preference["gpu_preference"],
+        "gpu_preference_honored": preference["gpu_preference_honored"],
+        "gpu_preference_reason": preference["gpu_preference_reason"],
+    }
 
 
 def classify_renderer(vendor: str, renderer: str) -> str:
-    """Describe renderer preference without affecting GL availability."""
-    lower_renderer = renderer.lower()
-    software = any(name in lower_renderer for name in ("llvmpipe", "softpipe", "swrast"))
-    if software:
-        policy = "software renderer; hardware GPU preferred when available"
-    elif "nvidia" in vendor.lower() or "nvidia" in renderer.lower():
-        policy = "NVIDIA fallback; alternate renderer selection unavailable via SDL"
-    else:
-        policy = "preferred non-NVIDIA renderer"
-    return policy
+    """Describe the active renderer without implying vendor equals topology."""
+    kind = adapter.classify_renderer(vendor, renderer)
+    return f"active {kind} renderer"
 
 
 def init() -> None:

@@ -35,6 +35,7 @@ Assignments use camelCase attributes and are type-checked immediately:
 from drivers import matrixman
 
 matrixman.config.backend = "opengl"
+matrixman.config.useDGPU = True
 matrixman.config.tileLimit = "auto"
 matrixman.config.tileSync = "end"
 matrixman.config.convSpatialReuse = True
@@ -65,7 +66,7 @@ values = matrixman.config.asDict()        # shallow copy of current values
 
 ## Configuration reference
 
-The following 26 variables are the active `MATRIXMAN_*` mappings in the
+The following 27 variables are the active `MATRIXMAN_*` mappings in the
 current source. Diagnostic and benchmark-only controls are included because
 they are intentionally supported by the centralized configuration object.
 
@@ -74,11 +75,22 @@ they are intentionally supported by the centralized configuration object.
 | Environment variable | Python attribute | Type | Default | Accepted values | Description | Lifecycle notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | `MATRIXMAN_BACKEND` | `config.backend` | `str` | `"auto"` | `auto`, `cuda`, `opengl` | Selects automatic capability-based selection, CUDA, or OpenGL. | `auto` means automatic selection; it is not a backend implementation name. Set before first backend use. |
+| `MATRIXMAN_USE_DGPU` | `config.useDGPU` | `bool` | `False` | boolean spellings above | OpenGL preference for a discrete (`True`) or integrated/power-saving (`False`) GPU. It does not select CUDA. | Read before OpenGL context creation; changing it after context creation does not switch the active context. Actual selection is platform/driver dependent. |
 
 `auto` probes usable backends and selects the first available implementation in
 the selector's capability order. An explicit `cuda` or `opengl` request fails
 if that backend is unavailable. This setting is independent from
-`tileLimit="auto"`.
+`useDGPU` and `tileLimit="auto"`.
+
+`useDGPU` is an OpenGL adapter preference only. `False` preserves the default
+integrated/power-saving preference; `True` requests a discrete/high-performance
+OpenGL adapter. It does not enable CUDA or alter tensor semantics. On Windows,
+the current SDL/WGL path cannot programmatically enumerate or select an adapter;
+use Windows Graphics Settings or a vendor application profile when strict
+adapter selection is required. On Linux, MatrixMan preserves existing PRIME/DRI configuration
+and does not overwrite `DRI_PRIME`; without such external configuration, SDL/
+the driver may choose the system default. Diagnostics report the requested
+preference, active renderer, and whether the preference could be verified.
 
 ### OpenGL tiling and convolution
 
@@ -183,6 +195,7 @@ requested `config.tileLimit` stays `"auto"`.
 PowerShell:
 
 ```powershell
+$env:MATRIXMAN_USE_DGPU="1"
 $env:MATRIXMAN_TILE_LIMIT="auto"
 $env:MATRIXMAN_TILE_SYNC="end"
 $env:MATRIXMAN_CONV_SPATIAL_REUSE="1"
@@ -193,6 +206,7 @@ python demo/main-tracking.py --imgsz 320
 Linux:
 
 ```bash
+MATRIXMAN_USE_DGPU=1 \
 MATRIXMAN_TILE_LIMIT=auto \
 MATRIXMAN_TILE_SYNC=end \
 MATRIXMAN_CONV_SPATIAL_REUSE=1 \
@@ -205,6 +219,7 @@ The Python-native equivalent is:
 from drivers import matrixman
 
 matrixman.config.tileLimit = "auto"
+matrixman.config.useDGPU = True
 matrixman.config.tileSync = "end"
 matrixman.config.convSpatialReuse = True
 matrixman.config.profile = True

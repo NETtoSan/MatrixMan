@@ -27,11 +27,11 @@ def debug_enabled() -> bool:
 
 
 def trace(message: str) -> None:
-    trace_log(f"    {message}")
+    #trace_log(f"    {message}")
     pass
 
-
 def kernel_log(message: str) -> None:
+
     trace_log(f"[MatrixMan/OpenGL] {message}")
 
 

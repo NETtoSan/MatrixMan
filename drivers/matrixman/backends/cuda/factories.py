@@ -129,11 +129,79 @@ def empty_strided_cuda(
         raise
 
 
+def new_full_cuda(
+    self, size, fill_value, *, dtype=None, layout=None, device=None, pin_memory=None
+):
+    """Create a contiguous CUDA tensor and fill it with the requested scalar."""
+    if not hasattr(self, "_owner") or self._owner.layout.kind != "cuda_linear":
+        raise RuntimeError("MatrixMan/CUDA: new_full requires a CUDA-backed MatrixManTensor self")
+    if dtype is None:
+        dtype = self.dtype
+    if device is None:
+        device = "matrixman:0"
+    _validate_options("torch.new_full", dtype, layout, device, pin_memory)
+    if dtype != torch.float32:
+        raise NotImplementedError(
+            f"MatrixMan/CUDA: torch.new_full supports float32 only, got {dtype}"
+        )
+    shape = _shape(size, "torch.new_full")
+    strides = []
+    stride = 1
+    for value in reversed(shape):
+        strides.insert(0, stride)
+        stride *= value
+    output = empty_strided_cuda(
+        shape,
+        tuple(strides),
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+    )
+    if not output.numel():
+        return output
+    backend = _cuda_context()
+    try:
+        backend.fill(output, fill_value)
+    except Exception:
+        output._owner.release()
+        raise
+    return output
+
+
 def _arange_count(start: float, end: float, step: float) -> int:
     if step == 0:
         raise ValueError("MatrixMan/CUDA: torch.arange step must be nonzero")
     distance = (end - start) / step
     return max(0, int(math.ceil(distance))) if distance > 0 else 0
+
+
+def arange_out_cuda(end, *, out):
+    """Write ``[0, ..., end)`` directly into an existing CUDA tensor."""
+    from ...tensor import MatrixManTensor
+
+    if not isinstance(out, MatrixManTensor) or out._owner.layout.kind != "cuda_linear":
+        raise RuntimeError("MatrixMan/CUDA: arange.out requires a CUDA-backed MatrixManTensor out")
+    if out.dtype != torch.float32:
+        raise NotImplementedError("MatrixMan/CUDA: arange.out supports float32 output only")
+    if out.layout != torch.strided or not out.is_contiguous() or out._storage_offset != 0:
+        raise RuntimeError(
+            "MatrixMan/CUDA: arange.out requires contiguous strided output with storage_offset=0"
+        )
+    length = _arange_count(0.0, float(end), 1.0)
+    expected_shape = (length,)
+    if tuple(int(value) for value in out.shape) != expected_shape:
+        raise RuntimeError(
+            f"MatrixMan/CUDA: arange.out cannot resize output from {list(out.shape)} "
+            f"to {list(expected_shape)}"
+        )
+    if not length:
+        return out
+    backend = _cuda_context()
+    if out._owner.execution is not backend.execution:
+        raise RuntimeError("MatrixMan/CUDA: arange.out output uses a different CUDA execution context")
+    backend.execution.arange(out._owner.pointer, 0.0, 1.0, length)
+    return out
 
 
 def _arange_cuda(start, end, step=1, *, dtype=None, layout=None, device=None, pin_memory=False):
@@ -193,7 +261,9 @@ def install_privateuse1_factory_kernels() -> None:
     lib = torch.library.Library("aten", "IMPL", "PrivateUse1")
     lib.impl("empty.memory_format", empty_cuda)
     lib.impl("empty_strided", empty_strided_cuda)
+    lib.impl("new_full", new_full_cuda)
     lib.impl("arange", arange_cuda)
     lib.impl("arange.start", arange_start_cuda)
     lib.impl("arange.start_step", arange_start_step_cuda)
+    lib.impl("arange.out", arange_out_cuda)
     _aten_privateuse1_lib = lib

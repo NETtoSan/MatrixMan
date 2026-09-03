@@ -28,10 +28,12 @@ class BackendCapability:
 
 def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
     """Probe all known backends once and return the ordered capability registry."""
+    cuda_probe_reason = None
     try:
         _, cuda_info = detect_device()
-    except Exception:
+    except Exception as exc:
         cuda_info = None
+        cuda_probe_reason = str(exc) or exc.__class__.__name__
 
     # OpenGL probing currently creates its hidden context.  Do not import or
     # probe it on the CUDA path.  It is still probed when needed for fallback
@@ -72,9 +74,13 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
             probed=True,
             backend=CudaBackend,
             device=cuda_info["name"] if cuda_info else None,
-            metadata={"compute_capability": cuda_info["compute_capability"]}
+            metadata={
+                "compute_capability": cuda_info["compute_capability"],
+                "driver_library": cuda_info["driver_library"],
+            }
             if cuda_info
             else {},
+            probe_reason=cuda_probe_reason,
         ),
         "opengl": BackendCapability(
             name="opengl",
@@ -92,6 +98,9 @@ def probe_capabilities(requested: str = "") -> dict[str, BackendCapability]:
             metadata={
                 "vendor": opengl_info.get("vendor", ""),
                 "device_policy": opengl_info.get("device_policy", ""),
+                "gpu_preference": opengl_info.get("gpu_preference", ""),
+                "gpu_preference_honored": opengl_info.get("gpu_preference_honored", ""),
+                "gpu_preference_reason": opengl_info.get("gpu_preference_reason", ""),
             },
         ),
     }
@@ -113,10 +122,18 @@ def _print_probe(capabilities: dict[str, BackendCapability]) -> None:
             print(f"    device: {capability.device}")
         if capability.metadata.get("compute_capability"):
             print(f"    compute capability: {capability.metadata['compute_capability']}")
+        if capability.metadata.get("driver_library"):
+            print(f"    CUDA driver library: {capability.metadata['driver_library']}")
         if capability.metadata.get("vendor"):
             print(f"    vendor: {capability.metadata['vendor']}")
         if capability.metadata.get("device_policy"):
             print(f"    device policy: {capability.metadata['device_policy']}")
+        if capability.metadata.get("gpu_preference"):
+            print(f"    GPU preference: {capability.metadata['gpu_preference']}")
+        if capability.metadata.get("gpu_preference_honored"):
+            print(f"    GPU preference honored: {capability.metadata['gpu_preference_honored']}")
+        if capability.metadata.get("gpu_preference_reason"):
+            print(f"    GPU preference reason: {capability.metadata['gpu_preference_reason']}")
         if capability.probe_reason:
             print(f"    reason: {capability.probe_reason}")
 

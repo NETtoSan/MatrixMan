@@ -2,25 +2,38 @@
 
 > **Does it run? YES.**  
 > **Is it fast? NO.**  
-> **Does your GPU run OpenGL? Welcome to MatrixMan.**
+> **Did modern PyTorch drop your GPU? MatrixMan may still have ideas.**
 
-MatrixMan is an experimental PyTorch execution backend for GPUs that do not
-have a usable native PyTorch compute backend.
+MatrixMan is an experimental PyTorch execution backend/runtime for obsolete and
+unsupported GPUs that modern PyTorch compute stacks have dropped.
 
-No CUDA? No usable native backend? Ancient integrated graphics? But
-programmable OpenGL shaders work? 
+Modern PyTorch dropped your GPU? If it still exposes a usable low-level
+interface, MatrixMan may still be able to run on it. The project implements a
+deliberately limited set of tensor operations itself through older GPU
+interfaces, keeping computationally capable hardware useful after its normal
+framework/toolchain support window has closed.
 
-Excellent.
-
-MatrixMan maps a supported subset of PyTorch tensor operations onto OpenGL and
-GLSL fragment shaders. Tensors are packed into floating-point textures, the
-shader performs the arithmetic, and framebuffer-backed textures hold the
-results.
+The runtime is not itself OpenGL, CUDA, or OpenCL. Those are execution backends
+under MatrixMan:
 
 ```text
-PyTorch -> MatrixMan -> OpenGL -> fragment shaders -> unsupported/ancient GPU
-                                                         -> hopefully numbers
+PyTorch
+   ↓
+MatrixMan (PrivateUse1 / MatrixManTensor frontend)
+   ├── OpenGL / GLSL fragment shaders
+   │      legacy Intel / AMD / NVIDIA-class graphics
+   ├── CUDA Driver API / PTX
+   │      legacy NVIDIA GPUs
+   └── OpenCL
+          experimental / future; not implemented
+   ↓
+GPU
 ```
+
+OpenGL and CUDA are separate implementations behind the same MatrixMan-facing
+selection and tensor-dispatch layer. PrivateUse1 supplies PyTorch's device
+identity and dispatch boundary; MatrixMan owns the tensor/runtime work below
+that boundary.
 
 OpenGL: “I am rendering pixels.”  
 MatrixMan: “You are doing tensor math.”
@@ -28,6 +41,68 @@ MatrixMan: “You are doing tensor math.”
 This is not universal OpenGL magic. Compatibility depends on the driver,
 OpenGL/GLSL version, floating-point texture support, and floating-point
 framebuffer support.
+
+## Backend Status
+
+### OpenGL / GLSL
+
+OpenGL is the current, most mature MatrixMan backend. It abuses GLSL fragment
+shaders for tensor arithmetic: tensors are packed into floating-point textures,
+the shader performs the operation, and framebuffer-backed textures hold the
+results. This is deliberately not generic native OpenGL compute.
+
+The OpenGL backend is integrated with PyTorch through `PrivateUse1`,
+`MatrixManTensor`, and `__torch_dispatch__`. Its supported subset includes the
+operations listed below, including Conv2D, grouped/depthwise convolution,
+inference BatchNorm, activation, pooling, resize, concatenation, softmax, and
+metadata-only view paths. Unsupported arithmetic fails explicitly instead of
+silently moving to the CPU.
+
+The OpenGL path has been verified on Linux and Windows. Confirmed hardware
+evidence currently includes Intel GM45/GMA 4500MHD, Intel HD Graphics 4400,
+and NVIDIA GT 720M-class hardware with the drivers listed in the compatibility
+table. A custom Ultralytics YOLO detection checkpoint has also been run through
+the PyTorch-facing path. These are validated configurations and model paths,
+not a claim that every OpenGL GPU, YOLO model, or PyTorch workload is supported.
+
+Known limitations include the narrow ATen operator subset, float32-oriented
+storage, driver- and shader-dependent behavior, and conservative physical
+tiling/synchronization requirements. GM45 can corrupt large one-shot
+convolution renders, so the production baseline uses small tiles.
+
+### CUDA / PTX
+
+CUDA is a separate legacy execution backend for NVIDIA hardware. It uses the
+CUDA Driver API directly through `ctypes`, embedded/hand-managed PTX, and CUDA
+device allocations. It does not depend on `torch.cuda` for execution. The
+validated PTX target is `sm_21`; the legacy test system is a GeForce GT 720M
+(GF117M/Fermi, Compute Capability 2.1) with NVIDIA driver 390.157.
+
+The CUDA backend is connected to MatrixMan's PyTorch-facing
+`PrivateUse1`/`MatrixManTensor` dispatch layer. The frontend is shared, but the
+CUDA tensor owner, kernels, transfers, and synchronization are not the
+OpenGL implementation. The current CUDA scope covers a limited float32
+runtime and dispatch subset, including elementwise arithmetic, 2D matmul,
+selected views/splits/cat/stack, sigmoid/SiLU, softmax, nearest-neighbor
+upsampling, inference BatchNorm, and a constrained NCHW Conv2D path. CUDA and
+OpenGL do not have full feature parity.
+
+Important CUDA limits remain: uploads require contiguous CPU float32 tensors;
+matmul is limited to contiguous 2D float32 inputs; convolution does not support
+transposed convolution or output padding and has restricted groups/layout
+support; BatchNorm is inference-only; tensor-tensor division is not
+implemented; and unsupported operators fail explicitly. CUDA uses the default
+stream, with asynchronous kernel queueing by default and synchronous Driver
+API transfers/readback. CUDA-specific runtime and operator coverage is still
+smaller than the OpenGL path, and the CUDA backend should not be read as
+arbitrary PyTorch or general model support.
+
+### OpenCL
+
+OpenCL is a planned/experimental backend only. `drivers/matrixman/backends/opencl/`
+is currently a placeholder, the OpenCL probe is not implemented, and no
+OpenCL fallback path should be inferred from the directory. OpenGL remains the
+only backend with the project's broadest validated model evidence.
 
 ## Implemented Operation Subset
 
@@ -49,9 +124,10 @@ arithmetic on the CPU.
 
 ## Current Status
 
-The working PyTorch-facing MatrixMan backend is currently OpenGL. A separate
-low-level CUDA execution backend is selectable when its legacy driver is
-available, but it is not yet integrated with the PrivateUse1 tensor frontend.
+The working PyTorch-facing MatrixMan frontend can select CUDA when its legacy
+driver is available and otherwise falls back to OpenGL. OpenGL remains the
+most mature and broadly validated backend; CUDA is a separate, lower-level
+implementation with a connected but smaller PrivateUse1 operator surface.
 The following are verified
 hardware results, not a claim that all GPUs from these vendors or families are
 supported:
@@ -150,10 +226,9 @@ ops/                arithmetic, activation, normalization, pooling, resize,
 ```
 
 `implementation.py` is now only a small compatibility re-export façade. It is
-not in the normal runtime execution path. The `backends/cuda/` and
-`backends/opencl/` remains a reserved placeholder package. CUDA selection is
-currently truthful at the backend boundary, while its PrivateUse1 operator
-coverage is still being added.
+not in the normal runtime execution path. The `backends/cuda/` package contains
+the CUDA Driver API/PTX runtime and backend-specific operations. The
+`backends/opencl/` package remains a reserved placeholder.
 
 ## Basic PyTorch Usage
 
@@ -310,14 +385,14 @@ The backend layout leaves room for future sibling implementations:
 ```text
 drivers/matrixman/backends/
 ├── opengl/   verified current backend
-├── cuda/     legacy Driver API execution backend; frontend integration pending
+├── cuda/     legacy Driver API/PTX backend; limited frontend integration
 └── opencl/   placeholder only; not implemented
 ```
 
-OpenCL support is not currently provided. CUDA has a low-level runtime and
-matrix execution path, but still needs its own tensor representation, dispatch
-bridge, operator implementations, and framework/factory integration. The
-current OpenGL `MatrixManTensor` is not intended to be shared by those backends.
+OpenCL support is not currently provided. CUDA has its own tensor owner,
+Driver API/PTX execution path, dispatch handlers, operator implementations,
+and factory registration. The current OpenGL `MatrixManTensor` storage owner
+is not shared by CUDA or intended to be shared by OpenCL.
 
 ## What MatrixMan Is Not
 

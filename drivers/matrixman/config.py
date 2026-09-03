@@ -16,6 +16,7 @@ _FALSE = {"", "0", "false", "no", "off"}
 _TRUE = {"1", "true", "yes", "on"}
 _DEFAULTS = {
     "backend": "auto", "tileLimit": 256, "resolvedTileLimit": 256,
+    "useDGPU": False,
     "tileSync": "per_tile", "convSpatialReuse": False,
     "skipPreConsolidationSync": False, "diagnosticTiles": False,
     "diagnosticRectTiles": False, "diagTileWidth": None,
@@ -30,6 +31,7 @@ _DEFAULTS = {
 }
 _ENV_FIELDS = {
     "MATRIXMAN_BACKEND": "backend", "MATRIXMAN_TILE_LIMIT": "tileLimit",
+    "MATRIXMAN_USE_DGPU": "useDGPU",
     "MATRIXMAN_TILE_SYNC": "tileSync", "MATRIXMAN_CONV_SPATIAL_REUSE": "convSpatialReuse",
     "MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC": "skipPreConsolidationSync",
     "MATRIXMAN_DIAGNOSTIC_TILES": "diagnosticTiles", "MATRIXMAN_DIAGNOSTIC_RECT_TILES": "diagnosticRectTiles",
@@ -45,7 +47,7 @@ _ENV_FIELDS = {
     "MATRIXMAN_TILE_AUTOTUNE_REFRESH": "tileAutotuneRefresh",
 }
 _BOOL_FIELDS = {
-    "convSpatialReuse", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
+    "useDGPU", "convSpatialReuse", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
     "profile", "cudaProfile", "profileDetail", "gpuTiming", "trace", "debug", "gpuPostprocess",
     "auditCpuLeaks", "cudaDebug", "cudaDisableAsyncQueue", "cudaDisableAllocPool",
     "cudaDisableSpecializedConv", "cudaLegacyModuleLoad", "tileAutotuneRefresh",
@@ -150,7 +152,7 @@ class Configuration:
             _sync_profile(value)
 
     def __repr__(self) -> str:
-        names = ("backend", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "profile", "gpuTiming")
+        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "profile", "gpuTiming")
         return "MatrixManConfig(" + ", ".join(f"{n}={self._values[n]!r}" for n in names) + ")"
 
     @property

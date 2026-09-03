@@ -41,6 +41,7 @@ per-terminal settings are recommended.
 | Variable | Backend/Subsystem | Purpose | Default | Example value |
 |---|---|---|---|---|
 | `MATRIXMAN_BACKEND` | shared selector | Select `auto`, `cuda`, or `opengl` | automatic capability order | `opengl` |
+| `MATRIXMAN_USE_DGPU` | OpenGL adapter preference | Prefer discrete (`1`) or integrated/power-saving (`0`) OpenGL GPU | `0` | `1` |
 | `MATRIXMAN_PROFILE` | shared profiling | Enable selected-backend profiling | off | `1` |
 | `MATRIXMAN_CUDA_PROFILE` | CUDA legacy profiling | CUDA-only fallback profiling switch | off | `1` |
 | `MATRIXMAN_TRACE` | shared tracing | High-level operation trace | off | `1` |
@@ -85,6 +86,17 @@ messages. These are implemented in `drivers/matrixman/config.py` and
 
 Sources: `backends/opengl/diagnostics.py`, `profiling.py`, `convolution.py`,
 `compatibility.py`, and `benchmarks/yolo_benchmark.py`.
+
+`MATRIXMAN_USE_DGPU` maps to `matrixman.config.useDGPU`. It uses the shared
+boolean parser, defaults to `0`, and must be set before the OpenGL context is
+created. The current SDL/WGL path has no adapter enumeration or explicit GPU
+index. DXGI GPU-preference enumeration cannot steer `SDL_GL_CreateContext`,
+and NVIDIA Optimus/AMD PowerXpress exports must be present in the executable
+itself, which a ctypes-loaded Python module cannot provide to `python.exe`.
+The diagnostic output reports the requested preference, active renderer, and
+whether the preference was honored. For strict selection, use Windows Graphics
+Settings (System > Display > Graphics > select `python.exe` > Options > High
+performance) or an NVIDIA Control Panel application profile.
 
 - `MATRIXMAN_DEBUG`, `MATRIXMAN_PROFILE_DETAIL`, `MATRIXMAN_GPU_TIMING`, and
   `MATRIXMAN_CONV_SPATIAL_REUSE` are booleans. They affect diagnostics,
@@ -202,6 +214,7 @@ PowerShell examples use semicolons; cmd.exe examples use `&&`:
 
 ```powershell
 $env:MATRIXMAN_BACKEND="opengl"; python -m drivers.matrixman --check
+$env:MATRIXMAN_USE_DGPU="1"; $env:MATRIXMAN_BACKEND="opengl"; python -m drivers.matrixman --check
 $env:MATRIXMAN_BACKEND="cuda"; python -m drivers.matrixman --check
 $env:MATRIXMAN_AUDIT_CPU_LEAKS="1"; $env:MATRIXMAN_BACKEND="opengl"; python demo/main-tracking.py --imgsz 320
 $env:MATRIXMAN_CUDA_DISABLE_ASYNC_QUEUE="1"; $env:MATRIXMAN_BACKEND="cuda"; python -m drivers.matrixman.diagnostics.matrixman_conv_demo
@@ -252,10 +265,10 @@ diagnostic mode in later work.
 
 ## Source Audit
 
-- **Unique active `MATRIXMAN_*` names found:** 26.
+- **Unique active `MATRIXMAN_*` names found:** 27.
 - **Source files containing environment reads:** `drivers/matrixman/audit.py`,
   `selector.py`, `config.py`, `compatibility.py`,
-  `config.py`, `backends/opengl/diagnostics.py`,
+  `config.py`, `backends/opengl/adapter.py`, `backends/opengl/diagnostics.py`,
   `backends/opengl/profiling.py`, `backends/opengl/convolution.py`,
   `backends/cuda/gpumatrix.py`, `backends/cuda/backend.py`, and
   `benchmarks/yolo_benchmark.py`.
@@ -268,6 +281,11 @@ diagnostic mode in later work.
   diagnostic-only; CUDA variant values other than `plane_legacy` fall through
   to normal kernel selection rather than being rejected.
 
-All 26 currently consumed `MATRIXMAN_*` variables are represented in the Quick
+All 27 currently consumed `MATRIXMAN_*` variables are represented in the Quick
 Reference table and described above. The canonical mapping and lifecycle
 reference is [`matrixman-configuration.md`](matrixman-configuration.md).
+
+The repository's bundled Windows `SDL2.dll` is SDL 2.32.8. MatrixMan uses
+`SDL_Init`, `SDL_CreateWindow`, and `SDL_GL_CreateContext`; this SDL/OpenGL
+path exposes no adapter enumeration, explicit GPU index, or high-performance
+OpenGL selection hint.

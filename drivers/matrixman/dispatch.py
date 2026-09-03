@@ -243,6 +243,28 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             if len(args) < 2:
                 raise RuntimeError("MatrixMan/CUDA: malformed fill_ arguments")
             return backend.fill(args[0], args[1])
+        if func is torch.ops.aten.new_full.default:
+            if len(args) < 3:
+                raise RuntimeError("MatrixMan/CUDA: malformed new_full arguments")
+            from .backends.cuda.factories import new_full_cuda
+
+            input_tensor, size, fill_value = args[:3]
+            options = kwargs or {}
+            return new_full_cuda(
+                input_tensor,
+                size,
+                fill_value,
+                dtype=options.get("dtype"),
+                layout=options.get("layout"),
+                device=options.get("device"),
+                pin_memory=options.get("pin_memory"),
+            )
+        if func is torch.ops.aten.arange.out:
+            if len(args) < 1 or "out" not in (kwargs or {}):
+                raise RuntimeError("MatrixMan/CUDA: malformed arange.out arguments")
+            from .backends.cuda.factories import arange_out_cuda
+
+            return arange_out_cuda(args[0], out=(kwargs or {})["out"])
         if func is torch.ops.aten.upsample_nearest2d.default:
             if len(args) < 4:
                 raise RuntimeError("MatrixMan/CUDA: malformed upsample_nearest2d arguments")

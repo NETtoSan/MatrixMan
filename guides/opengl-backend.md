@@ -121,6 +121,26 @@ example `--sizes 256,512,1024 --max-size 1024 --timeout 30`. The existing
 GM45-safe production defaults remain `MATRIXMAN_TILE_LIMIT=256` and
 `MATRIXMAN_TILE_SYNC=per_tile`.
 
+## Conv tiling demonstration
+
+For a focused correctness check of the real OpenGL Conv2D path, run:
+
+```text
+python -m drivers.matrixman.diagnostics.opengl_conv_tiling_demo --tile-size 16
+python -m drivers.matrixman.diagnostics.opengl_conv_tiling_demo --tile-size 256
+python -m drivers.matrixman.diagnostics.opengl_conv_tiling_demo --tile-size 512 --compare-direct
+```
+
+The diagnostic temporarily overrides `matrixman.config.tileLimit`, executes
+`torch.nn.functional.conv2d` with a MatrixMan tensor, and restores the prior
+configuration before exiting. Its default workload is `[1,8,32,32]` with an
+`[8,8,3,3]` weight and bias. Use `--preset yolo80` for the historical
+`[1,64,80,80]` to `[1,64,80,80]` workload. The result remains on the real
+OpenGL packed-texture/tiled shader path until the explicit validation readback.
+The report obtains tile coordinates and physical dimensions from existing
+diagnostic Conv telemetry and compares the readback with an independent NumPy
+float32 reference using `rtol=5e-4` and `atol=5e-4`.
+
 ## Compatibility and profiling
 
 Startup probes OpenGL availability and selects the OpenGL backend when a

@@ -6,6 +6,7 @@ import ctypes
 from dataclasses import dataclass
 
 from . import gpumatrix as gm
+from . import adapter
 from ...config import config
 
 
@@ -74,13 +75,14 @@ class _GlRuntime:
 
 
 _runtime: _GlRuntime | None = None
+_adapter_preference: dict[str, str] | None = None
 _MAX_SCRATCH_TEXTURES = 32
 _MAX_PARAMETER_CACHE_ENTRIES = 256
 
 
 def init() -> None:
     """Initialize the hidden SDL/OpenGL context and runtime-owned caches."""
-    global _runtime
+    global _runtime, _adapter_preference
     if _runtime is not None:
         return
 
@@ -90,6 +92,7 @@ def init() -> None:
     from ...privateuse import register_privateuse1_backend
 
     register_privateuse1_backend()
+    _adapter_preference = adapter.request_preference(config.useDGPU)
     diagnostics.trace("MatrixMan/OpenGL init -> SDL hidden compatibility-profile context")
     sdl_initialized = False
     window = None
@@ -172,7 +175,7 @@ def _gl_text(value) -> str:
 
 def shutdown() -> None:
     """Release all GL objects owned by the current runtime."""
-    global _runtime
+    global _runtime, _adapter_preference
     if _runtime is None:
         return
 
@@ -215,6 +218,7 @@ def shutdown() -> None:
     gm.sdl.SDL_DestroyWindow(_runtime.window)
     gm.sdl.SDL_Quit()
     _runtime = None
+    _adapter_preference = None
     from ... import audit
     audit.summary()
 

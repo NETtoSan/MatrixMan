@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
 import sys
 
 import numpy as np
@@ -4258,11 +4259,22 @@ PTX = _append_256_thread_plane_kernel(PTX)
 
 
 def load_driver() -> ctypes.CDLL:
+    if os.name == "nt":
+        path = "nvcuda.dll"
+        try:
+            return ctypes.WinDLL(path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"CUDA Driver API unavailable; attempted {path!r}: {exc}"
+            ) from exc
+
     path = ctypes.util.find_library("cuda") or "libcuda.so.1"
     try:
         return ctypes.CDLL(path)
     except OSError as exc:
-        raise RuntimeError("CUDA Driver API unavailable") from exc
+        raise RuntimeError(
+            f"CUDA Driver API unavailable; attempted {path!r}: {exc}"
+        ) from exc
 
 
 def configure_driver(driver: ctypes.CDLL) -> None:
@@ -4358,6 +4370,7 @@ def detect_device(driver: ctypes.CDLL | None = None) -> tuple[ctypes.CDLL, dict[
         "name": name.value.decode(errors="replace"),
         "compute_capability": f"{major.value}.{minor.value}",
         "memory_mib": f"{total_mem.value / (1024 * 1024):.1f}",
+        "driver_library": "nvcuda.dll" if sys.platform == "win32" else getattr(driver, "_name", "cuda"),
     }
 
 

@@ -38,7 +38,6 @@ _is_scalar_operand = operation_context.is_scalar_operand
 _scalar_value = operation_context.scalar_value
 _numel = numel
 
-
 def _trace(message: str) -> None:
     diagnostics.trace(message)
 
