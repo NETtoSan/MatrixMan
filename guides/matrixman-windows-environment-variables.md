@@ -51,7 +51,8 @@ per-terminal settings are recommended.
 | `MATRIXMAN_TILE_LIMIT` | OpenGL convolution | Physical tile limit or validated `auto` selection | `256` | `512` or `auto` |
 | `MATRIXMAN_TILE_SYNC` | OpenGL convolution | Inter-tile synchronization mode | `per_tile` | `end` |
 | `MATRIXMAN_CONV_SPATIAL_REUSE` | OpenGL convolution | Experimental spatial reuse | off | `1` |
-| `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` | OpenGL convolution | Skip pre-consolidation sync experiment | off | `1` |
+| `MATRIXMAN_PREPARED_EXECUTION` | OpenGL convolution | Prepared Conv/BatchNorm execution | on | `0` or `1` |
+| `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` | OpenGL convolution | Skip redundant pre-consolidation synchronization | on | `0` to retain the legacy barrier |
 | `MATRIXMAN_DIAGNOSTIC_TILES` | OpenGL compatibility | Capture tile diagnostics | off | `1` |
 | `MATRIXMAN_DIAGNOSTIC_RECT_TILES` | OpenGL diagnostics | Enable rectangular/order tile experiments | off | `1` |
 | `MATRIXMAN_DIAG_TILE_WIDTH` | OpenGL diagnostics | Diagnostic tile width | tile limit | `440` |
@@ -108,7 +109,7 @@ performance) or an NVIDIA Control Panel application profile.
 - `MATRIXMAN_TILE_SYNC` accepts `per_tile`, `end`, `flush`, or `none`; invalid
   values raise an error. It changes synchronization/performance, not intended
   numerical semantics.
-- `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` is a boolean experiment.
+- `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` defaults on after the tiled synchronization audit; set it to `0` only when diagnosing legacy barrier behavior.
 - `MATRIXMAN_DIAGNOSTIC_TILES` and `MATRIXMAN_DIAGNOSTIC_RECT_TILES` are
   boolean diagnostic switches.
 - `MATRIXMAN_DIAG_TILE_WIDTH` and `MATRIXMAN_DIAG_TILE_HEIGHT` are positive

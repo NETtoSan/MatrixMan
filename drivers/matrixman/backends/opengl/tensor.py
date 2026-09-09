@@ -28,9 +28,10 @@ live_textures = weakref.WeakSet()
 class _TextureOwner:
     """Own one GL texture and delete it while the active runtime is alive."""
 
-    def __init__(self, texture, layout):
+    def __init__(self, texture, layout, pool_key=None):
         self.texture = texture
         self.layout = layout
+        self._pool_key = pool_key
         live_textures.add(self)
 
     @property
@@ -39,14 +40,25 @@ class _TextureOwner:
 
     def __del__(self):
         if runtime.is_active() and self.texture:
-            texture = ctypes.c_uint(self.texture)
-            gm.glDeleteTextures(1, ctypes.byref(texture))
-            self.texture = 0
+            if self._pool_key is not None:
+                try:
+                    from . import resources
+                    resources.release_activation_texture(self)
+                except Exception:
+                    # Destructors must not mask interpreter/runtime teardown.
+                    if self.texture:
+                        texture = ctypes.c_uint(self.texture)
+                        gm.glDeleteTextures(1, ctypes.byref(texture))
+                        self.texture = 0
+            else:
+                texture = ctypes.c_uint(self.texture)
+                gm.glDeleteTextures(1, ctypes.byref(texture))
+                self.texture = 0
 
 
-def owner_from_texture(texture, layout):
+def owner_from_texture(texture, layout, pool_key=None):
     """Construct the tensor-owned wrapper for an already allocated texture."""
-    return _TextureOwner(texture, layout)
+    return _TextureOwner(texture, layout, pool_key)
 
 
 def _validate_cpu_input(tensor: torch.Tensor) -> np.ndarray:
@@ -134,7 +146,10 @@ def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset
         f"  -> torch shape {list(shape)}"
     )
     sync_started = time.perf_counter()
-    gm.glFinish()
+    with profiling.stage("readback_synchronization_wait"):
+        gm.glFinish()
+    if profiling.enabled:
+        profiling.counters["readback_sync_calls"] += 1
     if profiling.enabled:
         profiling.counters["readback_sync_seconds"] += time.perf_counter() - sync_started
     element_count = numel(shape)
@@ -148,26 +163,28 @@ def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset
     if owner.layout.kind == "matrix2d_red" and storage_offset != 0:
         raise RuntimeError("gm45 matrix2d_red readback does not support nonzero storage offsets")
     transfer_started = time.perf_counter()
-    raw = resources.read_texture_pixels(owner, rt.fbo)
+    with profiling.stage("readback_transfer"):
+        raw = resources.read_texture_pixels(owner, rt.fbo)
     if profiling.enabled:
         profiling.counters["readback_transfer_seconds"] += time.perf_counter() - transfer_started
     conversion_started = time.perf_counter()
-    if owner.layout.kind == "matrix2d_red":
-        result = torch.from_numpy(raw.copy()).reshape(shape)
-    else:
-        max_index = max_storage_index(shape, logical_strides)
-        if storage_offset < 0 or storage_offset + max_index >= owner.layout.numel:
-            raise RuntimeError("gm45 readback storage offset is outside texture storage")
-        flat_storage = raw.reshape(-1)
-        if logical_strides == contiguous_strides(shape):
-            flat = flat_storage[storage_offset : storage_offset + element_count].copy()
-            result = torch.from_numpy(flat.reshape(shape))
+    with profiling.stage("readback_tensor_construction"):
+        if owner.layout.kind == "matrix2d_red":
+            result = torch.from_numpy(raw.copy()).reshape(shape)
         else:
-            result_array = np.empty(shape, dtype=np.float32)
-            for index in np.ndindex(shape):
-                source_index = storage_offset + sum(i * stride for i, stride in zip(index, logical_strides))
-                result_array[index] = flat_storage[source_index]
-            result = torch.from_numpy(result_array)
+            max_index = max_storage_index(shape, logical_strides)
+            if storage_offset < 0 or storage_offset + max_index >= owner.layout.numel:
+                raise RuntimeError("gm45 readback storage offset is outside texture storage")
+            flat_storage = raw.reshape(-1)
+            if logical_strides == contiguous_strides(shape):
+                flat = flat_storage[storage_offset : storage_offset + element_count].copy()
+                result = torch.from_numpy(flat.reshape(shape))
+            else:
+                result_array = np.empty(shape, dtype=np.float32)
+                for index in np.ndindex(shape):
+                    source_index = storage_offset + sum(i * stride for i, stride in zip(index, logical_strides))
+                    result_array[index] = flat_storage[source_index]
+                result = torch.from_numpy(result_array)
     if profiling.enabled:
         profiling.counters["readback_conversion_seconds"] += time.perf_counter() - conversion_started
         profiling.counters["readback_bytes"] += owner.layout.texture_width * owner.layout.texture_height * 4 * 4

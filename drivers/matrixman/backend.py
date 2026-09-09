@@ -194,14 +194,14 @@ def profile_enabled() -> bool:
     return _require_opengl_frontend("profile inspection").profile_enabled()
 
 
-def profile_report() -> None:
+def profile_report(frame_count: int | None = None) -> None:
     backend = get_backend()
     if backend.name == "cuda":
         from .backends.cuda import profiling
 
         profiling.report()
         return
-    _require_opengl_frontend("profile reporting").profile_report()
+    _require_opengl_frontend("profile reporting").profile_report(frame_count=frame_count)
 
 
 def profile_reset() -> None:

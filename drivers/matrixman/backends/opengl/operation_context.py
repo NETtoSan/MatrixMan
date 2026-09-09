@@ -12,7 +12,6 @@ import torch
 from . import gpumatrix as gm
 from . import kernels, metadata, profiling, render, resources, runtime
 from ...tensor import MatrixManTensor
-from .tensor import owner_from_texture
 
 
 def gl_runtime():
@@ -23,12 +22,11 @@ def output_texture(shape):
     """Allocate an empty packed logical output through the shared services."""
     shape = tuple(int(value) for value in shape)
     validate_shape(shape)
-    texture, layout = resources.allocate_packed_texture(shape)
-    owner = owner_from_texture(texture, layout)
+    owner = resources.acquire_activation_texture(shape)
     from . import diagnostics
     diagnostics.trace(
-        f"gm45.texture_alloc -> packed output texture #{texture} shape={list(shape)} "
-        f"atlas={layout.texture_width}x{layout.texture_height}"
+        f"gm45.texture_alloc -> packed output texture #{owner.texture} shape={list(shape)} "
+        f"atlas={owner.layout.texture_width}x{owner.layout.texture_height}"
     )
     return owner
 

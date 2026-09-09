@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 
-from .. import diagnostics, gpumatrix as gm, operation_context, profiling
+from .. import convolution, diagnostics, gpumatrix as gm, operation_context, profiling
 from ..storage import packed_atlas_size
 from ....tensor import MatrixManTensor
+
+
+_DEFAULT_PARAMETER_TENSORS: dict[tuple[int, float], torch.Tensor] = {}
+
+
+def _default_parameter(channels: int, value: float) -> torch.Tensor:
+    key = (channels, value)
+    tensor = _DEFAULT_PARAMETER_TENSORS.get(key)
+    if tensor is None:
+        tensor = torch.full((channels,), value, dtype=torch.float32)
+        _DEFAULT_PARAMETER_TENSORS[key] = tensor
+    return tensor
 
 def _batchnorm_program(params: tuple) -> tuple[int, int, int, int, int, int]:
     rt = operation_context.gl_runtime()
@@ -117,7 +128,7 @@ def _render_batch_norm(args):
         ("running_var", running_var, 1.0),
     ]:
         if value is None:
-            params.append(torch.full((channels,), default, dtype=torch.float32))
+            params.append(_default_parameter(channels, default))
             continue
         if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
             raise RuntimeError(f"gm45 native_batch_norm {name} must be a CPU tensor")
@@ -125,10 +136,25 @@ def _render_batch_norm(args):
             raise RuntimeError(f"gm45 native_batch_norm {name} must be contiguous float32 shape [{channels}]")
         params.append(value)
 
-    weight_owner = operation_context.upload_raw_parameter(params[0].detach().numpy().astype(np.float32, copy=False), "bn_weight")
-    bias_owner = operation_context.upload_raw_parameter(params[1].detach().numpy().astype(np.float32, copy=False), "bn_bias")
-    mean_owner = operation_context.upload_raw_parameter(params[2].detach().numpy().astype(np.float32, copy=False), "bn_mean")
-    var_owner = operation_context.upload_raw_parameter(params[3].detach().numpy().astype(np.float32, copy=False), "bn_var")
+    fused = convolution.try_fuse_batch_norm(
+        input_tensor, params[0], params[1], params[2], params[3], eps
+    )
+    if fused is not None:
+        return fused, torch.empty((0,), dtype=torch.float32), torch.empty((0,), dtype=torch.float32)
+
+    from .. import resources
+    weight_owner = resources.cached_parameter_texture(
+        params[0], "bn_weight", operation="BatchNorm", parameter_role="weight"
+    )
+    bias_owner = resources.cached_parameter_texture(
+        params[1], "bn_bias", operation="BatchNorm", parameter_role="bias"
+    )
+    mean_owner = resources.cached_parameter_texture(
+        params[2], "bn_mean", operation="BatchNorm", parameter_role="running_mean"
+    )
+    var_owner = resources.cached_parameter_texture(
+        params[3], "bn_var", operation="BatchNorm", parameter_role="running_var"
+    )
     out_owner = operation_context.output_texture(tuple(int(v) for v in input_tensor.shape))
 
     shader_params = (

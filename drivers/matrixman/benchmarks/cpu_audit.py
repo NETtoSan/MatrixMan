@@ -13,14 +13,14 @@ _active = threading.local()
 
 
 class FrameStages:
-    """Accumulate wall and process-CPU time for named nested stages."""
+    """Accumulate wall and calling-thread CPU time for named stages."""
 
     def __init__(self) -> None:
-        self.values = defaultdict(lambda: {"wall_seconds": 0.0, "cpu_seconds": 0.0})
+        self.values = defaultdict(lambda: {"wall_seconds": 0.0, "thread_cpu_seconds": 0.0})
 
-    def record(self, name: str, wall: float, cpu: float) -> None:
+    def record(self, name: str, wall: float, thread_cpu: float) -> None:
         self.values[name]["wall_seconds"] += wall
-        self.values[name]["cpu_seconds"] += cpu
+        self.values[name]["thread_cpu_seconds"] += thread_cpu
 
 
 @contextlib.contextmanager
@@ -44,11 +44,16 @@ def stage(name: str):
         yield
         return
     wall_started = time.perf_counter()
-    cpu_started = time.process_time()
+    thread_cpu_clock = getattr(time, "thread_time", time.process_time)
+    cpu_started = thread_cpu_clock()
     try:
         yield
     finally:
-        collector.record(name, time.perf_counter() - wall_started, time.process_time() - cpu_started)
+        collector.record(
+            name,
+            time.perf_counter() - wall_started,
+            thread_cpu_clock() - cpu_started,
+        )
 
 
 def _rss_bytes() -> int | None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 
-from . import gpumatrix as gm
+from . import gpumatrix as gm, glstate
 from . import adapter
 from ...config import config
 
@@ -70,13 +70,21 @@ class _GlRuntime:
     postprocess_uniforms: dict[tuple, int]
     conv_spatial_uniforms: dict[tuple, tuple[int, int, int]]
     scratch_texture_pool: dict[tuple[int, int], list[int]]
+    activation_texture_pool: dict[tuple, list[int]]
+    activation_texture_pool_order: list[tuple[tuple, int]]
+    activation_texture_pool_bytes: int
+    activation_texture_pool_peak_count: int
+    activation_texture_pool_peak_bytes: int
     parameter_cache: dict[tuple, object]
     parameter_cache_current: dict[tuple, tuple]
+    fused_parameter_cache: dict[tuple, tuple[object, object]]
 
 
 _runtime: _GlRuntime | None = None
 _adapter_preference: dict[str, str] | None = None
 _MAX_SCRATCH_TEXTURES = 32
+_MAX_ACTIVATION_TEXTURES = 256
+_MAX_ACTIVATION_POOL_BYTES = 64 * 1024 * 1024
 _MAX_PARAMETER_CACHE_ENTRIES = 256
 
 
@@ -110,6 +118,7 @@ def init() -> None:
         context = gm.sdl.SDL_GL_CreateContext(window)
         gm.sdl_check(bool(context), "SDL_GL_CreateContext failed")
         gm.initialize_context_functions()
+        glstate.install()
 
         fbo = ctypes.c_uint()
         gm.glGenFramebuffers(1, ctypes.byref(fbo))
@@ -141,9 +150,15 @@ def init() -> None:
         fill_uniforms={}, cat_uniforms={}, cat_dim0_2d_uniforms={},
         cat_lastdim_uniforms={}, cat_dim1_3d_uniforms={}, maxpool_uniforms={},
         upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={}, postprocess_uniforms={}, conv_spatial_uniforms={},
-        scratch_texture_pool={}, parameter_cache={}, parameter_cache_current={},
+        scratch_texture_pool={}, activation_texture_pool={}, activation_texture_pool_order=[],
+        activation_texture_pool_bytes=0, activation_texture_pool_peak_count=0,
+        activation_texture_pool_peak_bytes=0, parameter_cache={}, parameter_cache_current={},
+        fused_parameter_cache={},
     )
     from . import profiling
+    profiling.install_program_cache_profilers(_runtime)
+    profiling.install_gl_profilers()
+    profiling.install_program_profiler()
     profiling.initialize_gpu_timing()
     if config.tileLimit == "auto":
         try:
@@ -193,8 +208,12 @@ def shutdown() -> None:
             texture_id = ctypes.c_uint(texture)
             gm.glDeleteTextures(1, ctypes.byref(texture_id))
     _runtime.scratch_texture_pool.clear()
+    from . import resources
+    resources.clear_activation_pool(_runtime)
+    glstate.reset()
     _runtime.parameter_cache.clear()
     _runtime.parameter_cache_current.clear()
+    _runtime.fused_parameter_cache.clear()
     for program in (
         list(_runtime.add_programs.values()) + list(_runtime.matmul_programs.values())
         + list(_runtime.conv_programs.values()) + list(_runtime.conv_tile_programs.values())

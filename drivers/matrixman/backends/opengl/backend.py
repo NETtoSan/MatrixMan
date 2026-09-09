@@ -101,8 +101,8 @@ def profile_enabled() -> bool:
     return profiling.is_enabled()
 
 
-def profile_report() -> None:
-    profiling.report()
+def profile_report(frame_count: int | None = None) -> None:
+    profiling.report(frame_count=frame_count)
 
 
 def profile_reset() -> None:

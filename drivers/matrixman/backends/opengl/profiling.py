@@ -22,12 +22,60 @@ def _gpu_timing_enabled() -> bool:
 
 def _profile_detail() -> bool:
     return bool(config.profileDetail)
+
+
+def detailed_enabled() -> bool:
+    """Return whether high-volume CPU-stage/GL-call instrumentation is active."""
+    return bool(enabled and _profile_detail())
+
+
+_thread_cpu_clock = getattr(time, "thread_time", None)
+
+
+def thread_cpu_time() -> float:
+    """Return calling-thread CPU time, with a documented fallback."""
+    return (_thread_cpu_clock or time.process_time)()
+
+
+def thread_cpu_supported() -> bool:
+    return _thread_cpu_clock is not None
+
+
 started = time.perf_counter()
-ops: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "total": 0.0, "max": 0.0})
+ops: dict[str, dict[str, float]] = defaultdict(
+    lambda: {"calls": 0, "total": 0.0, "thread_cpu_seconds": 0.0, "max": 0.0}
+)
 counters: dict[str, float] = defaultdict(float)
 parameters: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "bytes": 0, "repeated": 0})
 parameter_keys: set[tuple[str, int]] = set()
+parameter_groups: dict[tuple, dict[str, float]] = defaultdict(
+    lambda: {
+        "upload_count": 0,
+        "repeated_count": 0,
+        "bytes": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_invalidations": 0,
+    }
+)
 conv: dict[str, float] = defaultdict(float)
+stage_timings: dict[str, dict[str, float]] = defaultdict(
+    lambda: {"calls": 0, "wall_seconds": 0.0, "thread_cpu_seconds": 0.0}
+)
+gl_call_timings: dict[str, dict[str, float]] = defaultdict(
+    lambda: {"calls": 0, "redundant_calls": 0, "wall_seconds": 0.0, "thread_cpu_seconds": 0.0}
+)
+conv_stage_timings: dict[str, dict[str, float]] = defaultdict(
+    lambda: {"calls": 0, "wall_seconds": 0.0, "thread_cpu_seconds": 0.0}
+)
+_gl_state = {
+    "program": 0,
+    "active_texture": 0,
+    "textures": {},
+    "framebuffer": 0,
+    "viewport": None,
+    "uniforms": {},
+}
 
 _GL_EXTENSIONS = 0x1F03
 _GL_TIME_ELAPSED = 0x88BF
@@ -61,6 +109,8 @@ def set_enabled(value: bool) -> None:
         gm.glBegin = _profile_gl_begin
         gm.glFinish = _profile_gl_finish
         gm.glFlush = _profile_gl_flush
+    install_gl_profilers()
+    install_program_profiler()
     # These compatibility aliases are consumed by the OpenGL operation
     # modules. Keep them synchronized when Python configuration changes after
     # backend import.
@@ -219,27 +269,332 @@ def reset() -> None:
     counters.clear()
     parameters.clear()
     parameter_keys.clear()
+    parameter_groups.clear()
     conv.clear()
+    stage_timings.clear()
+    gl_call_timings.clear()
+    conv_stage_timings.clear()
+    _gl_state.update({
+        "program": 0,
+        "active_texture": 0,
+        "textures": {},
+        "framebuffer": 0,
+        "viewport": None,
+        "uniforms": {},
+    })
     gpu_timings.clear()
     gpu_timing_samples.clear()
     _gpu_timer_dropped = 0
+    try:
+        from . import glstate
+        glstate.reset_counters()
+    except ImportError:
+        pass
+
+
+def _parameter_group_key(operation: str | None, parameter_role: str, shape, cacheable: bool) -> tuple:
+    return (
+        operation or "unknown",
+        parameter_role,
+        tuple(int(value) for value in shape),
+        "cacheable" if cacheable else "bypassed",
+    )
+
+
+def record_parameter_upload(
+    array,
+    parameter_kind: str,
+    *,
+    operation: str | None = None,
+    parameter_role: str | None = None,
+    cacheable: bool = False,
+) -> None:
+    """Record one parameter upload and its operation/role attribution."""
+    if not enabled:
+        return
+    key = (parameter_kind, int(array.__array_interface__["data"][0]))
+    counters["parameter_uploads"] += 1
+    counters["parameter_upload_bytes"] += array.nbytes
+    parameters[parameter_kind]["count"] += 1
+    parameters[parameter_kind]["bytes"] += array.nbytes
+    repeated = key in parameter_keys
+    if repeated:
+        counters["repeated_parameter_uploads"] += 1
+        parameters[parameter_kind]["repeated"] += 1
+    parameter_keys.add(key)
+
+    group = parameter_groups[_parameter_group_key(operation, parameter_role or parameter_kind, array.shape, cacheable)]
+    group["upload_count"] += 1
+    group["bytes"] += array.nbytes
+    if repeated:
+        group["repeated_count"] += 1
+
+
+def record_parameter_cache_event(
+    operation: str | None,
+    parameter_role: str,
+    shape,
+    event: str,
+) -> None:
+    """Attribute cache hits, misses, and invalidations to a parameter group."""
+    if not enabled:
+        return
+    key = _parameter_group_key(operation, parameter_role, shape, True)
+    group = parameter_groups[key]
+    field = {
+        "hit": "cache_hits",
+        "miss": "cache_misses",
+        "invalidation": "cache_invalidations",
+    }.get(event)
+    if field is not None:
+        group[field] += 1
+
+
+def record_timing(name: str, wall_seconds: float, thread_cpu_seconds: float, *, count: int = 1) -> None:
+    """Record wall and calling-thread CPU timing for a diagnostic stage."""
+    if not detailed_enabled():
+        return
+    record = stage_timings[name]
+    record["calls"] += count
+    record["wall_seconds"] += wall_seconds
+    record["thread_cpu_seconds"] += thread_cpu_seconds
+
+
+@contextmanager
+def stage(name: str):
+    """Measure a CPU-side stage with elapsed and calling-thread CPU clocks."""
+    if not detailed_enabled():
+        yield
+        return
+    wall_started = time.perf_counter()
+    cpu_started = thread_cpu_time()
+    try:
+        yield
+    finally:
+        record_timing(
+            name,
+            time.perf_counter() - wall_started,
+            thread_cpu_time() - cpu_started,
+        )
+
+
+@contextmanager
+def conv_stage(name: str):
+    """Measure a Conv2D setup/render sub-stage and calling-thread CPU time."""
+    if not detailed_enabled():
+        yield
+        return
+    wall_started = time.perf_counter()
+    cpu_started = thread_cpu_time()
+    try:
+        yield
+    finally:
+        wall_seconds = time.perf_counter() - wall_started
+        thread_cpu_seconds = thread_cpu_time() - cpu_started
+        record_timing(f"Conv2D/{name}", wall_seconds, thread_cpu_seconds)
+        record = conv_stage_timings[name]
+        record["calls"] += 1
+        record["wall_seconds"] += wall_seconds
+        record["thread_cpu_seconds"] += thread_cpu_seconds
+
+
+class ProgramCache(dict):
+    """Runtime program dictionary that measures membership/cache lookups."""
+
+    def __init__(self, label: str, initial=None):
+        super().__init__(initial or {})
+        self.label = label
+
+    def __contains__(self, key):
+        if not detailed_enabled():
+            return dict.__contains__(self, key)
+        wall_started = time.perf_counter()
+        cpu_started = thread_cpu_time()
+        hit = dict.__contains__(self, key)
+        wall_seconds = time.perf_counter() - wall_started
+        thread_cpu_seconds = thread_cpu_time() - cpu_started
+        record_timing("program_lookup", wall_seconds, thread_cpu_seconds)
+        counters["program_cache_lookups"] += 1
+        counters["program_cache_hits" if hit else "program_cache_misses"] += 1
+        return hit
+
+
+def install_program_cache_profilers(runtime_state) -> None:
+    """Wrap runtime program maps without changing their lookup semantics."""
+    names = (
+        name for name in vars(runtime_state)
+        if name.endswith("_programs")
+    )
+    for name in names:
+        value = getattr(runtime_state, name)
+        if not isinstance(value, ProgramCache):
+            setattr(runtime_state, name, ProgramCache(name, value))
+
+
+def _record_gl_call(name: str, original, args, redundant: bool):
+    if not detailed_enabled():
+        return original(*args)
+    wall_started = time.perf_counter()
+    cpu_started = thread_cpu_time()
+    try:
+        return original(*args)
+    finally:
+        wall_seconds = time.perf_counter() - wall_started
+        thread_cpu_seconds = thread_cpu_time() - cpu_started
+        record = gl_call_timings[name]
+        record["calls"] += 1
+        record["redundant_calls"] += int(redundant)
+        record["wall_seconds"] += wall_seconds
+        record["thread_cpu_seconds"] += thread_cpu_seconds
+        stage_name = {
+            "glUseProgram": "glUseProgram",
+            "glUniform1i": "uniform_setup",
+            "glGetUniformLocation": "program_lookup",
+            "glActiveTexture": "texture_binding",
+            "glBindTexture": "texture_binding",
+            "glBindFramebuffer": "fbo_output_binding",
+            "glFramebufferTexture2D": "fbo_output_binding",
+            "glCheckFramebufferStatus": "fbo_output_binding",
+            "glViewport": "viewport_state_setup",
+            "glBegin": "draw_submission",
+            "glEnd": "draw_submission",
+            "glVertex2f": "draw_submission",
+            "glFinish": "synchronization_wait",
+            "glFlush": "synchronization_wait",
+        }.get(name)
+        if stage_name:
+            record_timing(stage_name, wall_seconds, thread_cpu_seconds)
+
+
+def _gl_redundant(name: str, args) -> bool:
+    if name == "glUseProgram":
+        value = int(args[0])
+        redundant = value == _gl_state["program"]
+        _gl_state["program"] = value
+        return redundant
+    if name == "glActiveTexture":
+        value = int(args[0])
+        redundant = value == _gl_state["active_texture"]
+        _gl_state["active_texture"] = value
+        return redundant
+    if name == "glBindTexture":
+        target, texture = int(args[0]), int(args[1])
+        key = (_gl_state["active_texture"], target)
+        redundant = _gl_state["textures"].get(key) == texture
+        _gl_state["textures"][key] = texture
+        return redundant
+    if name == "glBindFramebuffer":
+        value = int(args[1])
+        redundant = value == _gl_state["framebuffer"]
+        _gl_state["framebuffer"] = value
+        return redundant
+    if name == "glViewport":
+        value = tuple(int(item) for item in args)
+        redundant = value == _gl_state["viewport"]
+        _gl_state["viewport"] = value
+        return redundant
+    if name == "glUniform1i":
+        key = (_gl_state["program"], int(args[0]))
+        value = int(args[1])
+        redundant = _gl_state["uniforms"].get(key) == value
+        _gl_state["uniforms"][key] = value
+        return redundant
+    return False
+
+
+def _make_gl_profiler(name: str, original):
+    @functools.wraps(original)
+    def wrapped(*args):
+        redundant = _gl_redundant(name, args) if detailed_enabled() else False
+        return _record_gl_call(name, original, args, redundant)
+    wrapped._matrixman_profile_wrapper = True
+    wrapped.original = original
+    return wrapped
+
+
+def install_gl_profilers() -> None:
+    """Install diagnostic wrappers after context-specific GL functions load."""
+    if not detailed_enabled():
+        return
+    names = (
+        "glUseProgram", "glUniform1i", "glGetUniformLocation",
+        "glActiveTexture", "glBindTexture", "glBindFramebuffer",
+        "glFramebufferTexture2D", "glCheckFramebufferStatus", "glViewport",
+        "glEnd", "glVertex2f",
+    )
+    for name in names:
+        original = getattr(gm, name, None)
+        if original is not None and not getattr(original, "_matrixman_profile_wrapper", False):
+            setattr(gm, name, _make_gl_profiler(name, original))
+
+
+def install_program_profiler() -> None:
+    """Time actual shader compile/link calls, which only occur on cache misses."""
+    if not detailed_enabled():
+        return
+    original = gm.make_program
+    if getattr(original, "_matrixman_profile_wrapper", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped(fragment_source):
+        if not detailed_enabled():
+            return original(fragment_source)
+        with stage("shader_compile_link"):
+            result = original(fragment_source)
+        counters["shader_compile_link_calls"] += 1
+        return result
+
+    wrapped._matrixman_profile_wrapper = True
+    wrapped.original = original
+    gm.make_program = wrapped
+
+
+def diagnostic_snapshot() -> dict:
+    """Return JSON-safe stage and GL-call telemetry for benchmark frame deltas."""
+    from . import glstate
+    return {
+        "stages": {name: dict(value) for name, value in stage_timings.items()},
+        "gl_calls": {name: dict(value) for name, value in gl_call_timings.items()},
+        "state_cache_skips": glstate.snapshot(),
+    }
+
+
+def parameter_group_snapshot() -> list[dict]:
+    """Return JSON-safe operation/role/shape parameter attribution."""
+    result = []
+    for (operation, parameter_role, shape, cache_status), values in sorted(parameter_groups.items(), key=str):
+        result.append({
+            "operation": operation,
+            "parameter_role": parameter_role,
+            "tensor_shape": list(shape),
+            "cacheable": cache_status == "cacheable",
+            **{name: int(value) for name, value in values.items()},
+        })
+    return result
 
 
 def _profile_gl_begin(mode):
     if not enabled:
         return _profile_gl_begin.original(mode)
     counters["draw_calls"] += 1
-    return _profile_gl_begin.original(mode)
+    return _record_gl_call("glBegin", _profile_gl_begin.original, (mode,), False)
 
 
 def _profile_gl_finish():
     if not enabled and not _gpu_timing_enabled():
         return _profile_gl_finish.original()
-    begin = time.perf_counter()
-    result = _profile_gl_finish.original()
+    if detailed_enabled():
+        before = gl_call_timings["glFinish"]["wall_seconds"]
+        result = _record_gl_call("glFinish", _profile_gl_finish.original, (), False)
+        elapsed = gl_call_timings["glFinish"]["wall_seconds"] - before
+    else:
+        wall_started = time.perf_counter()
+        result = _profile_gl_finish.original()
+        elapsed = time.perf_counter() - wall_started
     if enabled:
         counters["glFinish_calls"] += 1
-        counters["glFinish_seconds"] += time.perf_counter() - begin
+        counters["glFinish_seconds"] += elapsed
     collect_gpu_timing()
     return result
 
@@ -247,10 +602,16 @@ def _profile_gl_finish():
 def _profile_gl_flush():
     if not enabled:
         return _profile_gl_flush.original()
-    begin = time.perf_counter()
-    result = _profile_gl_flush.original()
+    if detailed_enabled():
+        before = gl_call_timings["glFlush"]["wall_seconds"]
+        result = _record_gl_call("glFlush", _profile_gl_flush.original, (), False)
+        elapsed = gl_call_timings["glFlush"]["wall_seconds"] - before
+    else:
+        wall_started = time.perf_counter()
+        result = _profile_gl_flush.original()
+        elapsed = time.perf_counter() - wall_started
     counters["glFlush_calls"] += 1
-    counters["glFlush_seconds"] += time.perf_counter() - begin
+    counters["glFlush_seconds"] += elapsed
     return result
 
 
@@ -270,20 +631,24 @@ def dispatch_timer(fn):
             return fn(cls, func, types, args, kwargs)
         name = str(func).removeprefix("aten.")
         begin = time.perf_counter()
+        cpu_begin = thread_cpu_time()
         try:
-            return fn(cls, func, types, args, kwargs)
+            with stage("matrixman_python_op_wrapper"):
+                return fn(cls, func, types, args, kwargs)
         finally:
             elapsed = time.perf_counter() - begin
+            cpu_elapsed = thread_cpu_time() - cpu_begin
             record = ops[name]
             record["calls"] += 1
             record["total"] += elapsed
+            record["thread_cpu_seconds"] += cpu_elapsed
             record["max"] = max(record["max"], elapsed)
             if _profile_detail():
                 print(f"[MatrixMan profile] {name}: {elapsed:.6f}s")
     return wrapped
 
 
-def report() -> None:
+def report(frame_count: int | None = None) -> None:
     collect_gpu_timing()
     if not enabled and not _gpu_timing_enabled():
         return
@@ -294,17 +659,70 @@ def report() -> None:
     for name in names:
         record = ops.get(name)
         if record:
-            print(f"{name}: calls={int(record['calls'])} total={record['total']:.3f}s average={record['total']/record['calls']:.3f}s max={record['max']:.3f}s")
+            print(
+                f"{name}: calls={int(record['calls'])} total={record['total']:.3f}s "
+                f"thread_cpu={record['thread_cpu_seconds']:.3f}s average={record['total']/record['calls']:.3f}s "
+                f"max={record['max']:.3f}s"
+            )
     print("CPU-side dispatch timing:")
-    print("  timings below measure Python/dispatch duration and are not GPU execution time")
+    print("  wall time and calling-thread CPU time; these are not GPU execution time")
+    print(f"  calling-thread CPU clock: {'time.thread_time' if thread_cpu_supported() else 'time.process_time fallback'}")
+    print("  whole-process process_time is reported only by benchmark/frame summaries")
+    print("OpenGL CPU dispatch profile:")
+    for name, record in sorted(stage_timings.items()):
+        per_frame = (
+            f" per_frame_calls={record['calls'] / frame_count:.2f}"
+            f" per_frame_wall={record['wall_seconds'] / frame_count:.6f}s"
+            f" per_frame_thread_cpu={record['thread_cpu_seconds'] / frame_count:.6f}s"
+            if frame_count else ""
+        )
+        print(
+            f"  {name}: calls={int(record['calls'])} wall={record['wall_seconds']:.6f}s "
+            f"thread_cpu={record['thread_cpu_seconds']:.6f}s{per_frame}"
+        )
+    print("OpenGL call counts and redundant-state calls:")
+    for name, record in sorted(gl_call_timings.items()):
+        per_frame = (
+            f" per_frame_calls={record['calls'] / frame_count:.2f}"
+            f" per_frame_redundant={record['redundant_calls'] / frame_count:.2f}"
+            if frame_count else ""
+        )
+        print(
+            f"  {name}: calls={int(record['calls'])} redundant={int(record['redundant_calls'])} "
+            f"wall={record['wall_seconds']:.6f}s thread_cpu={record['thread_cpu_seconds']:.6f}s{per_frame}"
+        )
+    print(f"  program cache: lookups={int(counters['program_cache_lookups'])} "
+          f"hits={int(counters['program_cache_hits'])} misses={int(counters['program_cache_misses'])}")
+    print(f"  shader compile/link calls: {int(counters['shader_compile_link_calls'])}")
+    print(f"  prepared convolution deferrals: {int(counters['prepared_convolution_deferrals'])}")
+    print(f"  fused Conv+BatchNorm calls: {int(counters['fused_batch_norm_calls'])}")
+    print(f"  fused Conv+BatchNorm+SiLU calls: {int(counters['fused_silu_calls'])}")
+    print(f"  PrivateUse1 dispatch calls: {int(counters['privateuse1_dispatch_calls'])}")
+    try:
+        from . import glstate
+        skips = glstate.snapshot()
+        if skips:
+            print("  state-cache-suppressed GL calls: " + ", ".join(
+                f"{name}={count}" for name, count in sorted(skips.items())
+            ))
+    except ImportError:
+        pass
+    print("Conv2D detailed CPU stages:")
+    for name, record in sorted(conv_stage_timings.items()):
+        print(
+            f"  {name}: calls={int(record['calls'])} wall={record['wall_seconds']:.6f}s "
+            f"thread_cpu={record['thread_cpu_seconds']:.6f}s"
+        )
     print("OpenGL:")
     print(f"  draw calls: {int(counters['draw_calls'])}")
     print(f"  tiled convolution draw calls: {int(counters['tiled_draw_calls'])}")
     print(f"  consolidation draw calls: {int(counters['consolidation_draw_calls'])}")
     print(f"  glFinish: {int(counters['glFinish_calls'])} ({counters['glFinish_seconds']:.3f}s)")
     print(f"  glFlush: {int(counters['glFlush_calls'])} ({counters['glFlush_seconds']:.3f}s)")
+    print(f"  tiled per-tile glFinish calls: {int(counters['tiled_per_tile_sync_calls'])}")
     print(f"  pre-consolidation glFinish executed: {int(counters['pre_consolidation_sync_calls'])}")
     print(f"  pre-consolidation glFinish skipped: {int(counters['pre_consolidation_sync_skips'])}")
+    print(f"  post-consolidation synchronization elisions: {int(counters['consolidation_sync_elisions'])}")
     print(f"  tiled convolution sync mode: {config.tileSync}")
     print(f"  physical tile limit: {config.resolvedTileLimit}")
     print("GPU timing:")
@@ -354,6 +772,20 @@ def report() -> None:
     print(f"  scratch texture reuses: {int(counters['scratch_texture_reuses'])}")
     print(f"  scratch texture releases: {int(counters['scratch_texture_releases'])}")
     print(f"  scratch texture evictions: {int(counters['scratch_texture_evictions'])}")
+    try:
+        from .resources import activation_pool_stats
+        pool = activation_pool_stats()
+        print(
+            f"  activation pool: {pool['current_pooled_textures']} textures "
+            f"({pool['current_pooled_bytes']} bytes)"
+        )
+        print(
+            f"  activation pool peak: {pool['peak_pooled_textures']} textures "
+            f"({pool['peak_pooled_bytes']} bytes)"
+        )
+        print(f"  activation allocation avoidance: {pool['allocation_avoidance_rate']:.1%}")
+    except RuntimeError:
+        print("  activation pool: unavailable")
     print(f"  texture uploads: {int(counters['texture_uploads'])} ({int(counters['texture_upload_bytes'])} bytes, {counters['texture_upload_seconds']:.3f}s)")
     print("parameter uploads:")
     print(f"  count: {int(counters['parameter_uploads'])}")
@@ -363,6 +795,25 @@ def report() -> None:
     print(f"  cache misses: {int(counters['parameter_cache_misses'])}")
     print(f"  cache invalidations: {int(counters['parameter_cache_invalidations'])}")
     print(f"  cache bypasses: {int(counters['parameter_cache_bypasses'])}")
+    print("parameter upload groups:")
+    for group in parameter_group_snapshot():
+        shape = group["tensor_shape"]
+        cache_status = "cacheable" if group["cacheable"] else "bypassed"
+        print(
+            f"  {group['operation']} {group['parameter_role']} shape={shape} "
+            f"cache={cache_status}: uploads={group['upload_count']} "
+            f"repeated={group['repeated_count']} bytes={group['bytes']} "
+            f"hits={group['cache_hits']} misses={group['cache_misses']} "
+            f"invalidations={group['cache_invalidations']}"
+        )
+    try:
+        from .resources import persistent_parameter_resources
+        current = persistent_parameter_resources()
+        print(f"  persistent parameter resources: {current}")
+        print(f"  peak persistent parameter resources: {int(counters['persistent_parameter_resources_peak'])}")
+    except RuntimeError:
+        print("  persistent parameter resources: unavailable (runtime already cleaned up)")
+        print(f"  peak persistent parameter resources: {int(counters['persistent_parameter_resources_peak'])}")
     print("readback:")
     print(f"  calls: {int(counters['readback_calls'])} bytes: {int(counters['readback_bytes'])}")
     print(f"  sync/wait: {counters['readback_sync_seconds']:.3f}s")
@@ -371,7 +822,7 @@ def report() -> None:
     print(f"  total: {counters['readback_total_seconds']:.3f}s")
     if conv:
         print("Conv2D breakdown (aggregate):")
-        for key in ("prepare", "parameter_upload", "shader_setup", "tile_render", "sync", "consolidation"):
+        for key in ("prepare", "parameter_upload", "tile_render", "sync", "consolidation"):
             print(f"  {key}: {conv[key]:.3f}s")
         print(f"  tiled calls: {int(counters['tiled_conv_calls'])} tiles: {int(counters['tiled_conv_tiles'])} max physical tile: {int(counters['tiled_conv_max_tile_width'])}x{int(counters['tiled_conv_max_tile_height'])}")
     slow = sorted(ops.items(), key=lambda item: item[1]["total"], reverse=True)[:3]

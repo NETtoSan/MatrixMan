@@ -48,6 +48,33 @@ GPU-resident. CPU work is used for metadata, dispatch, uploads, diagnostics,
 and explicit final readback. Calling `.cpu()` performs the intentional
 GPU-to-CPU readback and synchronization point.
 
+### Inference parameter residency
+
+OpenGL Conv2D weights and biases, plus inference BatchNorm parameters, are
+uploaded to context-local RGBA32F textures on first use and reused on later
+dispatches. The cache key includes tensor identity, storage identity,
+addressing metadata, dtype, device, and PyTorch's in-place mutation version;
+an in-place change invalidates and replaces the old texture. Distinct tensors
+with identical shapes and values do not alias. Cached resources are bounded,
+released when their source tensors are destroyed, and cleared during runtime
+shutdown.
+
+Activations remain per-operation logical tensors today, while their physical
+packed textures may be recycled after the shared owner dies. The existing
+bounded scratch pool remains used for tiled-convolution intermediates; more
+complicated aliasing cases are intentionally deferred until their lifetime
+rules are proven. No public tensor API or PrivateUse1 dispatch contract
+changes, and there is no CPU arithmetic fallback: `.cpu()` remains the
+explicit readback boundary.
+
+Fresh packed activation outputs now use a separate context-local pool. The
+pool is keyed by OpenGL context, texture target, internal format, dtype, layout
+kind, and physical atlas width/height; logical shape alone is never used as a
+reuse key. The shared `_TextureOwner` is the lifetime boundary, so views keep
+the underlying texture live and only the final owner can return it to the
+pool. The pool is bounded to 256 textures and 64 MiB, with eviction on
+overflow. Parameter textures never enter this pool.
+
 ## Runtime architecture
 
 The OpenGL implementation is split under
@@ -95,9 +122,10 @@ MATRIXMAN_TILE_SYNC=per_tile   # default
 
 `per_tile` is the validated GM45-safe production behavior. Other modes and a
 larger limit such as 512 are experiments measured on newer test GPUs. They
-must not be treated as safe GM45 defaults. The optional
-`MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC=1` experiment skips only the audited
-pre-consolidation barrier; it does not change the production default.
+must not be treated as safe GM45 defaults. The default skips the audited
+redundant pre-consolidation barrier. Set
+`MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC=0` to retain that legacy barrier while
+diagnosing a driver-specific issue.
 
 ## Physical tile validation diagnostic
 
@@ -155,6 +183,15 @@ optional `MATRIXMAN_GPU_TIMING=1` control uses deferred OpenGL timer queries
 collected at later synchronization points; the profiler does not add a
 `glFinish()` after every operator. It reports CPU submission time separately
 from GPU elapsed time and synchronization time.
+
+For a per-frame CPU audit, run the YOLO benchmark with `--cpu-audit`. Its JSON
+report includes wall/calling-thread-CPU timings for PrivateUse1 dispatch, MatrixMan
+operator wrappers, parameter-cache and activation-pool bookkeeping, program
+lookup and compile/link, GL state/binding/draw calls, synchronization, and
+readback transfer/construction. It also records counts and redundant
+`glUseProgram`, `glActiveTexture`, `glBindTexture`, `glBindFramebuffer`,
+`glViewport`, and uniform calls. Conv2D stages are additionally grouped under
+`Conv2D/*`; the report keeps CPU postprocessing separate from backend work.
 
 ## Step 10B spatial reuse
 

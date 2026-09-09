@@ -36,6 +36,12 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
     """Send a PrivateUse1 operation to the selected backend only."""
     kwargs = kwargs or {}
     backend = get_backend()
+    if backend.name == "opengl" and func not in {
+        torch.ops.aten.native_batch_norm.default,
+        torch.ops.aten.silu_.default,
+    }:
+        from .backends.opengl import dispatch as opengl_dispatch
+        opengl_dispatch.materialize_pending_args(args)
     if func is torch.ops.aten._to_copy.default:
         if not args or not isinstance(args[0], cls):
             raise RuntimeError("MatrixMan: _to_copy requires a MatrixManTensor source")
@@ -61,8 +67,12 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
         )
     if backend.name == "opengl":
         from .backends.opengl import dispatch as opengl_dispatch
+        from .backends.opengl import profiling
 
-        return opengl_dispatch.handle_torch_dispatch(cls, func, types, args, kwargs)
+        if profiling.enabled:
+            profiling.counters["privateuse1_dispatch_calls"] += 1
+        with profiling.stage("pytorch_privateuse1_dispatch"):
+            return opengl_dispatch.handle_torch_dispatch(cls, func, types, args, kwargs)
     if backend.name == "cuda":
         if func is torch.ops.aten.unsqueeze.default:
             if len(args) < 2:

@@ -38,6 +38,18 @@ _is_scalar_operand = operation_context.is_scalar_operand
 _scalar_value = operation_context.scalar_value
 _numel = numel
 
+
+def materialize_pending_args(value) -> None:
+    """Materialize deferred Conv2D results at the first non-fusible consumer."""
+    if isinstance(value, MatrixManTensor):
+        convolution.materialize_pending(value)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            materialize_pending_args(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            materialize_pending_args(item)
+
 def _trace(message: str) -> None:
     diagnostics.trace(message)
 
@@ -152,6 +164,9 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL SiLU kernel")
             _trace("  -> GLSL fragment shader arithmetic: x / (1 + exp(-x))")
+            fused = convolution.try_fuse_silu(args[0])
+            if fused is not None:
+                return fused
             return _render_silu_inplace(args)
 
         if func is torch.ops.aten.split.Tensor:
