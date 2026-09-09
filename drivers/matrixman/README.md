@@ -29,10 +29,46 @@ raise instead of falling back to CPU arithmetic. Set `MATRIXMAN_TRACE=1` (or
 `MATRIXMAN_CUDA_DEBUG=1` flag remains available for low-level implementation
 diagnostics; normal execution is quiet.
 
+For CUDA and OpenGL inference, `matrixman.auto_prepare(model)` returns a narrow
+model-level wrapper that prepares an eligible eval model on its first MatrixMan
+inference and reuses the backend-specific cached prepared copy afterward. The
+original model is not mutated. The first inference includes preparation cost;
+call `matrixman.prepare(model, backend="cuda")` or
+`matrixman.prepare(model, backend="opengl")` when eager preparation is preferred.
+Training and autograd-enabled calls bypass lazy preparation. Disable it with
+`$env:MATRIXMAN_DISABLE_AUTO_PREPARE="1"`; explicit `matrixman.prepare()` is
+still available. Raw `model(matrixman_tensor)` calls cannot be intercepted
+safely without global PyTorch monkey-patching, so the wrapper is required for
+lazy behavior.
+
+The tracking demo enables this wrapper by default:
+
+```powershell
+$env:MATRIXMAN_BACKEND="cuda"
+python demo/main-tracking.py --imgsz 320
+```
+
+Use `$env:MATRIXMAN_BACKEND="opengl"` for the OpenGL path. Use
+`--no-auto-prepare` for an unprepared baseline, or `--prepare` when eager
+preparation before the first frame is preferred.
+
+The minimal inference pattern is:
+
+```python
+from drivers import matrixman
+
+model.eval()
+model = matrixman.auto_prepare(model)
+input_tensor = matrixman.to_device(input_tensor)
+with torch.no_grad():
+    prediction = model(input_tensor)
+prediction = prediction.cpu()
+```
+
 Run the capability and numerical probe with:
 
 ```bash
-python3 -m drivers.matrixman.compatibility
+python -m drivers.matrixman.compatibility
 # or
-python3 -m drivers.matrixman --check
+python -m drivers.matrixman --check
 ```

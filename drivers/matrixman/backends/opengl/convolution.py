@@ -890,13 +890,14 @@ def _convolution_params(input_tensor, out_owner, dimensions, stride, padding,
 
 def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_owner,
                                  weight_owner, bias_owner, dimensions, stride,
-                                 padding, out_shape, b, *, fused_silu=False):
+                                 padding, out_shape, b, *, fused_silu=False,
+                                 allow_spatial_reuse=True):
     params = _convolution_params(
         input_tensor, out_owner, dimensions, stride, padding,
         bias_tensor, weight_owner, bias_owner, fused_silu=fused_silu,
     )
     tile_limit = _tile_limit()
-    if not fused_silu and _spatial_reuse_enabled() and _conv_spatial_reuse_supported(
+    if allow_spatial_reuse and not fused_silu and _spatial_reuse_enabled() and _conv_spatial_reuse_supported(
         input_tensor, out_owner, params, tile_limit
     ):
         return _render_convolution_spatial(
@@ -1089,4 +1090,17 @@ def execute(args):
     return _render_prepared_convolution(
         input_tensor, weight_tensor, bias_tensor, out_owner,
         weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+    )
+
+
+def execute_prepared(args):
+    """Execute a prepared Conv2D without deferred prepared-execution routing."""
+    b = _backend()
+    (input_tensor, weight_tensor, bias_tensor,
+     stride, padding, out_shape, out_owner, dimensions) = _validate_convolution(args, b)
+    weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
+    return _render_prepared_convolution(
+        input_tensor, weight_tensor, bias_tensor, out_owner,
+        weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+        allow_spatial_reuse=False,
     )

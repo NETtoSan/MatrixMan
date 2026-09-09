@@ -62,6 +62,13 @@ def _error_log(message: str) -> None:
     diagnostics.error_log(message)
 
 
+def _metadata_call(callback, *args):
+    from ... import frontend_profiling
+    if frontend_profiling.enabled:
+        return frontend_profiling.metadata_call(callback, *args)
+    return callback(*args)
+
+
 def _record_unsupported(func, args, kwargs) -> None:
     diagnostics.record_unsupported(func, args, kwargs)
 
@@ -172,7 +179,7 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
         if func is torch.ops.aten.split.Tensor:
             _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL metadata-only split view")
-            return _metadata_split(args, kwargs)
+            return _metadata_call(_metadata_split, args, kwargs)
 
         if func is torch.ops.aten.cat.default:
             _kernel_log("Cat")
@@ -258,11 +265,11 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
 
         if func is torch.ops.aten.view.default:
             tensor_arg = args[0]
-            return _metadata_view(tensor_arg, _normalize_shape(args[1], _numel(tuple(tensor_arg.shape))), "view")
+            return _metadata_call(_metadata_view, tensor_arg, _normalize_shape(args[1], _numel(tuple(tensor_arg.shape))), "view")
 
         if func is torch.ops.aten.reshape.default:
             tensor_arg = args[0]
-            return _metadata_view(tensor_arg, _normalize_shape(args[1], _numel(tuple(tensor_arg.shape))), "reshape")
+            return _metadata_call(_metadata_view, tensor_arg, _normalize_shape(args[1], _numel(tuple(tensor_arg.shape))), "reshape")
 
         if func is torch.ops.aten.flatten.using_ints:
             tensor_arg = args[0]
@@ -278,25 +285,25 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             flat_dim = math.prod(shape[start_dim : end_dim + 1])
             new_shape = shape[:start_dim] + (flat_dim,) + shape[end_dim + 1 :]
             _validate_supported_shape(new_shape)
-            return _metadata_view(tensor_arg, new_shape, "flatten")
+            return _metadata_call(_metadata_view, tensor_arg, new_shape, "flatten")
 
         if func is torch.ops.aten.squeeze.default:
             tensor_arg = args[0]
-            return _metadata_squeeze(tensor_arg)
+            return _metadata_call(_metadata_squeeze, tensor_arg)
 
         if func is torch.ops.aten.squeeze.dim:
             tensor_arg = args[0]
-            return _metadata_squeeze(tensor_arg, args[1])
+            return _metadata_call(_metadata_squeeze, tensor_arg, args[1])
 
         if func is torch.ops.aten.unsqueeze.default:
             tensor_arg = args[0]
-            return _metadata_unsqueeze(tensor_arg, int(args[1]))
+            return _metadata_call(_metadata_unsqueeze, tensor_arg, int(args[1]))
 
         if func is torch.ops.aten.expand.default:
-            return _metadata_expand(args, kwargs)
+            return _metadata_call(_metadata_expand, args, kwargs)
 
         if func is torch.ops.aten.transpose.int:
-            return _metadata_transpose(args)
+            return _metadata_call(_metadata_transpose, args)
 
         if func is torch.ops.aten.permute.default:
             _record_unsupported(func, args, kwargs)
@@ -326,3 +333,8 @@ class DispatchBridge(torch.Tensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         return handle_torch_dispatch(cls, func, types, args, kwargs)
+
+
+handle_torch_dispatch = __import__(
+    "drivers.matrixman.frontend_profiling", fromlist=["wrap_backend"]
+).wrap_backend(handle_torch_dispatch)

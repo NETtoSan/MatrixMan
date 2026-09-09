@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import cv2
 import torch
 
 from drivers.matrixman.benchmarks.cpu_audit import stage
+
+
+_torchvision_nms = None
+_torchvision_nms_checked = False
+
+
+def _get_torchvision_nms():
+    """Return native CPU NMS when available, probing it at most once."""
+    global _torchvision_nms, _torchvision_nms_checked
+    if _torchvision_nms_checked:
+        return _torchvision_nms
+    _torchvision_nms_checked = True
+    if os.environ.get("MATRIXMAN_DISABLE_TORCHVISION_NMS", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return None
+    try:
+        from torchvision.ops import nms
+        nms(torch.empty((0, 4), dtype=torch.float32), torch.empty(0, dtype=torch.float32), 0.5)
+    except (ImportError, OSError, RuntimeError):
+        return None
+    _torchvision_nms = nms
+    return _torchvision_nms
 
 
 def first_tensor(value):
@@ -33,22 +57,33 @@ def preprocess_frame(frame, image_size: int) -> torch.Tensor:
 
 
 def _nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+    """Run per-class NMS with a native CPU fast path and local fallback."""
+    if boxes.device.type == "cpu" and boxes.dtype in (torch.float32, torch.float64):
+        native_nms = _get_torchvision_nms()
+        if native_nms is not None:
+            try:
+                return native_nms(boxes.contiguous(), scores.contiguous(), iou_threshold)
+            except RuntimeError:
+                # Disable only the optional operator after an operator/runtime
+                # availability failure; retain the repository implementation.
+                global _torchvision_nms
+                _torchvision_nms = None
     keep = []
     order = scores.argsort(descending=True)
+    x1, y1, x2, y2 = boxes.unbind(1)
+    areas = (x2 - x1) * (y2 - y1)
     while order.numel():
         current = order[0]
         keep.append(current)
         if order.numel() == 1:
             break
         rest = order[1:]
-        xx1 = torch.maximum(boxes[rest, 0], boxes[current, 0])
-        yy1 = torch.maximum(boxes[rest, 1], boxes[current, 1])
-        xx2 = torch.minimum(boxes[rest, 2], boxes[current, 2])
-        yy2 = torch.minimum(boxes[rest, 3], boxes[current, 3])
+        xx1 = torch.maximum(x1[rest], x1[current])
+        yy1 = torch.maximum(y1[rest], y1[current])
+        xx2 = torch.minimum(x2[rest], x2[current])
+        yy2 = torch.minimum(y2[rest], y2[current])
         intersection = (xx2 - xx1).clamp_min(0) * (yy2 - yy1).clamp_min(0)
-        area_current = (boxes[current, 2] - boxes[current, 0]) * (boxes[current, 3] - boxes[current, 1])
-        area_rest = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
-        iou = intersection / (area_current + area_rest - intersection).clamp_min(1e-12)
+        iou = intersection / (areas[current] + areas[rest] - intersection).clamp_min(1e-12)
         order = rest[iou <= iou_threshold]
     return torch.stack(keep) if keep else torch.empty(0, dtype=torch.long)
 

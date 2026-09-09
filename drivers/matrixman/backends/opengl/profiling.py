@@ -7,10 +7,11 @@ import atexit
 import sys
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from . import gpumatrix as gm
 from ...config import config, profiling_enabled
+from ... import frontend_profiling
 
 
 enabled = profiling_enabled()
@@ -105,7 +106,7 @@ def set_enabled(value: bool) -> None:
     enabled = bool(value)
     if enabled:
         register_exit_hook()
-    if enabled or _gpu_timing_enabled():
+    if enabled or _gpu_timing_enabled() or frontend_profiling.enabled:
         gm.glBegin = _profile_gl_begin
         gm.glFinish = _profile_gl_finish
         gm.glFlush = _profile_gl_flush
@@ -433,6 +434,9 @@ def install_program_cache_profilers(runtime_state) -> None:
 
 def _record_gl_call(name: str, original, args, redundant: bool):
     if not detailed_enabled():
+        if frontend_profiling.enabled and name in {"glBegin", "glEnd", "glVertex2f"}:
+            with frontend_profiling.component("OpenGL API/draw submission"):
+                return original(*args)
         return original(*args)
     wall_started = time.perf_counter()
     cpu_started = thread_cpu_time()
@@ -514,7 +518,7 @@ def _make_gl_profiler(name: str, original):
 
 def install_gl_profilers() -> None:
     """Install diagnostic wrappers after context-specific GL functions load."""
-    if not detailed_enabled():
+    if not detailed_enabled() and not frontend_profiling.enabled:
         return
     names = (
         "glUseProgram", "glUniform1i", "glGetUniformLocation",
@@ -584,13 +588,19 @@ def _profile_gl_begin(mode):
 def _profile_gl_finish():
     if not enabled and not _gpu_timing_enabled():
         return _profile_gl_finish.original()
+    synchronization_scope = (
+        frontend_profiling.component("OpenGL synchronization wait")
+        if frontend_profiling.enabled else nullcontext()
+    )
     if detailed_enabled():
         before = gl_call_timings["glFinish"]["wall_seconds"]
-        result = _record_gl_call("glFinish", _profile_gl_finish.original, (), False)
+        with synchronization_scope:
+            result = _record_gl_call("glFinish", _profile_gl_finish.original, (), False)
         elapsed = gl_call_timings["glFinish"]["wall_seconds"] - before
     else:
         wall_started = time.perf_counter()
-        result = _profile_gl_finish.original()
+        with synchronization_scope:
+            result = _profile_gl_finish.original()
         elapsed = time.perf_counter() - wall_started
     if enabled:
         counters["glFinish_calls"] += 1
@@ -618,7 +628,7 @@ def _profile_gl_flush():
 _profile_gl_begin.original = gm.glBegin
 _profile_gl_finish.original = gm.glFinish
 _profile_gl_flush.original = gm.glFlush
-if enabled or _gpu_timing_enabled():
+if enabled or _gpu_timing_enabled() or frontend_profiling.enabled:
     gm.glBegin = _profile_gl_begin
     gm.glFinish = _profile_gl_finish
     gm.glFlush = _profile_gl_flush

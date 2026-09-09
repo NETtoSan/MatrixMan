@@ -11,11 +11,15 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import re
 import sys
+from contextlib import nullcontext
+from typing import Any, NamedTuple
 
 import numpy as np
 
 from . import profiling
+from ... import frontend_profiling
 from ...config import config, trace_log
 
 
@@ -25,6 +29,7 @@ CUdeviceptr = ctypes.c_uint64
 CUcontext = ctypes.c_void_p
 CUmodule = ctypes.c_void_p
 CUfunction = ctypes.c_void_p
+CUevent = ctypes.c_void_p
 CUfunction_attribute = ctypes.c_int
 
 CUDA_SUCCESS = 0
@@ -35,6 +40,15 @@ CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 CUDA_BLOCK_SIZE = 128
+
+
+class CudaConvExecutionMetadata(NamedTuple):
+    """Immutable Conv2D execution values; tensor pointers remain dynamic."""
+
+    function: Any
+    work_items: int
+    block_size: int
+    profile_variant: str
 
 
 def _cuda_debug_enabled() -> bool:
@@ -4258,6 +4272,53 @@ def _append_256_thread_plane_kernel(ptx: bytes) -> bytes:
 PTX = _append_256_thread_plane_kernel(PTX)
 
 
+def _append_fused_conv_silu_kernel(
+    ptx: bytes,
+    source_name: str,
+    fused_name: str,
+    stored_registers: tuple[str, ...],
+) -> bytes:
+    """Clone a Conv PTX entry and apply the existing approximate SiLU math."""
+    source = ptx.decode("ascii")
+    entry = f".visible .entry {source_name}("
+    start = source.index(entry)
+    end = source.index("\n}\n", start) + 3
+    kernel = source[start:end]
+    labels = re.findall(r"^([A-Z][A-Z0-9_]*):", kernel, flags=re.MULTILINE)
+    for label in labels:
+        kernel = re.sub(rf"\b{re.escape(label)}\b", f"{fused_name.upper()}_{label}", kernel)
+    kernel = kernel.replace(entry, f".visible .entry {fused_name}(", 1)
+    for register in stored_registers:
+        silu = (
+            f"    neg.f32 %f1, %f{register};\n"
+            "    mov.f32 %f2, 1.4426950409;\n"
+            "    mul.f32 %f1, %f1, %f2;\n"
+            "    ex2.approx.f32 %f1, %f1;\n"
+            "    mov.f32 %f2, 1.0;\n"
+            "    add.f32 %f1, %f1, %f2;\n"
+            f"    div.approx.f32 %f{register}, %f{register}, %f1;\n"
+        )
+        store = f"    st.global.f32 [%rd6], %f{register};"
+        conditional_store = f"    @%p2 st.global.f32 [%rd6], %f{register};"
+        if conditional_store in kernel:
+            kernel = kernel.replace(conditional_store, silu + conditional_store, 1)
+        else:
+            kernel = kernel.replace(store, silu + store, 1)
+    return ptx + kernel.encode("ascii")
+
+
+# Diagnostic-only variants. Production dispatch never selects these entries.
+PTX = _append_fused_conv_silu_kernel(
+    PTX, "conv2d_nchw", "conv2d_silu_nchw", ("0",)
+)
+for _source, _name, _registers in (
+    ("conv2d_3x3_s1_p1_small_c8", "conv2d_3x3_s1_p1_small_c8_silu", ("0", "5")),
+    ("conv2d_3x3_s1_p1_small_c10", "conv2d_3x3_s1_p1_small_c10_silu", ("0", "5")),
+    ("conv2d_3x3_s1_p1_small_c24", "conv2d_3x3_s1_p1_small_c24_silu", ("0", "5")),
+):
+    PTX = _append_fused_conv_silu_kernel(PTX, _source, _name, _registers)
+
+
 def load_driver() -> ctypes.CDLL:
     if os.name == "nt":
         path = "nvcuda.dll"
@@ -4327,6 +4388,20 @@ def configure_driver(driver: ctypes.CDLL) -> None:
     driver.cuLaunchKernel.restype = CUresult
     driver.cuCtxSynchronize.argtypes = []
     driver.cuCtxSynchronize.restype = CUresult
+    if all(hasattr(driver, name) for name in (
+        "cuEventCreate", "cuEventRecord", "cuEventSynchronize",
+        "cuEventElapsedTime", "cuEventDestroy",
+    )):
+        driver.cuEventCreate.argtypes = [ctypes.POINTER(CUevent), ctypes.c_uint]
+        driver.cuEventCreate.restype = CUresult
+        driver.cuEventRecord.argtypes = [CUevent, ctypes.c_void_p]
+        driver.cuEventRecord.restype = CUresult
+        driver.cuEventSynchronize.argtypes = [CUevent]
+        driver.cuEventSynchronize.restype = CUresult
+        driver.cuEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float), CUevent, CUevent]
+        driver.cuEventElapsedTime.restype = CUresult
+        driver.cuEventDestroy.argtypes = [CUevent]
+        driver.cuEventDestroy.restype = CUresult
     driver.cuGetErrorName.argtypes = [CUresult, ctypes.POINTER(ctypes.c_char_p)]
     driver.cuGetErrorName.restype = CUresult
     driver.cuGetErrorString.argtypes = [CUresult, ctypes.POINTER(ctypes.c_char_p)]
@@ -4392,6 +4467,15 @@ class CudaExecutionBackend:
         self.device = CUdevice()
         check(self.driver, self.driver.cuDeviceGet(ctypes.byref(self.device), device_index), "cuDeviceGet")
         self.context = CUcontext()
+        self._gpu_timing_start_event = CUevent()
+        self._gpu_timing_stop_event = CUevent()
+        self._gpu_timing_active = False
+        self._gpu_timing_supported = all(
+            hasattr(self.driver, name) for name in (
+                "cuEventCreate", "cuEventRecord", "cuEventSynchronize",
+                "cuEventElapsedTime", "cuEventDestroy",
+            )
+        )
         self.module = CUmodule()
         self.closed = False
         try:
@@ -4485,6 +4569,10 @@ class CudaExecutionBackend:
             self.convolution_1x1_cin36_function = CUfunction()
             self.convolution_1x1_cin48_function = CUfunction()
             self.convolution_1x1_cin72_function = CUfunction()
+            self.diagnostic_fused_convolution_silu_function = CUfunction()
+            self.diagnostic_fused_small_c8_silu_function = CUfunction()
+            self.diagnostic_fused_small_c10_silu_function = CUfunction()
+            self.diagnostic_fused_small_c24_silu_function = CUfunction()
             self.batch_norm_function = CUfunction()
             self.silu_function = CUfunction()
             self.split_function = CUfunction()
@@ -4520,6 +4608,10 @@ class CudaExecutionBackend:
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin36_function), self.module, b"conv2d_1x1_s1_cin36"), "get conv2d_1x1_s1_cin36")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin48_function), self.module, b"conv2d_1x1_s1_cin48"), "get conv2d_1x1_s1_cin48")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_1x1_cin72_function), self.module, b"conv2d_1x1_s1_cin72"), "get conv2d_1x1_s1_cin72")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.diagnostic_fused_convolution_silu_function), self.module, b"conv2d_silu_nchw"), "get conv2d_silu_nchw")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.diagnostic_fused_small_c8_silu_function), self.module, b"conv2d_3x3_s1_p1_small_c8_silu"), "get conv2d_3x3_s1_p1_small_c8_silu")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.diagnostic_fused_small_c10_silu_function), self.module, b"conv2d_3x3_s1_p1_small_c10_silu"), "get conv2d_3x3_s1_p1_small_c10_silu")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.diagnostic_fused_small_c24_silu_function), self.module, b"conv2d_3x3_s1_p1_small_c24_silu"), "get conv2d_3x3_s1_p1_small_c24_silu")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.batch_norm_function), self.module, b"batch_norm_inference"), "get batch_norm_inference")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.silu_function), self.module, b"silu"), "get silu")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.split_function), self.module, b"split_copy"), "get split_copy")
@@ -4556,6 +4648,10 @@ class CudaExecutionBackend:
                 id(self.convolution_1x1_cin36_function): "Conv2D",
                 id(self.convolution_1x1_cin48_function): "Conv2D",
                 id(self.convolution_1x1_cin72_function): "Conv2D",
+                id(self.diagnostic_fused_convolution_silu_function): "Fused Conv2D+SiLU",
+                id(self.diagnostic_fused_small_c8_silu_function): "Fused Conv2D+SiLU",
+                id(self.diagnostic_fused_small_c10_silu_function): "Fused Conv2D+SiLU",
+                id(self.diagnostic_fused_small_c24_silu_function): "Fused Conv2D+SiLU",
                 id(self.batch_norm_function): "BatchNorm",
                 id(self.silu_function): "SiLU",
                 id(self.split_function): "Split",
@@ -4574,10 +4670,49 @@ class CudaExecutionBackend:
         if self.module:
             check(self.driver, self.driver.cuModuleUnload(self.module), "cuModuleUnload")
             self.module = CUmodule()
+        if self._gpu_timing_supported:
+            for event in (self._gpu_timing_start_event, self._gpu_timing_stop_event):
+                if event and event.value:
+                    check(self.driver, self.driver.cuEventDestroy(event), "cuEventDestroy")
+            self._gpu_timing_start_event = CUevent()
+            self._gpu_timing_stop_event = CUevent()
         if self.context:
             check(self.driver, self.driver.cuCtxDestroy_v2(self.context), "cuCtxDestroy")
             self.context = CUcontext()
         self.closed = True
+
+    def gpu_timing_start(self) -> bool:
+        """Record a diagnostic event on the existing default stream."""
+        if not self._gpu_timing_supported:
+            return False
+        if not self._gpu_timing_start_event.value:
+            check(self.driver, self.driver.cuEventCreate(ctypes.byref(self._gpu_timing_start_event), 0), "cuEventCreate(start)")
+            check(self.driver, self.driver.cuEventCreate(ctypes.byref(self._gpu_timing_stop_event), 0), "cuEventCreate(stop)")
+        check(self.driver, self.driver.cuEventRecord(self._gpu_timing_start_event, None), "cuEventRecord(start)")
+        self._gpu_timing_active = True
+        return True
+
+    def gpu_timing_stop(self) -> bool:
+        if not self._gpu_timing_active:
+            return False
+        check(self.driver, self.driver.cuEventRecord(self._gpu_timing_stop_event, None), "cuEventRecord(stop)")
+        return True
+
+    def gpu_timing_elapsed_ms(self) -> float | None:
+        """Return elapsed device time after the stop event has completed."""
+        if not self._gpu_timing_active:
+            return None
+        check(self.driver, self.driver.cuEventSynchronize(self._gpu_timing_stop_event), "cuEventSynchronize")
+        elapsed = ctypes.c_float()
+        check(
+            self.driver,
+            self.driver.cuEventElapsedTime(
+                ctypes.byref(elapsed), self._gpu_timing_start_event, self._gpu_timing_stop_event
+            ),
+            "cuEventElapsedTime",
+        )
+        self._gpu_timing_active = False
+        return float(elapsed.value)
 
     def __enter__(self) -> "CudaExecutionBackend":
         return self
@@ -4686,31 +4821,46 @@ class CudaExecutionBackend:
         check(self.driver, result, "cuMemAlloc")
         return pointer
 
+    @frontend_profiling.method_timer("storage/allocation bookkeeping")
     def allocate(self, nbytes: int, category: str = "temporary") -> CUdeviceptr:
         if nbytes <= 0:
             raise ValueError("device allocation size must be positive")
         profiling.allocation_request(nbytes, category)
         eligible = self._pool_enabled and category != "parameter"
         if eligible:
-            blocks = self._free_blocks.get(int(nbytes))
-            if blocks:
-                pointer = blocks.pop()
-                if not blocks:
-                    self._free_blocks.pop(int(nbytes), None)
-                self._allocation_records[int(pointer.value)] = (int(nbytes), category, "live")
-                profiling.allocation_pool_hit(nbytes)
-                profiling.allocation_pool_reused(pointer, nbytes, category)
-                return pointer
-            profiling.allocation_pool_miss()
+            pool_scope = (
+                frontend_profiling.component("allocation-pool lookup")
+                if frontend_profiling.enabled else nullcontext()
+            )
+            with pool_scope:
+                blocks = self._free_blocks.get(int(nbytes))
+                if blocks:
+                    pointer = blocks.pop()
+                    if not blocks:
+                        self._free_blocks.pop(int(nbytes), None)
+                    with (
+                        frontend_profiling.component("temporary allocation bookkeeping")
+                        if frontend_profiling.enabled else nullcontext()
+                    ):
+                        self._allocation_records[int(pointer.value)] = (int(nbytes), category, "live")
+                    profiling.allocation_pool_hit(nbytes)
+                    profiling.allocation_pool_reused(pointer, nbytes, category)
+                    return pointer
+                profiling.allocation_pool_miss()
         started = profiling.start()
         try:
             pointer = self._allocate_driver(nbytes)
-            self._allocation_records[int(pointer.value)] = (int(nbytes), category, "live")
+            with (
+                frontend_profiling.component("temporary allocation bookkeeping")
+                if frontend_profiling.enabled else nullcontext()
+            ):
+                self._allocation_records[int(pointer.value)] = (int(nbytes), category, "live")
             profiling.allocation_succeeded(pointer, nbytes, category)
         finally:
             profiling.observe("Alloc", started, nbytes)
         return pointer
 
+    @frontend_profiling.method_timer("storage/allocation bookkeeping")
     def free(self, pointer: CUdeviceptr) -> None:
         if pointer and pointer.value:
             profiling.allocation_free_request(pointer)
@@ -4724,15 +4874,23 @@ class CudaExecutionBackend:
             ):
                 nbytes, category, _state = record
                 cached_pointer = CUdeviceptr(address)
-                self._allocation_records[address] = (nbytes, category, "pending")
-                self._pending_releases.append(cached_pointer)
+                with (
+                    frontend_profiling.component("deferred-release bookkeeping")
+                    if frontend_profiling.enabled else nullcontext()
+                ):
+                    self._allocation_records[address] = (nbytes, category, "pending")
+                    self._pending_releases.append(cached_pointer)
                 profiling.allocation_pending(pointer)
                 pointer.value = 0
                 return
             if record is not None and record[1] != "parameter" and record[2] == "live":
                 nbytes, category, _state = record
-                self._allocation_records[address] = (nbytes, category, "pending")
-                self._pending_releases.append(CUdeviceptr(address))
+                with (
+                    frontend_profiling.component("deferred-release bookkeeping")
+                    if frontend_profiling.enabled else nullcontext()
+                ):
+                    self._allocation_records[address] = (nbytes, category, "pending")
+                    self._pending_releases.append(CUdeviceptr(address))
                 profiling.allocation_pending(pointer)
                 pointer.value = 0
                 return
@@ -4802,20 +4960,94 @@ class CudaExecutionBackend:
             raise ValueError("kernel work size must be positive")
         started = profiling.start()
         try:
-            params = (ctypes.c_void_p * len(args))(
-                *(ctypes.cast(ctypes.byref(arg), ctypes.c_void_p) for arg in args)
+            submission_scope = (
+                frontend_profiling.component("CUDA ctypes/cuLaunchKernel submission")
+                if frontend_profiling.enabled else nullcontext()
             )
-            grid = (work_items + block_size - 1) // block_size
-            launch_started = profiling.launch_started()
-            check(self.driver, self.driver.cuLaunchKernel(function, grid, 1, 1, block_size, 1, 1, 0, None, params, None), "cuLaunchKernel")
+            with submission_scope:
+                if frontend_profiling.enabled:
+                    with frontend_profiling.component("ctypes launch-argument construction"):
+                        params = (ctypes.c_void_p * len(args))(
+                            *(ctypes.cast(ctypes.byref(arg), ctypes.c_void_p) for arg in args)
+                        )
+                else:
+                    params = (ctypes.c_void_p * len(args))(
+                        *(ctypes.cast(ctypes.byref(arg), ctypes.c_void_p) for arg in args)
+                    )
+                if frontend_profiling.enabled:
+                    with frontend_profiling.component("launch-grid/block calculation"):
+                        grid = (work_items + block_size - 1) // block_size
+                else:
+                    grid = (work_items + block_size - 1) // block_size
+                launch_started = profiling.launch_started()
+                if frontend_profiling.enabled:
+                    with frontend_profiling.component("cuLaunchKernel call"):
+                        check(self.driver, self.driver.cuLaunchKernel(function, grid, 1, 1, block_size, 1, 1, 0, None, params, None), "cuLaunchKernel")
+                else:
+                    check(self.driver, self.driver.cuLaunchKernel(function, grid, 1, 1, block_size, 1, 1, 0, None, params, None), "cuLaunchKernel")
             if not self._async_queue_enabled:
                 self._synchronize_and_reclaim("synchronous_launch")
                 profiling.launch_synchronized(launch_started)
         finally:
-            label = getattr(self, "_function_labels", {}).get(id(function), "CUDA kernel")
+            if frontend_profiling.enabled:
+                with frontend_profiling.component("PTX function/kernel lookup"):
+                    label = getattr(self, "_function_labels", {}).get(id(function), "CUDA kernel")
+            else:
+                label = getattr(self, "_function_labels", {}).get(id(function), "CUDA kernel")
             elapsed = profiling.observe(label, started)
             if profile_signature is not None:
                 profiling.observe_conv2d_signature(profile_signature, elapsed, profile_variant)
+
+    def diagnostic_fused_convolution_silu(
+        self,
+        input_pointer: CUdeviceptr,
+        weight_pointer: CUdeviceptr,
+        bias_pointer: CUdeviceptr,
+        output_pointer: CUdeviceptr,
+        n: int,
+        c: int,
+        h: int,
+        w: int,
+        k: int,
+        r: int,
+        s: int,
+        out_h: int,
+        out_w: int,
+        stride_h: int,
+        stride_w: int,
+        pad_h: int,
+        pad_w: int,
+        dilation_h: int,
+        dilation_w: int,
+        groups: int,
+        variant: str,
+    ) -> None:
+        """Launch a diagnostic-only fused Conv+SiLU PTX variant."""
+        functions = {
+            "generic": self.diagnostic_fused_convolution_silu_function,
+            "small_c8": self.diagnostic_fused_small_c8_silu_function,
+            "small_c10": self.diagnostic_fused_small_c10_silu_function,
+            "small_c24": self.diagnostic_fused_small_c24_silu_function,
+        }
+        try:
+            function = functions[variant]
+        except KeyError as exc:
+            raise ValueError(f"unknown diagnostic fused Conv+SiLU variant: {variant}") from exc
+        self._launch(
+            function,
+            [
+                input_pointer, weight_pointer, bias_pointer, output_pointer,
+                ctypes.c_uint(n), ctypes.c_uint(c), ctypes.c_uint(h), ctypes.c_uint(w),
+                ctypes.c_uint(k), ctypes.c_uint(r), ctypes.c_uint(s),
+                ctypes.c_uint(out_h), ctypes.c_uint(out_w),
+                ctypes.c_uint(stride_h), ctypes.c_uint(stride_w),
+                ctypes.c_uint(pad_h), ctypes.c_uint(pad_w),
+                ctypes.c_uint(dilation_h), ctypes.c_uint(dilation_w),
+                ctypes.c_uint(groups),
+            ],
+            n * k * CUDA_BLOCK_SIZE,
+            profile_variant=f"diagnostic-fused-{variant}",
+        )
 
     def add(
         self,
@@ -5021,6 +5253,8 @@ class CudaExecutionBackend:
         output_strides: tuple[int, int, int, int],
         outer_strides: tuple[int, int, int, int],
     ) -> None:
+        if config.trace:
+            trace_log(f"[MatrixMan/CUDA] Softmax shape [{','.join(str(v) for v in shape)}] dim={dim}")
         self._launch(
             self.softmax_function,
             [
@@ -5089,7 +5323,38 @@ class CudaExecutionBackend:
         specialized_3x3_plane_legacy: bool = False,
         specialized_3x3_plane_2block: bool = False,
         specialized_3x3_plane_256: bool = False,
-    ) -> None:
+        execution_metadata: CudaConvExecutionMetadata | None = None,
+    ) -> CudaConvExecutionMetadata | None:
+        if config.trace:
+            trace_log(f"[MatrixMan/CUDA] Conv2D [{n},{c},{h},{w}] -> [{n},{k},{out_h},{out_w}]")
+        if execution_metadata is not None:
+            profile_signature = (
+                (
+                    n, c, h, w, k, out_h, out_w, r, s,
+                    stride_h, stride_w, pad_h, pad_w,
+                    dilation_h, dilation_w, groups,
+                )
+                if profiling.enabled
+                else None
+            )
+            self._launch(
+                execution_metadata.function,
+                [
+                    input_pointer, weight_pointer, bias_pointer, output_pointer,
+                    ctypes.c_uint(n), ctypes.c_uint(c), ctypes.c_uint(h), ctypes.c_uint(w),
+                    ctypes.c_uint(k), ctypes.c_uint(r), ctypes.c_uint(s),
+                    ctypes.c_uint(out_h), ctypes.c_uint(out_w),
+                    ctypes.c_uint(stride_h), ctypes.c_uint(stride_w),
+                    ctypes.c_uint(pad_h), ctypes.c_uint(pad_w),
+                    ctypes.c_uint(dilation_h), ctypes.c_uint(dilation_w),
+                    ctypes.c_uint(groups),
+                ],
+                execution_metadata.work_items,
+                profile_signature=profile_signature,
+                profile_variant=execution_metadata.profile_variant,
+                block_size=execution_metadata.block_size,
+            )
+            return execution_metadata
         # ``specialized=True`` remains a compatibility alias for the original
         # plane kernel; new callers use the explicit legacy name.
         specialized_3x3_plane_legacy = specialized_3x3_plane_legacy or specialized
@@ -5248,7 +5513,6 @@ class CudaExecutionBackend:
             else None
         )
         total_outputs = n * k * out_h * out_w
-        trace_log(f"[MatrixMan/CUDA] Conv2D [{n},{c},{h},{w}] -> [{n},{k},{out_h},{out_w}]")
         if _cuda_debug_enabled():
             print(
                 "[MatrixMan/CUDA/debug] Conv2D launch: "
@@ -5305,6 +5569,43 @@ class CudaExecutionBackend:
             if specialized_3x3_spatial
             else self.convolution_function
         )
+        work_items = (
+            n * k * ((out_h * out_w + CUDA_BLOCK_SIZE - 1) // CUDA_BLOCK_SIZE)
+            * CUDA_BLOCK_SIZE
+            if specialized_3x3_spatial
+            else n * k * 2 * CUDA_BLOCK_SIZE
+            if specialized_3x3_plane_2block or specialized_3x3_plane_256
+            else n * k * CUDA_BLOCK_SIZE
+            if fast_path
+            else total_outputs
+        )
+        profile_variant = (
+            "specialized-3x3-plane-legacy" if specialized_3x3_plane_legacy
+            else "specialized-1x1-c64" if specialized_1x1
+            else "specialized-1x1-cin16" if specialized_1x1_cin16
+            else "specialized-1x1-cin24" if specialized_1x1_cin24
+            else "specialized-1x1-cin36" if specialized_1x1_cin36
+            else "specialized-1x1-cin48" if specialized_1x1_cin48
+            else "specialized-1x1-cin72" if specialized_1x1_cin72
+            else "specialized-3x3-plane-2block" if specialized_3x3_plane_2block
+            else "specialized-3x3-plane-256" if specialized_3x3_plane_256
+            else "specialized-3x3-spatial" if specialized_3x3_spatial
+            else "specialized-3x3-plane" if specialized_3x3_plane
+            else "specialized-3x3-c8-c64-plane" if specialized_3x3_c8_c64_plane
+            else "specialized-3x3-small-c8" if specialized_3x3_small_c8
+            else "specialized-3x3-small-c10" if specialized_3x3_small_c10
+            else "specialized-3x3-small-c12" if specialized_3x3_small_c12
+            else "specialized-3x3-small-c24" if specialized_3x3_small_c24
+            else "specialized-3x3-c24-c64-plane" if specialized_3x3_c24_c64_plane
+            else "specialized-3x3-c48-c64-plane" if specialized_3x3_c48_c64_plane
+            else "generic"
+        )
+        metadata = CudaConvExecutionMetadata(
+            function=function,
+            work_items=work_items,
+            block_size=256 if specialized_3x3_plane_256 else CUDA_BLOCK_SIZE,
+            profile_variant=profile_variant,
+        )
         self._launch(
             function,
             [
@@ -5355,6 +5656,7 @@ class CudaExecutionBackend:
             ),
             block_size=256 if specialized_3x3_plane_256 else CUDA_BLOCK_SIZE,
         )
+        return metadata
 
     def batch_norm(
         self,
@@ -5371,6 +5673,8 @@ class CudaExecutionBackend:
     ) -> None:
         if min(count, channels, spatial) <= 0:
             raise ValueError("batch norm dimensions must be positive")
+        if config.trace:
+            trace_log(f"[MatrixMan/CUDA] BatchNorm count={count} channels={channels} spatial={spatial}")
         self._launch(
             self.batch_norm_function,
             [
@@ -5385,6 +5689,8 @@ class CudaExecutionBackend:
     def silu(self, input_pointer: CUdeviceptr, output_pointer: CUdeviceptr, count: int) -> None:
         if count <= 0:
             raise ValueError("SiLU tensor size must be positive")
+        if config.trace:
+            trace_log(f"[MatrixMan/CUDA] SiLU elements={count}")
         self._launch(
             self.silu_function,
             [input_pointer, output_pointer, ctypes.c_uint(count)],

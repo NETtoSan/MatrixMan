@@ -28,7 +28,7 @@ _DEFAULTS = {
     "cudaDebug": False, "cudaDisableAsyncQueue": False,
     "cudaDisableAllocPool": False, "cudaDisableSpecializedConv": False,
     "cudaConv3x3Variant": "plane", "cudaLegacyModuleLoad": False,
-    "tileAutotuneRefresh": False,
+    "tileAutotuneRefresh": False, "disableAutoPrepare": False,
 }
 _ENV_FIELDS = {
     "MATRIXMAN_BACKEND": "backend", "MATRIXMAN_TILE_LIMIT": "tileLimit",
@@ -46,13 +46,13 @@ _ENV_FIELDS = {
     "MATRIXMAN_CUDA_DEBUG": "cudaDebug", "MATRIXMAN_CUDA_DISABLE_ASYNC_QUEUE": "cudaDisableAsyncQueue",
     "MATRIXMAN_CUDA_DISABLE_ALLOC_POOL": "cudaDisableAllocPool", "MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV": "cudaDisableSpecializedConv",
     "MATRIXMAN_CUDA_CONV3X3_VARIANT": "cudaConv3x3Variant", "MATRIXMAN_CUDA_LEGACY_MODULE_LOAD": "cudaLegacyModuleLoad",
-    "MATRIXMAN_TILE_AUTOTUNE_REFRESH": "tileAutotuneRefresh",
+    "MATRIXMAN_TILE_AUTOTUNE_REFRESH": "tileAutotuneRefresh", "MATRIXMAN_DISABLE_AUTO_PREPARE": "disableAutoPrepare",
 }
 _BOOL_FIELDS = {
     "useDGPU", "convSpatialReuse", "preparedExecution", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
     "profile", "cudaProfile", "profileDetail", "gpuTiming", "trace", "debug", "gpuPostprocess",
     "auditCpuLeaks", "cudaDebug", "cudaDisableAsyncQueue", "cudaDisableAllocPool",
-    "cudaDisableSpecializedConv", "cudaLegacyModuleLoad", "tileAutotuneRefresh",
+    "cudaDisableSpecializedConv", "cudaLegacyModuleLoad", "tileAutotuneRefresh", "disableAutoPrepare",
 }
 
 
@@ -154,7 +154,7 @@ class Configuration:
             _sync_profile(value)
 
     def __repr__(self) -> str:
-        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "preparedExecution", "profile", "gpuTiming")
+        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "preparedExecution", "disableAutoPrepare", "profile", "gpuTiming")
         return "MatrixManConfig(" + ", ".join(f"{n}={self._values[n]!r}" for n in names) + ")"
 
     @property

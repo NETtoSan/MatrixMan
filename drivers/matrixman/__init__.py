@@ -24,6 +24,7 @@ from .backend import (
     unsupported_report,
 )
 from .tensor import Gm45Tensor, MatrixManTensor, is_gm45_tensor, is_matrixman_tensor
+from .preparation import auto_prepare, prepare, prepare_cuda, prepare_opengl
 from .selector import select_backend
 
 config = _config_module.config
@@ -58,6 +59,10 @@ __all__ = [
     "Gm45Tensor",
     "gpu_postprocess_detection",
     "prefer",
+    "prepare",
+    "prepare_cuda",
+    "prepare_opengl",
+    "auto_prepare",
     "config",
     "profiling",
     "set_profiling",

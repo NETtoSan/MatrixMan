@@ -1,15 +1,22 @@
 """MatrixMan CUDA backend façade."""
 
 from dataclasses import dataclass
+import time
 
 import torch
 
 from ...config import config
 from ...backend import Backend
+from ... import frontend_profiling
 from ...tensor import contiguous_strides
 from . import factories
 from . import profiling
-from .gpumatrix import CudaExecutionBackend, check as check_cuda, detect_device
+from .gpumatrix import (
+    CudaConvExecutionMetadata,
+    CudaExecutionBackend,
+    check as check_cuda,
+    detect_device,
+)
 
 
 @dataclass(frozen=True)
@@ -20,9 +27,40 @@ class CudaStorageLayout:
     kind: str = "cuda_linear"
 
 
+@dataclass(frozen=True)
+class Conv2DExecutionMetadata:
+    """Immutable Conv2D setup; pointers and allocations stay per invocation."""
+
+    input_shape: tuple[int, ...]
+    input_strides: tuple[int, ...]
+    weight_shape: tuple[int, ...]
+    weight_strides: tuple[int, ...]
+    bias_signature: tuple | None
+    stride: tuple[int, int]
+    padding: tuple[int, int]
+    dilation: tuple[int, int]
+    groups: int
+    output_shape: tuple[int, int, int, int]
+    flags: tuple[bool, ...]
+    runtime: CudaConvExecutionMetadata
+
+
+@dataclass(frozen=True)
+class BatchNormExecutionMetadata:
+    """Immutable BatchNorm setup; parameter and output pointers stay dynamic."""
+
+    input_shape: tuple[int, ...]
+    parameter_signatures: tuple
+    eps: float
+    count: int
+    channels: int
+    spatial: int
+
+
 class CudaTensorOwner:
     """Own one CUDA device allocation used by a MatrixMan tensor."""
 
+    @frontend_profiling.method_timer("CUDA storage owner construction")
     def __init__(
         self,
         execution: CudaExecutionBackend,
@@ -58,6 +96,7 @@ class CudaTensorOwner:
             pass
 
 
+@frontend_profiling.method_timer("shape/stride tuple/list construction")
 def _numel(shape) -> int:
     result = 1
     for dimension in shape:
@@ -65,11 +104,43 @@ def _numel(shape) -> int:
     return result
 
 
+@frontend_profiling.method_timer("shape/stride tuple/list construction")
 def _pair(value, label: str) -> tuple[int, int]:
     values = tuple(int(item) for item in value) if isinstance(value, (tuple, list)) else (int(value), int(value))
     if len(values) != 2:
         raise NotImplementedError(f"MatrixMan/CUDA: convolution {label} must contain two values")
     return values
+
+
+def _execution_tensor_signature(value):
+    """Return immutable semantic tensor properties, never a storage pointer."""
+    if value is None:
+        return None
+    # MatrixManTensor metadata is immutable for the lifetime of the wrapper.
+    # Reading it directly avoids re-entering device/stride/contiguity helpers
+    # on every CUDA cache-key construction, while still including every
+    # property that can invalidate the signature.
+    owner = getattr(value, "_owner", None)
+    if getattr(getattr(owner, "layout", None), "kind", None) == "cuda_linear":
+        shape = tuple(int(item) for item in value.shape)
+        strides = tuple(int(item) for item in value._logical_strides)
+        return (
+            "privateuseone",
+            str(value.dtype),
+            shape,
+            strides,
+            strides == contiguous_strides(shape),
+        )
+    try:
+        return (
+            value.device.type,
+            str(value.dtype),
+            tuple(int(item) for item in value.shape),
+            tuple(int(item) for item in value.stride()),
+            bool(value.is_contiguous()),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return (type(value).__module__, type(value).__qualname__)
 
 
 def upload_tensor(data: torch.Tensor, execution: CudaExecutionBackend) -> CudaTensorOwner:
@@ -115,6 +186,8 @@ class CudaBackend(Backend):
         # Raw parameter pointers are owned by this backend for its lifetime;
         # activation/output owners remain independently managed by tensors.
         self._parameter_cache = {}
+        self._conv_execution_metadata_cache: dict[tuple, Conv2DExecutionMetadata] = {}
+        self._batch_norm_execution_metadata_cache: dict[tuple, BatchNormExecutionMetadata] = {}
 
     def device_info(self) -> dict[str, str]:
         return {
@@ -127,6 +200,7 @@ class CudaBackend(Backend):
     def synchronize(self):
         self.execution.synchronize()
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def matmul(self, left, right):
         """Execute 2D matrix multiplication through the existing CUDA kernel."""
         for name, value in (("left", left), ("right", right)):
@@ -166,10 +240,17 @@ class CudaBackend(Backend):
 
     @staticmethod
     def _parameter_cache_key(value: torch.Tensor):
-        try:
-            storage_pointer = int(value.untyped_storage().data_ptr())
-        except AttributeError:
-            storage_pointer = int(value.storage().data_ptr())
+        if frontend_profiling.enabled:
+            with frontend_profiling.component("CUDA tensor/storage lookup"):
+                try:
+                    storage_pointer = int(value.untyped_storage().data_ptr())
+                except AttributeError:
+                    storage_pointer = int(value.storage().data_ptr())
+        else:
+            try:
+                storage_pointer = int(value.untyped_storage().data_ptr())
+            except AttributeError:
+                storage_pointer = int(value.storage().data_ptr())
         return (
             storage_pointer,
             int(value.storage_offset()),
@@ -181,9 +262,16 @@ class CudaBackend(Backend):
 
     def _cached_parameter(self, value: torch.Tensor):
         """Return a persistent device pointer and whether it was uploaded."""
-        key = self._parameter_cache_key(value)
-        version = int(value._version)
-        entry = self._parameter_cache.get(key)
+        if frontend_profiling.enabled:
+            with frontend_profiling.component("parameter-cache key construction"):
+                key = self._parameter_cache_key(value)
+            with frontend_profiling.component("parameter-cache dict lookup"):
+                version = int(value._version)
+                entry = self._parameter_cache.get(key)
+        else:
+            key = self._parameter_cache_key(value)
+            version = int(value._version)
+            entry = self._parameter_cache.get(key)
         if entry is not None and entry[1] == version:
             profiling.parameter_cache_event("hits")
             return entry[2], False
@@ -205,8 +293,83 @@ class CudaBackend(Backend):
         profiling.parameter_cache_adjust("retained_bytes", nbytes)
         return pointer, True
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def convolution(self, input_tensor, weight, bias, stride, padding, dilation, groups):
         """Execute a float32 NCHW convolution entirely through CUDA storage."""
+        input_signature = _execution_tensor_signature(input_tensor)
+        weight_signature = _execution_tensor_signature(weight)
+        bias_signature = _execution_tensor_signature(bias)
+        owner = getattr(input_tensor, "_owner", None)
+        owner_kind = getattr(getattr(owner, "layout", None), "kind", None)
+        conv_key = (
+            "conv2d",
+            owner_kind,
+            input_signature,
+            weight_signature,
+            bias_signature,
+            None if bias is None else (tuple(int(item) for item in bias.shape) if hasattr(bias, "shape") else None),
+            tuple(int(item) for item in stride) if isinstance(stride, (tuple, list)) else int(stride),
+            tuple(int(item) for item in padding) if isinstance(padding, (tuple, list)) else int(padding),
+            tuple(int(item) for item in dilation) if isinstance(dilation, (tuple, list)) else int(dilation),
+            int(groups) if isinstance(groups, (int, bool)) else str(groups),
+            bool(config.cudaDisableSpecializedConv),
+            str(config.cudaConv3x3Variant),
+        )
+        cached = self._conv_execution_metadata_cache.get(conv_key)
+        if cached is not None:
+            started = time.perf_counter()
+            profiling.execution_metadata_event("convolution", "hit")
+            n, c, h, w = cached.input_shape
+            k, _weight_c, r, s = cached.weight_shape
+            out_n, out_k, out_h, out_w = cached.output_shape
+            profiling.execution_metadata["conv_hit_seconds"] += time.perf_counter() - started
+            weight_pointer, weight_uploaded = self._cached_parameter(weight)
+            if weight_uploaded:
+                profiling.count_conv2d("weight_uploads", weight.numel() * weight.element_size())
+            bias_pointer = None
+            output_pointer = None
+            try:
+                if bias is not None:
+                    bias_pointer, bias_uploaded = self._cached_parameter(bias)
+                    if bias_uploaded:
+                        profiling.count_conv2d("bias_uploads", bias.numel() * bias.element_size())
+                else:
+                    bias_pointer = type(input_tensor._owner.pointer)()
+                output_pointer = self.execution.allocate(n * out_k * out_h * out_w * 4)
+                profiling.count_conv2d("output_allocations", n * out_k * out_h * out_w * 4)
+                self.execution.convolution(
+                    input_tensor._owner.pointer, weight_pointer, bias_pointer, output_pointer,
+                    n, c, h, w, out_k, r, s, out_h, out_w,
+                    *cached.stride, *cached.padding, *cached.dilation, cached.groups,
+                    specialized_3x3_plane_legacy=cached.flags[0],
+                    specialized_1x1=cached.flags[1],
+                    specialized_1x1_cin16=cached.flags[2],
+                    specialized_1x1_cin24=cached.flags[3],
+                    specialized_1x1_cin36=cached.flags[4],
+                    specialized_1x1_cin48=cached.flags[5],
+                    specialized_1x1_cin72=cached.flags[6],
+                    specialized_3x3_spatial=cached.flags[7],
+                    specialized_3x3_plane=cached.flags[8],
+                    specialized_3x3_c8_c64_plane=cached.flags[9],
+                    specialized_3x3_small_c8=cached.flags[10],
+                    specialized_3x3_small_c10=cached.flags[11],
+                    specialized_3x3_small_c12=cached.flags[12],
+                    specialized_3x3_small_c24=cached.flags[13],
+                    specialized_3x3_c24_c64_plane=cached.flags[14],
+                    specialized_3x3_c48_c64_plane=cached.flags[15],
+                    specialized_3x3_plane_2block=cached.flags[16],
+                    specialized_3x3_plane_256=cached.flags[17],
+                    execution_metadata=cached.runtime,
+                )
+                return CudaTensorOwner(
+                    self.execution, output_pointer, cached.output_shape,
+                    (out_k * out_h * out_w, out_h * out_w, out_w, 1),
+                )
+            except Exception:
+                if output_pointer is not None:
+                    self.execution.free(output_pointer)
+                raise
+        miss_started = time.perf_counter()
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
             raise RuntimeError("MatrixMan/CUDA: convolution requires a CUDA-backed MatrixManTensor")
         if input_tensor.dtype != torch.float32 or len(input_tensor.shape) != 4:
@@ -368,6 +531,9 @@ class CudaBackend(Backend):
             and dilation_h == 1 and dilation_w == 1 and groups == 1
         )
 
+        profiling.execution_metadata_event(
+            "convolution", "miss", time.perf_counter() - miss_started
+        )
         weight_pointer, weight_uploaded = self._cached_parameter(weight)
         if weight_uploaded:
             profiling.count_conv2d("weight_uploads", weight.numel() * weight.element_size())
@@ -382,7 +548,7 @@ class CudaBackend(Backend):
                 bias_pointer = type(input_tensor._owner.pointer)()
             output_pointer = self.execution.allocate(n * k * out_h * out_w * 4)
             profiling.count_conv2d("output_allocations", n * k * out_h * out_w * 4)
-            self.execution.convolution(
+            runtime_metadata = self.execution.convolution(
                 input_tensor._owner.pointer, weight_pointer, bias_pointer, output_pointer,
                 n, c, h, w, k, r, s, out_h, out_w,
                 stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w, groups,
@@ -404,6 +570,31 @@ class CudaBackend(Backend):
                 specialized_3x3_c48_c64_plane=specialized_3x3_c48_c64_plane,
             )
             strides = (k * out_h * out_w, out_h * out_w, out_w, 1)
+            self._conv_execution_metadata_cache[conv_key] = Conv2DExecutionMetadata(
+                input_shape=(n, c, h, w),
+                input_strides=tuple(int(item) for item in input_tensor.stride()),
+                weight_shape=(k, weight_c, r, s),
+                weight_strides=tuple(int(item) for item in weight.stride()),
+                bias_signature=bias_signature,
+                stride=(stride_h, stride_w),
+                padding=(pad_h, pad_w),
+                dilation=(dilation_h, dilation_w),
+                groups=groups,
+                output_shape=(n, k, out_h, out_w),
+                flags=(
+                    specialized_3x3_plane_legacy, specialized_1x1,
+                    specialized_1x1_cin16, specialized_1x1_cin24,
+                    specialized_1x1_cin36, specialized_1x1_cin48,
+                    specialized_1x1_cin72, specialized_3x3_spatial,
+                    specialized_3x3_plane, specialized_3x3_c8_c64_plane,
+                    specialized_3x3_small_c8, specialized_3x3_small_c10,
+                    specialized_3x3_small_c12, specialized_3x3_small_c24,
+                    specialized_3x3_c24_c64_plane, specialized_3x3_c48_c64_plane,
+                    False, False,
+                ),
+                runtime=runtime_metadata,
+            )
+            profiling.execution_metadata_entries("conv", len(self._conv_execution_metadata_cache))
             return CudaTensorOwner(
                 self.execution,
                 output_pointer,
@@ -415,8 +606,49 @@ class CudaBackend(Backend):
                 self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def batch_norm(self, input_tensor, weight, bias, running_mean, running_var, training, eps):
         """Execute inference-only float32 NCHW BatchNorm in CUDA storage."""
+        bn_key = (
+            "batch_norm",
+            getattr(getattr(getattr(input_tensor, "_owner", None), "layout", None), "kind", None),
+            _execution_tensor_signature(input_tensor),
+            tuple(_execution_tensor_signature(value) for value in (weight, bias, running_mean, running_var)),
+            bool(training),
+            float(eps) if isinstance(eps, (int, float)) else str(eps),
+        )
+        cached = self._batch_norm_execution_metadata_cache.get(bn_key)
+        if cached is not None:
+            started = time.perf_counter()
+            profiling.execution_metadata_event("batch_norm", "hit")
+            values = [
+                torch.full((cached.channels,), default, dtype=torch.float32)
+                if value is None else value.detach()
+                for value, default in (
+                    (running_mean, 0.0), (running_var, 1.0),
+                    (weight, 1.0), (bias, 0.0),
+                )
+            ]
+            profiling.execution_metadata["batch_norm_hit_seconds"] += time.perf_counter() - started
+            parameter_pointers = [self._cached_parameter(value)[0] for value in values]
+            output_pointer = None
+            try:
+                output_pointer = self.execution.allocate(cached.count * 4)
+                self.execution.batch_norm(
+                    input_tensor._owner.pointer,
+                    parameter_pointers[0], parameter_pointers[1],
+                    parameter_pointers[2], parameter_pointers[3], output_pointer,
+                    cached.count, cached.channels, cached.spatial, cached.eps,
+                )
+                return CudaTensorOwner(
+                    self.execution, output_pointer, cached.input_shape,
+                    (cached.channels * cached.spatial, cached.spatial, cached.input_shape[-1], 1),
+                )
+            except Exception:
+                if output_pointer is not None:
+                    self.execution.free(output_pointer)
+                raise
+        miss_started = time.perf_counter()
         if training:
             raise NotImplementedError("MatrixMan/CUDA: BatchNorm training mode is not implemented")
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
@@ -447,6 +679,9 @@ class CudaBackend(Backend):
         if float(eps) < 0:
             raise ValueError("MatrixMan/CUDA: BatchNorm epsilon must be non-negative")
 
+        profiling.execution_metadata_event(
+            "batch_norm", "miss", time.perf_counter() - miss_started
+        )
         parameter_pointers = []
         profiling.count_batch_norm("invocations")
         for value in (running_mean, running_var, weight, bias):
@@ -470,6 +705,20 @@ class CudaBackend(Backend):
                 float(eps),
             )
             strides = (channels * height * width, height * width, width, 1)
+            self._batch_norm_execution_metadata_cache[bn_key] = BatchNormExecutionMetadata(
+                input_shape=(n, channels, height, width),
+                parameter_signatures=tuple(
+                    _execution_tensor_signature(value)
+                    for value in (weight, bias, running_mean, running_var)
+                ),
+                eps=float(eps),
+                count=n * channels * height * width,
+                channels=channels,
+                spatial=height * width,
+            )
+            profiling.execution_metadata_entries(
+                "batch_norm", len(self._batch_norm_execution_metadata_cache)
+            )
             return CudaTensorOwner(
                 self.execution,
                 output_pointer,
@@ -481,6 +730,7 @@ class CudaBackend(Backend):
                 self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def sigmoid(self, input_tensor):
         """Execute float32 sigmoid on a readable CUDA logical layout."""
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
@@ -511,6 +761,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def silu(self, input_tensor, inplace=False):
         """Execute float32 SiLU, optionally mutating the existing CUDA storage."""
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
@@ -544,6 +795,24 @@ class CudaBackend(Backend):
                 self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("prepared CUDA Conv+SiLU execution")
+    def convolution_silu(self, input_tensor, weight, bias, stride, padding, dilation, groups):
+        """Run existing Conv and SiLU primitives for a prepared module."""
+        convolution_owner = self.convolution(
+            input_tensor, weight, bias, stride, padding, dilation, groups
+        )
+        try:
+            self.execution.silu(
+                convolution_owner.pointer,
+                convolution_owner.pointer,
+                convolution_owner.layout.numel,
+            )
+            return convolution_owner
+        except Exception:
+            convolution_owner.release()
+            raise
+
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def split(self, input_tensor, split_size, dimension):
         """Copy contiguous float32 tensor chunks into independent CUDA buffers."""
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
@@ -616,6 +885,7 @@ class CudaBackend(Backend):
             raise
         return owners
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def add(self, left, right, alpha=1):
         """Execute float32 tensor or scalar addition on CUDA."""
         left_is_tensor = hasattr(left, "_owner")
@@ -700,6 +970,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def mul(self, left, right):
         """Multiply float32 CUDA tensors with aligned singleton broadcasting."""
         if not hasattr(left, "_owner") or not hasattr(right, "_owner"):
@@ -757,6 +1028,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def div(self, input_tensor, divisor):
         """Divide a readable float32 CUDA tensor by a scalar on CUDA."""
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
@@ -797,6 +1069,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def sub(self, left, right, alpha=1):
         """Subtract matching float32 CUDA tensors using logical view strides."""
         if not hasattr(left, "_owner") or not hasattr(right, "_owner"):
@@ -848,6 +1121,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def cat(self, tensors, dimension):
         """Concatenate contiguous float32 tensors into one CUDA allocation."""
         tensors = tuple(tensors)
@@ -925,6 +1199,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def stack(self, tensors, dimension):
         """Stack matching float32 tensors through a stride-aware CUDA copy."""
         tensors = tuple(tensors)
@@ -981,6 +1256,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def fill(self, tensor, value):
         """Fill a CUDA-backed float32 tensor in place using logical strides."""
         if not hasattr(tensor, "_owner") or tensor._owner.layout.kind != "cuda_linear":
@@ -1011,6 +1287,7 @@ class CudaBackend(Backend):
         self.execution.fill(pointer, value, _numel(shape), padded_shape, padded_strides)
         return tensor
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def softmax(self, tensor, dimension, half_to_float=False):
         """Execute stable float32 softmax while honoring logical input strides."""
         if not hasattr(tensor, "_owner") or tensor._owner.layout.kind != "cuda_linear":
@@ -1071,6 +1348,7 @@ class CudaBackend(Backend):
             self.execution.free(output_pointer)
             raise
 
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def upsample_nearest2d(self, input_tensor, output_size, scale_h=None, scale_w=None):
         """Resize contiguous float32 NCHW storage with CUDA nearest-neighbor sampling."""
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":

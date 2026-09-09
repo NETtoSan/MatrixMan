@@ -195,23 +195,45 @@ def profile_enabled() -> bool:
 
 
 def profile_report(frame_count: int | None = None) -> None:
+    from . import frontend_profiling
+
     backend = get_backend()
     if backend.name == "cuda":
         from .backends.cuda import profiling
 
         profiling.report()
+        frontend_profiling.report(frame_count=frame_count)
         return
     _require_opengl_frontend("profile reporting").profile_report(frame_count=frame_count)
+    frontend_profiling.report(frame_count=frame_count)
 
 
 def profile_reset() -> None:
+    from . import frontend_profiling
+
     backend = get_backend()
     if backend.name == "cuda":
         from .backends.cuda import profiling
 
         profiling.reset()
+        frontend_profiling.reset()
         return
     _require_opengl_frontend("profile reset").profile_reset()
+    frontend_profiling.reset()
+
+
+def frontend_profile_report(frame_count: int | None = None) -> None:
+    """Print the opt-in PyTorch-facing dispatch profile."""
+    from . import frontend_profiling
+
+    frontend_profiling.report(frame_count=frame_count)
+
+
+def frontend_profile_reset() -> None:
+    """Reset the opt-in PyTorch-facing dispatch profile."""
+    from . import frontend_profiling
+
+    frontend_profiling.reset()
 
 
 def reset_unsupported_report() -> None:

@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-"""Simple public-facing MatrixMan YOLO demonstration."""
-
+#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,15 +18,19 @@ from demo.yolo_helpers import detections, first_tensor, preprocess_frame
 from drivers import matrixman
 from drivers.matrixman.backend import get_backend
 
+# Select CUDA, OpenGL, or auto detection through MATRIXMAN_BACKEND.
+preferences = os.environ.get("MATRIXMAN_BACKEND", "auto").strip().lower() or "auto"
 matrixman.prefer("opengl")
-#matrixman.profiling = True
+
+matrixman.profiling = True
 matrixman.trace = True
 
-#matrixman.config.profileDetail = True
+# Keep the demo's conservative legacy-GPU execution settings in one place.
 matrixman.config.tileLimit = 512
 matrixman.config.tileSync = "end"
 matrixman.config.convSpatialReuse = True
-#matrixman.config.useDGPU = False
+
+matrixman.config.useDGPU = True
 
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
@@ -39,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--frames", type=int, default=0, help="stop after N frames; 0 means until quit/end")
     parser.add_argument("--no-display", action="store_true")
+    preparation = parser.add_mutually_exclusive_group()
+    preparation.add_argument("--prepare", action="store_true", help="eagerly prepare the model before inference")
+    preparation.add_argument("--no-auto-prepare", action="store_true", help="disable lazy model preparation")
     return parser.parse_args()
 
 
@@ -62,32 +68,50 @@ def main() -> int:
         device = info.get("renderer") or info.get("device") or info.get("name") or "unknown"
         print(f"backend: MatrixMan / {info['backend']} / {device}")
         yolo = YOLO(str(model_path))
-        net = yolo.model.eval()
+        model = yolo.model.eval()
+        if args.prepare:
+            model = matrixman.prepare(model, backend=info["backend"].lower())
+        elif not args.no_auto_prepare:
+            # Normal inference: MatrixMan prepares supported patterns once.
+            model = matrixman.auto_prepare(model)
         names = yolo.names if isinstance(yolo.names, dict) else dict(enumerate(yolo.names))
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"could not open video: {video_path}")
         frame_count = 0
+
         try:
             if not args.no_display:
                 cv2.namedWindow("MatrixMan VisDrone", cv2.WINDOW_AUTOSIZE)
             while args.frames == 0 or frame_count < args.frames:
+
                 ok, frame = cap.read()
                 if not ok:
                     break
+
                 frame_started = time.perf_counter()
                 display_frame = cv2.resize(frame, (args.imgsz, args.imgsz), interpolation=cv2.INTER_LINEAR)
-                cpu_input = preprocess_frame(frame, args.imgsz)
-                gpu_input = matrixman.to_device(cpu_input)
+                input_tensor = matrixman.to_device(preprocess_frame(frame, args.imgsz))
+
+                event_timing = os.environ.get("MATRIXMAN_CUDA_EVENT_TIMING", "").lower() in {"1", "true", "yes", "on"}
+                execution = get_backend().execution if event_timing else None
+                event_started = execution.gpu_timing_start() if execution is not None else False
 
                 with torch.no_grad():
-                    prediction = first_tensor(net(gpu_input))
-                if not matrixman.is_matrixman_tensor(prediction):
-                    pass
-                    #raise RuntimeError("model output did not remain a MatrixManTensor")
+                    prediction = first_tensor(model(input_tensor))
+                event_stopped = execution.gpu_timing_stop() if event_started else False
 
+                readback_started = time.perf_counter() if event_stopped else None
+                # MatrixMan tensor -> CPU tensor: the single normal readback boundary.
                 prediction = prediction.cpu()
+                if event_stopped:
+                    gpu_ms = execution.gpu_timing_elapsed_ms()
+                    readback_ms = (time.perf_counter() - readback_started) * 1000.0
+                    print(
+                        f"  CUDA events: gpu_execution={gpu_ms:.3f} ms "
+                        f"readback_boundary={readback_ms:.3f} ms"
+                    )
                 result, _ = detections(prediction, args.imgsz, args.imgsz, names, args.conf, args.iou)
 
                 for (x1, y1, x2, y2), score, _cls, label in result:
@@ -95,7 +119,7 @@ def main() -> int:
                     cv2.rectangle(display_frame, box[:2], box[2:], (0, 255, 0), 2)
                     cv2.putText(display_frame, f"{label} {score:.2f}", (box[0], max(12, box[1] - 4)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
-                
+
                 elapsed = time.perf_counter() - frame_started
                 print(f"frame {frame_count}: detections={len(result)} total={elapsed:.3f}s FPS={1 / max(elapsed, 1e-9):.2f}")
                 if not args.no_display:

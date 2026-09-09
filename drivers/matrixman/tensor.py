@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 import warnings
+from contextlib import nullcontext
 
 import torch
 
@@ -220,6 +222,12 @@ def _impl():
     return dispatch
 
 
+def _frontend_profiling():
+    from . import frontend_profiling
+
+    return frontend_profiling
+
+
 def is_matrixman_tensor(value) -> bool:
     return isinstance(value, MatrixManTensor)
 
@@ -264,17 +272,32 @@ class MatrixManTensor(torch.Tensor):
 
     @staticmethod
     def _from_owner(owner, shape, storage_offset=0, logical_strides=None):
-        strides = tuple(logical_strides or contiguous_strides(shape))
-        if len(strides) != len(shape):
-            raise RuntimeError("MatrixMan tensor logical strides must match shape rank")
-        max_index = max_storage_index(shape, strides)
-        if storage_offset < 0 or (numel(shape) > 0 and storage_offset + max_index >= owner.layout.numel):
-            raise RuntimeError("MatrixMan tensor view storage offset is outside owner storage")
+        profiling = _frontend_profiling()
+        validation_scope = (
+            profiling.component("shape/layout validation")
+            if profiling.enabled else nullcontext()
+        )
+        with validation_scope:
+            strides = tuple(logical_strides or contiguous_strides(shape))
+            if len(strides) != len(shape):
+                raise RuntimeError("MatrixMan tensor logical strides must match shape rank")
+            max_index = max_storage_index(shape, strides)
+            if storage_offset < 0 or (numel(shape) > 0 and storage_offset + max_index >= owner.layout.numel):
+                raise RuntimeError("MatrixMan tensor view storage offset is outside owner storage")
+        if profiling.enabled:
+            profiling.wrapper_created()
+            with profiling.component("tensor wrapper creation"):
+                return MatrixManTensor(owner, shape, storage_offset, strides)
         return MatrixManTensor(owner, shape, storage_offset, strides)
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        return _impl().handle_torch_dispatch(cls, func, types, args, kwargs)
+        if not _frontend_profiling().enabled:
+            return _impl().handle_torch_dispatch(cls, func, types, args, kwargs)
+        return _frontend_profiling().dispatch_call(
+            func,
+            lambda: _impl().handle_torch_dispatch(cls, func, types, args, kwargs),
+        )
 
     def __repr__(self):
         storage = self._owner.storage_description

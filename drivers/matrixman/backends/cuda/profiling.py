@@ -19,6 +19,18 @@ batch_norm = defaultdict(float)
 conv2d = defaultdict(float)
 activation = defaultdict(float)
 parameter_cache = defaultdict(float)
+execution_metadata = {
+    "conv_hits": 0,
+    "conv_misses": 0,
+    "batch_norm_hits": 0,
+    "batch_norm_misses": 0,
+    "conv_hit_seconds": 0.0,
+    "conv_miss_seconds": 0.0,
+    "batch_norm_hit_seconds": 0.0,
+    "batch_norm_miss_seconds": 0.0,
+    "conv_entries": 0,
+    "batch_norm_entries": 0,
+}
 readback = defaultdict(float)
 conv2d_signatures = {}
 async_mode = False
@@ -92,6 +104,8 @@ def reset() -> None:
     conv2d.clear()
     activation.clear()
     parameter_cache.clear()
+    for key in execution_metadata:
+        execution_metadata[key] = 0
     readback.clear()
     conv2d_signatures.clear()
     synchronizations.clear()
@@ -247,6 +261,21 @@ def parameter_cache_event(name: str, byte_count: int = 0) -> None:
 def parameter_cache_adjust(name: str, delta: int) -> None:
     if enabled:
         parameter_cache[name] += int(delta)
+
+
+def execution_metadata_event(kind: str, result: str, elapsed: float = 0.0) -> None:
+    """Record a Conv2D/BatchNorm immutable-metadata cache event."""
+    if not enabled:
+        return
+    prefix = "conv" if kind == "convolution" else "batch_norm"
+    count_key = "hits" if result == "hit" else "misses"
+    execution_metadata[f"{prefix}_{count_key}"] += 1
+    execution_metadata[f"{prefix}_{result}_seconds"] += float(elapsed)
+
+
+def execution_metadata_entries(kind: str, count: int) -> None:
+    if enabled:
+        execution_metadata[f"{kind}_entries"] = int(count)
 
 
 def readback_phase(name: str, elapsed: float) -> None:
@@ -529,6 +558,21 @@ def report() -> None:
         print(f"  misses: {int(parameter_cache['misses'])}")
         print(f"  retained allocations: {int(parameter_cache['retained_allocations'])}")
         print(f"  retained bytes: {int(parameter_cache['retained_bytes'])}")
+
+    if any(execution_metadata.values()):
+        print("CUDA execution-metadata cache")
+        for kind, label in (("conv", "Conv2D"), ("batch_norm", "BatchNorm")):
+            hits = int(execution_metadata[f"{kind}_hits"])
+            misses = int(execution_metadata[f"{kind}_misses"])
+            total = hits + misses
+            hit_ms = execution_metadata[f"{kind}_hit_seconds"] * 1000.0
+            miss_ms = execution_metadata[f"{kind}_miss_seconds"] * 1000.0
+            print(
+                f"  {label}: hits={hits} misses={misses} "
+                f"hit_rate={(hits / total * 100.0) if total else 0.0:.1f}% "
+                f"entries={int(execution_metadata[f'{kind}_entries'])} "
+                f"hit_setup_ms={hit_ms:.3f} miss_setup_ms={miss_ms:.3f}"
+            )
 
     if readback:
         print("CUDA readback reconstruction")

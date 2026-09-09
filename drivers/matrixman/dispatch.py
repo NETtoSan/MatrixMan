@@ -60,6 +60,14 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
         memory_format = kwargs.get("memory_format")
         if memory_format not in {None, torch.preserve_format}:
             raise NotImplementedError("MatrixMan CPU readback supports preserve_format only")
+        from . import frontend_profiling
+        if frontend_profiling.enabled:
+            with frontend_profiling.component("explicit transfer/readback"):
+                return readback_tensor(
+                    source,
+                    audit_op="aten._to_copy.default",
+                    audit_reason="explicit MatrixMan-to-CPU transfer",
+                )
         return readback_tensor(
             source,
             audit_op="aten._to_copy.default",
@@ -80,10 +88,14 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             input_tensor = args[0]
             if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
                 raise RuntimeError("MatrixMan/CUDA: unsqueeze requires a CUDA-backed MatrixManTensor")
-            output_shape, output_strides = unsqueeze_shape_strides(
+            from . import frontend_profiling
+            output_shape, output_strides = frontend_profiling.metadata_call(
+                unsqueeze_shape_strides,
                 input_tensor.shape,
                 input_tensor._logical_strides,
                 args[1],
+            ) if frontend_profiling.enabled else unsqueeze_shape_strides(
+                input_tensor.shape, input_tensor._logical_strides, args[1]
             )
             return type(input_tensor)._from_owner(
                 input_tensor._owner,
@@ -134,10 +146,14 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             input_tensor = args[0]
             if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
                 raise RuntimeError("MatrixMan/CUDA: expand requires a CUDA-backed MatrixManTensor")
-            output_shape, output_strides = expand_shape_strides(
+            from . import frontend_profiling
+            output_shape, output_strides = frontend_profiling.metadata_call(
+                expand_shape_strides,
                 input_tensor.shape,
                 input_tensor._logical_strides,
                 args[1],
+            ) if frontend_profiling.enabled else expand_shape_strides(
+                input_tensor.shape, input_tensor._logical_strides, args[1]
             )
             return type(input_tensor)._from_owner(
                 input_tensor._owner,
@@ -156,7 +172,10 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
                 raise NotImplementedError(
                     "MatrixMan/CUDA: view only supports contiguous tensors"
                 )
-            output_shape = infer_view_shape(input_shape, args[1])
+            from . import frontend_profiling
+            output_shape = frontend_profiling.metadata_call(
+                infer_view_shape, input_shape, args[1]
+            ) if frontend_profiling.enabled else infer_view_shape(input_shape, args[1])
             return type(input_tensor)._from_owner(
                 input_tensor._owner,
                 output_shape,
@@ -353,7 +372,13 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             # default dimension is used; explicit Python keyword arguments
             # may likewise remain in kwargs.
             dimension = args[2] if len(args) > 2 else (kwargs or {}).get("dim", 0)
-            owners = backend.split(args[0], args[1], dimension)
+            from . import frontend_profiling
+            split_scope = frontend_profiling.component("metadata/view handling") if frontend_profiling.enabled else None
+            if split_scope is None:
+                owners = backend.split(args[0], args[1], dimension)
+            else:
+                with split_scope:
+                    owners = backend.split(args[0], args[1], dimension)
             return tuple(
                 type(args[0])._from_owner(
                     owner,
@@ -366,3 +391,10 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             f"MatrixMan/CUDA: {_operator_name(func)} not implemented"
         )
     raise RuntimeError(f"MatrixMan/{backend.name}: no dispatch implementation")
+
+
+_frontend_profiling = __import__(
+    "drivers.matrixman.frontend_profiling", fromlist=["wrap_shared"]
+)
+handle_torch_dispatch = _frontend_profiling.wrap_cuda_backend(handle_torch_dispatch)
+handle_torch_dispatch = _frontend_profiling.wrap_shared(handle_torch_dispatch)
