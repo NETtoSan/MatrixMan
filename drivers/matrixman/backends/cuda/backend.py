@@ -1349,6 +1349,50 @@ class CudaBackend(Backend):
             raise
 
     @frontend_profiling.method_timer("CUDA operation setup/validation")
+    def max_pool2d(self, input_tensor, kernel_size, stride, padding, dilation, ceil_mode):
+        """Execute the YOLO SPPF max-pool subset on CUDA."""
+        if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":
+            raise RuntimeError("MatrixMan/CUDA: max_pool2d requires a CUDA-backed MatrixManTensor")
+        if input_tensor.dtype != torch.float32 or len(input_tensor.shape) != 4:
+            raise NotImplementedError("MatrixMan/CUDA: max_pool2d supports float32 NCHW tensors only")
+        if not input_tensor.is_contiguous():
+            raise NotImplementedError("MatrixMan/CUDA: max_pool2d requires contiguous tensors")
+        n, channels, height, width = (int(value) for value in input_tensor.shape)
+        kernel = _pair(kernel_size, "kernel_size")
+        pooling_stride = _pair(stride, "stride")
+        pooling_padding = _pair(padding, "padding")
+        pooling_dilation = _pair(dilation, "dilation")
+        if (
+            kernel != (5, 5) or pooling_stride != (1, 1)
+            or pooling_padding != (2, 2) or pooling_dilation != (1, 1)
+            or bool(ceil_mode)
+        ):
+            raise NotImplementedError(
+                "MatrixMan/CUDA max_pool2d currently supports only "
+                "kernel=5, stride=1, padding=2, dilation=1, ceil_mode=False"
+            )
+        output_shape = (n, channels, height, width)
+        output_pointer = self.execution.allocate(_numel(output_shape) * 4)
+        try:
+            self.execution.max_pool2d_5x5_s1_p2(
+                input_tensor._owner.pointer,
+                output_pointer,
+                n, channels, height, width,
+                int(input_tensor._storage_offset),
+            )
+            output = CudaTensorOwner(
+                self.execution,
+                output_pointer,
+                output_shape,
+                (channels * height * width, height * width, width, 1),
+            )
+            output_pointer = None
+            return output
+        finally:
+            if output_pointer is not None:
+                self.execution.free(output_pointer)
+
+    @frontend_profiling.method_timer("CUDA operation setup/validation")
     def upsample_nearest2d(self, input_tensor, output_size, scale_h=None, scale_w=None):
         """Resize contiguous float32 NCHW storage with CUDA nearest-neighbor sampling."""
         if not hasattr(input_tensor, "_owner") or input_tensor._owner.layout.kind != "cuda_linear":

@@ -28,6 +28,7 @@ def _operator_name(func) -> str:
         torch.ops.aten.stack.default: "Stack",
         torch.ops.aten._softmax.default: "Softmax",
         torch.ops.aten.upsample_nearest2d.default: "UpsampleNearest2D",
+        torch.ops.aten.max_pool2d_with_indices.default: "MaxPool2D",
     }
     return names.get(func, str(func))
 
@@ -332,6 +333,25 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
                 owner.shape,
                 logical_strides=owner.strides,
             )
+        if func is torch.ops.aten.max_pool2d_with_indices.default:
+            if len(args) < 2:
+                raise RuntimeError("MatrixMan/CUDA: malformed max_pool2d_with_indices arguments")
+            input_tensor = args[0]
+            kernel_size = args[1]
+            stride = args[2] if len(args) > 2 and args[2] is not None else kernel_size
+            padding = args[3] if len(args) > 3 else (0, 0)
+            dilation = args[4] if len(args) > 4 else (1, 1)
+            ceil_mode = args[5] if len(args) > 5 else False
+            owner = backend.max_pool2d(
+                input_tensor, kernel_size, stride, padding, dilation, ceil_mode
+            )
+            values = type(input_tensor)._from_owner(
+                owner,
+                owner.shape,
+                logical_strides=owner.strides,
+            )
+            indices = torch.empty((0,), dtype=torch.int64, device="cpu")
+            return values, indices
         if func is torch.ops.aten.native_batch_norm.default:
             if len(args) < 8:
                 raise RuntimeError("MatrixMan/CUDA: malformed BatchNorm arguments")

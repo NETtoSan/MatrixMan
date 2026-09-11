@@ -71,6 +71,103 @@ PTX = r"""
 .shared .align 4 .b8 conv3x3_weights[2304];
 .shared .align 4 .b8 conv1x1_weights[288];
 
+.visible .entry max_pool2d_5x5_s1_p2(
+    .param .u64 p_input,
+    .param .u64 p_output,
+    .param .u32 p_n,
+    .param .u32 p_c,
+    .param .u32 p_h,
+    .param .u32 p_w,
+    .param .u32 p_input_offset
+)
+{
+    .reg .pred %p<6>;
+    .reg .u32 %r<24>;
+    .reg .s32 %s<8>;
+    .reg .u64 %rd<6>;
+    .reg .f32 %f<3>;
+
+    ld.param.u64 %rd1, [p_input];
+    ld.param.u64 %rd2, [p_output];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_c];
+    ld.param.u32 %r3, [p_h];
+    ld.param.u32 %r4, [p_w];
+    ld.param.u32 %r5, [p_input_offset];
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mul.lo.u32 %r6, %r6, %r7;
+    mov.u32 %r8, %tid.x;
+    add.u32 %r6, %r6, %r8;
+    mul.lo.u32 %r9, %r1, %r2;
+    mul.lo.u32 %r9, %r9, %r3;
+    mul.lo.u32 %r9, %r9, %r4;
+    setp.ge.u32 %p0, %r6, %r9;
+    @%p0 bra MAXPOOL_DONE;
+
+    div.u32 %r10, %r6, %r4;
+    mul.lo.u32 %r11, %r10, %r4;
+    sub.u32 %r12, %r6, %r11;
+    div.u32 %r13, %r10, %r3;
+    mul.lo.u32 %r11, %r13, %r3;
+    sub.u32 %r14, %r10, %r11;
+    div.u32 %r15, %r13, %r2;
+    mul.lo.u32 %r11, %r15, %r2;
+    sub.u32 %r16, %r13, %r11;
+    div.u32 %r17, %r15, %r1;
+
+    mov.s32 %s0, %r14;
+    mov.s32 %s1, %r12;
+    mov.s32 %s2, %r3;
+    mov.s32 %s3, %r4;
+    mov.f32 %f1, -3.402823466e+38;
+    mov.u32 %r18, 0;
+MAXPOOL_Y:
+    setp.ge.u32 %p1, %r18, 5;
+    @%p1 bra MAXPOOL_STORE;
+    add.s32 %s4, %s0, %r18;
+    add.s32 %s4, %s4, -2;
+    setp.lt.s32 %p2, %s4, 0;
+    @%p2 bra MAXPOOL_NEXT_Y;
+    setp.ge.s32 %p2, %s4, %s2;
+    @%p2 bra MAXPOOL_NEXT_Y;
+    mov.u32 %r19, 0;
+MAXPOOL_X:
+    setp.ge.u32 %p3, %r19, 5;
+    @%p3 bra MAXPOOL_NEXT_Y;
+    add.s32 %s5, %s1, %r19;
+    add.s32 %s5, %s5, -2;
+    setp.lt.s32 %p4, %s5, 0;
+    @%p4 bra MAXPOOL_NEXT_X;
+    setp.ge.s32 %p4, %s5, %s3;
+    @%p4 bra MAXPOOL_NEXT_X;
+    mul.lo.u32 %r20, %r17, %r2;
+    add.u32 %r20, %r20, %r16;
+    mul.lo.u32 %r20, %r20, %r3;
+    mov.u32 %r22, %s4;
+    add.u32 %r20, %r20, %r22;
+    mul.lo.u32 %r20, %r20, %r4;
+    mov.u32 %r23, %s5;
+    add.u32 %r20, %r20, %r23;
+    add.u32 %r20, %r20, %r5;
+    mul.wide.u32 %rd3, %r20, 4;
+    add.u64 %rd3, %rd1, %rd3;
+    ld.global.f32 %f2, [%rd3];
+    max.f32 %f1, %f1, %f2;
+MAXPOOL_NEXT_X:
+    add.u32 %r19, %r19, 1;
+    bra MAXPOOL_X;
+MAXPOOL_NEXT_Y:
+    add.u32 %r18, %r18, 1;
+    bra MAXPOOL_Y;
+MAXPOOL_STORE:
+    mul.wide.u32 %rd4, %r6, 4;
+    add.u64 %rd4, %rd2, %rd4;
+    st.global.f32 [%rd4], %f1;
+MAXPOOL_DONE:
+    ret;
+}
+
 .visible .entry matrix_add(
     .param .u64 p_a,
     .param .u64 p_b,
@@ -4500,6 +4597,7 @@ class CudaExecutionBackend:
                 "matrix_mul_elementwise, matrix_arange, matrix_add_scalar, "
                 "matrix_div_scalar, matrix_sigmoid, stack_copy, matrix_fill, "
                 "matrix_softmax, matrix_mul, conv2d_nchw, "
+                "max_pool2d_5x5_s1_p2, "
                 "conv2d_3x3_s1_p1_c64_plane_legacy, conv2d_3x3_s1_p1_c64_plane, "
                 "conv2d_3x3_s1_p1_c8_c64_plane, conv2d_3x3_s1_p1_small_c8, "
                 "conv2d_3x3_s1_p1_c24_c64_plane, conv2d_3x3_s1_p1_c48_c64_plane, "
@@ -4549,6 +4647,7 @@ class CudaExecutionBackend:
             self.stack_function = CUfunction()
             self.fill_function = CUfunction()
             self.softmax_function = CUfunction()
+            self.max_pool2d_function = CUfunction()
             self.matmul_function = CUfunction()
             self.convolution_function = CUfunction()
             self.convolution_plane_legacy_function = CUfunction()
@@ -4588,6 +4687,7 @@ class CudaExecutionBackend:
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.stack_function), self.module, b"stack_copy"), "get stack_copy")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.fill_function), self.module, b"matrix_fill"), "get matrix_fill")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.softmax_function), self.module, b"matrix_softmax"), "get matrix_softmax")
+            check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.max_pool2d_function), self.module, b"max_pool2d_5x5_s1_p2"), "get max_pool2d_5x5_s1_p2")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.matmul_function), self.module, b"matrix_mul"), "get matrix_mul")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_function), self.module, b"conv2d_nchw"), "get conv2d_nchw")
             check(self.driver, self.driver.cuModuleGetFunction(ctypes.byref(self.convolution_plane_legacy_function), self.module, b"conv2d_3x3_s1_p1_c64_plane_legacy"), "get conv2d_3x3_s1_p1_c64_plane_legacy")
@@ -4628,6 +4728,7 @@ class CudaExecutionBackend:
                 id(self.stack_function): "Stack",
                 id(self.fill_function): "Fill",
                 id(self.softmax_function): "Softmax",
+                id(self.max_pool2d_function): "MaxPool2D",
                 id(self.matmul_function): "MatMul",
                 id(self.convolution_function): "Conv2D",
                 id(self.convolution_plane_legacy_function): "Conv2D",
@@ -5271,6 +5372,34 @@ class CudaExecutionBackend:
                 *(ctypes.c_uint(item) for item in outer_strides),
             ],
             outer,
+        )
+
+    def max_pool2d_5x5_s1_p2(
+        self,
+        input_pointer: CUdeviceptr,
+        output_pointer: CUdeviceptr,
+        n: int,
+        channels: int,
+        height: int,
+        width: int,
+        input_offset: int = 0,
+    ) -> None:
+        if min(n, channels, height, width) <= 0:
+            raise ValueError("max-pool dimensions must be positive")
+        if config.trace:
+            trace_log(
+                f"[MatrixMan/CUDA] MaxPool2D [{n},{channels},{height},{width}] -> "
+                f"[{n},{channels},{height},{width}] k=5 s=1 p=2"
+            )
+        self._launch(
+            self.max_pool2d_function,
+            [
+                input_pointer, output_pointer,
+                ctypes.c_uint(n), ctypes.c_uint(channels),
+                ctypes.c_uint(height), ctypes.c_uint(width),
+                ctypes.c_uint(input_offset),
+            ],
+            n * channels * height * width,
         )
 
     def matmul(self, a: CUdeviceptr, b: CUdeviceptr, output: CUdeviceptr, m: int, k: int, n: int) -> None:

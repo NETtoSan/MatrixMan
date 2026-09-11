@@ -35,7 +35,7 @@ matrixman.config.useDGPU = True
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="MatrixMan VisDrone tracking demo")
-    parser.add_argument("--model", type=Path, default=base / "models/VisDrone-arm64-480/weights/best.pt")
+    parser.add_argument("--model", type=Path, default=base / "models/VisDrone-small/weights/best.pt")
     parser.add_argument("--video", type=Path, default=base / "videos/video0.mp4")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.25)
