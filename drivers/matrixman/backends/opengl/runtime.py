@@ -191,6 +191,9 @@ def _gl_text(value) -> str:
 def shutdown() -> None:
     """Release all GL objects owned by the current runtime."""
     global _runtime, _adapter_preference
+    from . import conv_diagnostics, convolution
+    conv_diagnostics.close()
+    convolution.reset_conv_diagnostics()
     if _runtime is None:
         return
 

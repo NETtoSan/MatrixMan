@@ -52,6 +52,7 @@ per-terminal settings are recommended.
 | `MATRIXMAN_TILE_SYNC` | OpenGL convolution | Inter-tile synchronization mode | `per_tile` | `end` |
 | `MATRIXMAN_CONV_SPATIAL_REUSE` | OpenGL convolution | Experimental spatial reuse | off | `1` |
 | `MATRIXMAN_PREPARED_EXECUTION` | OpenGL convolution | Prepared Conv/BatchNorm execution | on | `0` or `1` |
+| `MATRIXMAN_CONV_DIAG` | OpenGL convolution | Persistent Conv diagnostics window | off | `1` |
 | `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` | OpenGL convolution | Skip redundant pre-consolidation synchronization | on | `0` to retain the legacy barrier |
 | `MATRIXMAN_DIAGNOSTIC_TILES` | OpenGL compatibility | Capture tile diagnostics | off | `1` |
 | `MATRIXMAN_DIAGNOSTIC_RECT_TILES` | OpenGL diagnostics | Enable rectangular/order tile experiments | off | `1` |
@@ -141,6 +142,7 @@ Exact source map:
 | `MATRIXMAN_TILE_LIMIT` | `drivers/matrixman/backends/opengl/convolution.py`, `profiling.py`, `compatibility.py` |
 | `MATRIXMAN_TILE_SYNC` | `drivers/matrixman/backends/opengl/convolution.py`, `profiling.py`, `compatibility.py` |
 | `MATRIXMAN_CONV_SPATIAL_REUSE` | `drivers/matrixman/backends/opengl/convolution.py`, `diagnostics/matrixman_conv_10a_diagnostic.py` |
+| `MATRIXMAN_CONV_DIAG` | `drivers/matrixman/backends/opengl/conv_diagnostics.py`, `convolution.py` |
 | `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` | `drivers/matrixman/backends/opengl/convolution.py` |
 | `MATRIXMAN_DIAGNOSTIC_TILES` | `drivers/matrixman/backends/opengl/convolution.py`, `compatibility.py`, `diagnostics/opengl_conv_target_diagnostic.py` |
 | `MATRIXMAN_DIAGNOSTIC_RECT_TILES` | `drivers/matrixman/backends/opengl/convolution.py`, `compatibility.py` |

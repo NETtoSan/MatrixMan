@@ -127,6 +127,21 @@ redundant pre-consolidation barrier. Set
 `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC=0` to retain that legacy barrier while
 diagnosing a driver-specific issue.
 
+## Conv diagnostics window
+
+Set `matrixman.config.convDiag = True`, or use
+`MATRIXMAN_CONV_DIAG=1`, to enable one persistent `MatrixMan Conv Diagnostics`
+window. It is created lazily on the first Conv2D, reused for every later Conv,
+and destroyed by `matrixman.shutdown()`. The window shows the selected logical
+input activation channel, the corresponding Conv filter, and the selected
+logical output channel, together with Conv shapes, kernel/stride/padding,
+program cache status, prepared/fused status, and physical packed texture sizes.
+
+This mode explicitly reads back the current input and output textures after
+each displayed Conv and is intentionally slow. It is not suitable for
+performance benchmarking. `MATRIXMAN_CONV_DIAG=0` adds no diagnostic window or
+Conv readbacks.
+
 ## Physical tile validation diagnostic
 
 To validate physical Conv render sizes on the current OpenGL GPU and driver,

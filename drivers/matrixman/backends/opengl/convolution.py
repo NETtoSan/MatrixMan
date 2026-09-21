@@ -26,6 +26,22 @@ _DEFAULT_BIAS = torch.zeros((1,), dtype=torch.float32)
 _last_tile_geometry: list[dict] = []
 _last_tile_output_texture: int | None = None
 _last_dispatch_metadata: dict | None = None
+_last_conv_program_status = "cached"
+_conv_diag_index = 0
+
+
+def _begin_conv_program_status() -> None:
+    global _last_conv_program_status
+    _last_conv_program_status = "cached"
+
+
+def _note_conv_program_status(status: str) -> None:
+    global _last_conv_program_status
+    if status == "compiled":
+        _last_conv_program_status = "compiled"
+        if config.convDiag:
+            from . import conv_diagnostics
+            conv_diagnostics.set_status("COMPILE")
 _GL_SCISSOR_TEST = 0x0C11
 gm.gl.glScissor.restype = None
 gm.gl.glScissor.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -166,6 +182,7 @@ def _conv_program(params: tuple) -> tuple[int, int, int, int]:
     with profiling.conv_stage("program_cache_lookup"):
         cached = params in rt.conv_programs
     if not cached:
+        _note_conv_program_status("compiled")
         b._trace(f"gm45.compile -> convolution GLSL fragment shader params={params}")
         with profiling.conv_stage("shader_source_generation"):
             source = _conv_shader_source(params)
@@ -370,6 +387,7 @@ def _conv_spatial_program(params: tuple) -> tuple[int, int, int, int]:
     with profiling.conv_stage("program_cache_lookup"):
         cached = params in rt.conv_spatial_programs
     if not cached:
+        _note_conv_program_status("compiled")
         b._trace(f"gm45.compile -> spatial-reuse convolution GLSL shader params={params}")
         with profiling.conv_stage("shader_source_generation"):
             source = _conv_spatial_shader_source(params)
@@ -452,6 +470,7 @@ def _conv_tile_program(fragment_source: bytes) -> tuple[int, int, int, int]:
     with profiling.conv_stage("program_cache_lookup"):
         cached = key in rt.conv_tile_programs
     if not cached:
+        _note_conv_program_status("compiled")
         b._trace("gm45.compile -> tiled convolution GLSL fragment shader")
         with profiling.conv_stage("shader_compile_link"):
             program = gm.make_program(fragment_source)
@@ -474,6 +493,7 @@ def _tile_copy_program(fragment_source: bytes) -> tuple[int, int]:
     with profiling.conv_stage("program_cache_lookup"):
         cached = key in rt.tile_copy_programs
     if not cached:
+        _note_conv_program_status("compiled")
         b._trace("gm45.compile -> tiled convolution copy GLSL fragment shader")
         with profiling.conv_stage("shader_compile_link"):
             program = gm.make_program(fragment_source)
@@ -891,7 +911,13 @@ def _convolution_params(input_tensor, out_owner, dimensions, stride, padding,
 def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_owner,
                                  weight_owner, bias_owner, dimensions, stride,
                                  padding, out_shape, b, *, fused_silu=False,
-                                 allow_spatial_reuse=True):
+                                 allow_spatial_reuse=True, prepared=False,
+                                 fused_batch_norm=False):
+    global _conv_diag_index
+    _begin_conv_program_status()
+    if config.convDiag:
+        from . import conv_diagnostics
+        conv_diagnostics.set_context(input_tensor.shape, out_shape)
     params = _convolution_params(
         input_tensor, out_owner, dimensions, stride, padding,
         bias_tensor, weight_owner, bias_owner, fused_silu=fused_silu,
@@ -900,17 +926,52 @@ def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_o
     if allow_spatial_reuse and not fused_silu and _spatial_reuse_enabled() and _conv_spatial_reuse_supported(
         input_tensor, out_owner, params, tile_limit
     ):
-        return _render_convolution_spatial(
+        result = _render_convolution_spatial(
             input_tensor, out_owner, weight_owner, bias_owner, params
         )
-    if out_owner.layout.texture_width > tile_limit or out_owner.layout.texture_height > tile_limit:
-        return _render_convolution_tiled(
+    elif out_owner.layout.texture_width > tile_limit or out_owner.layout.texture_height > tile_limit:
+        result = _render_convolution_tiled(
             input_tensor, out_owner, weight_owner, bias_owner, params
         )
-    return _render_convolution_direct(
-        input_tensor, weight_tensor, bias_tensor, out_owner,
-        weight_owner, bias_owner, params, out_shape, b,
-    )
+    else:
+        result = _render_convolution_direct(
+            input_tensor, weight_tensor, bias_tensor, out_owner,
+            weight_owner, bias_owner, params, out_shape, b,
+        )
+    if config.convDiag:
+        try:
+            from . import conv_diagnostics
+
+            _conv_diag_index += 1
+            if fused_silu and fused_batch_norm:
+                fused = "Conv+BN+SiLU"
+            elif fused_batch_norm:
+                fused = "Conv+BN"
+            elif fused_silu:
+                fused = "Conv+SiLU"
+            else:
+                fused = "none"
+            conv_diagnostics.update(
+                input_tensor=input_tensor,
+                weight_tensor=weight_tensor,
+                output_tensor=result,
+                index=_conv_diag_index,
+                kernel=f"{dimensions[6]}x{dimensions[7]}",
+                stride=f"{stride[0]}x{stride[1]}",
+                padding=f"{padding[0]}x{padding[1]}",
+                program=_last_conv_program_status,
+                prepared=prepared,
+                fused=fused,
+            )
+        except Exception as exc:
+            # Diagnostics must never turn a valid inference into a failure.
+            b._trace(f"Conv diagnostics update failed: {exc}")
+    return result
+
+
+def reset_conv_diagnostics() -> None:
+    global _conv_diag_index
+    _conv_diag_index = 0
 
 
 def _pending_descriptor(input_tensor, weight_tensor, bias_tensor, out_owner,
@@ -948,6 +1009,8 @@ def materialize_pending(tensor, *, override_parameters=None):
         descriptor["dimensions"], descriptor["stride"], descriptor["padding"],
         descriptor["out_shape"], b,
         fused_silu=bool(descriptor.get("fused_silu", False)),
+        prepared=True,
+        fused_batch_norm=bool(descriptor.get("fused_batch_norm", False)),
     )
     tensor._owner = result._owner
     tensor._shape = result._shape
@@ -1090,6 +1153,7 @@ def execute(args):
     return _render_prepared_convolution(
         input_tensor, weight_tensor, bias_tensor, out_owner,
         weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+        prepared=False,
     )
 
 

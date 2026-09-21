@@ -18,7 +18,7 @@ _DEFAULTS = {
     "backend": "auto", "tileLimit": 256, "resolvedTileLimit": 256,
     "useDGPU": False,
     "tileSync": "per_tile", "convSpatialReuse": False,
-    "preparedExecution": True,
+    "preparedExecution": True, "convDiag": False,
     "skipPreConsolidationSync": True, "diagnosticTiles": False,
     "diagnosticRectTiles": False, "diagTileWidth": None,
     "diagTileHeight": None, "diagTileOrder": "normal",
@@ -35,6 +35,7 @@ _ENV_FIELDS = {
     "MATRIXMAN_USE_DGPU": "useDGPU",
     "MATRIXMAN_TILE_SYNC": "tileSync", "MATRIXMAN_CONV_SPATIAL_REUSE": "convSpatialReuse",
     "MATRIXMAN_PREPARED_EXECUTION": "preparedExecution",
+    "MATRIXMAN_CONV_DIAG": "convDiag",
     "MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC": "skipPreConsolidationSync",
     "MATRIXMAN_DIAGNOSTIC_TILES": "diagnosticTiles", "MATRIXMAN_DIAGNOSTIC_RECT_TILES": "diagnosticRectTiles",
     "MATRIXMAN_DIAG_TILE_WIDTH": "diagTileWidth", "MATRIXMAN_DIAG_TILE_HEIGHT": "diagTileHeight",
@@ -49,7 +50,7 @@ _ENV_FIELDS = {
     "MATRIXMAN_TILE_AUTOTUNE_REFRESH": "tileAutotuneRefresh", "MATRIXMAN_DISABLE_AUTO_PREPARE": "disableAutoPrepare",
 }
 _BOOL_FIELDS = {
-    "useDGPU", "convSpatialReuse", "preparedExecution", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
+    "useDGPU", "convSpatialReuse", "preparedExecution", "convDiag", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
     "profile", "cudaProfile", "profileDetail", "gpuTiming", "trace", "debug", "gpuPostprocess",
     "auditCpuLeaks", "cudaDebug", "cudaDisableAsyncQueue", "cudaDisableAllocPool",
     "cudaDisableSpecializedConv", "cudaLegacyModuleLoad", "tileAutotuneRefresh", "disableAutoPrepare",
@@ -154,7 +155,7 @@ class Configuration:
             _sync_profile(value)
 
     def __repr__(self) -> str:
-        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "preparedExecution", "disableAutoPrepare", "profile", "gpuTiming")
+        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "preparedExecution", "convDiag", "disableAutoPrepare", "profile", "gpuTiming")
         return "MatrixManConfig(" + ", ".join(f"{n}={self._values[n]!r}" for n in names) + ")"
 
     @property

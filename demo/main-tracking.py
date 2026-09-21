@@ -26,7 +26,8 @@ matrixman.profiling = True
 matrixman.trace = True
 
 # Keep the demo's conservative legacy-GPU execution settings in one place.
-matrixman.config.tileLimit = 512
+matrixman.config.convDiag = True
+matrixman.config.tileLimit = 640
 matrixman.config.tileSync = "end"
 matrixman.config.convSpatialReuse = True
 
