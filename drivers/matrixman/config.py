@@ -25,6 +25,8 @@ _DEFAULTS = {
     "diagConvWorkload": "heavy", "profile": False, "cudaProfile": False,
     "profileDetail": False, "gpuTiming": False, "trace": False,
     "debug": False, "gpuPostprocess": False, "auditCpuLeaks": False,
+    "unsafeScratchReuse": False, "debugFreshScratch": False, "scratchEpochPool": False,
+    "debugClearReusedScratch": False,
     "cudaDebug": False, "cudaDisableAsyncQueue": False,
     "cudaDisableAllocPool": False, "cudaDisableSpecializedConv": False,
     "cudaConv3x3Variant": "plane", "cudaLegacyModuleLoad": False,
@@ -43,6 +45,10 @@ _ENV_FIELDS = {
     "MATRIXMAN_PROFILE": "profile", "MATRIXMAN_CUDA_PROFILE": "cudaProfile",
     "MATRIXMAN_PROFILE_DETAIL": "profileDetail", "MATRIXMAN_GPU_TIMING": "gpuTiming",
     "MATRIXMAN_TRACE": "trace", "MATRIXMAN_DEBUG": "debug",
+    "MATRIXMAN_DEBUG_UNSAFE_SCRATCH_REUSE": "unsafeScratchReuse",
+    "MATRIXMAN_DEBUG_FRESH_SCRATCH": "debugFreshScratch",
+    "MATRIXMAN_SCRATCH_EPOCH_POOL": "scratchEpochPool",
+    "MATRIXMAN_DEBUG_CLEAR_REUSED_SCRATCH": "debugClearReusedScratch",
     "MATRIXMAN_GPU_POSTPROCESS": "gpuPostprocess", "MATRIXMAN_AUDIT_CPU_LEAKS": "auditCpuLeaks",
     "MATRIXMAN_CUDA_DEBUG": "cudaDebug", "MATRIXMAN_CUDA_DISABLE_ASYNC_QUEUE": "cudaDisableAsyncQueue",
     "MATRIXMAN_CUDA_DISABLE_ALLOC_POOL": "cudaDisableAllocPool", "MATRIXMAN_CUDA_DISABLE_SPECIALIZED_CONV": "cudaDisableSpecializedConv",
@@ -52,7 +58,7 @@ _ENV_FIELDS = {
 _BOOL_FIELDS = {
     "useDGPU", "convSpatialReuse", "preparedExecution", "convDiag", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
     "profile", "cudaProfile", "profileDetail", "gpuTiming", "trace", "debug", "gpuPostprocess",
-    "auditCpuLeaks", "cudaDebug", "cudaDisableAsyncQueue", "cudaDisableAllocPool",
+    "auditCpuLeaks", "unsafeScratchReuse", "debugFreshScratch", "scratchEpochPool", "debugClearReusedScratch", "cudaDebug", "cudaDisableAsyncQueue", "cudaDisableAllocPool",
     "cudaDisableSpecializedConv", "cudaLegacyModuleLoad", "tileAutotuneRefresh", "disableAutoPrepare",
 }
 
@@ -111,21 +117,30 @@ class Configuration:
     def reloadFromEnvironment(self) -> None:
         """Reload all settings from the process environment."""
         self._overrides.clear()
-        self._values = dict(_DEFAULTS)
+        values = dict(_DEFAULTS)
         for env_name, field in _ENV_FIELDS.items():
             if env_name in os.environ:
-                self._values[field] = _parse_value(field, os.environ[env_name])
-        requested = self._values["tileLimit"]
-        self._values["resolvedTileLimit"] = 256 if requested == "auto" else requested
+                values[field] = _parse_value(field, os.environ[env_name])
+        _validate_values(values)
+        requested = values["tileLimit"]
+        values["resolvedTileLimit"] = 256 if requested == "auto" else requested
+        self._values = values
         if "_sync_profile" in globals():
             _sync_profile(bool(self._values["profile"]))
 
     def _reload_field(self, field: str) -> None:
         environment_name = next(name for name, value in _ENV_FIELDS.items() if value == field)
-        self._values[field] = (
+        value = (
             _parse_value(field, os.environ[environment_name])
             if environment_name in os.environ else _DEFAULTS[field]
         )
+        old_value = self._values.get(field)
+        self._values[field] = value
+        try:
+            _validate_values(self._values)
+        except Exception:
+            self._values[field] = old_value
+            raise
         self._overrides.discard(field)
 
     def reset(self) -> None:
@@ -147,15 +162,23 @@ class Configuration:
 
     def _set(self, field: str, value: Any) -> None:
         value = _parse_value(field, value)
+        old_value = self._values.get(field)
+        old_limit = self._values.get("resolvedTileLimit")
         self._values[field] = value
-        self._overrides.add(field)
         if field == "tileLimit":
             self._values["resolvedTileLimit"] = 256 if value == "auto" else value
+        try:
+            _validate_values(self._values)
+        except Exception:
+            self._values[field] = old_value
+            self._values["resolvedTileLimit"] = old_limit
+            raise
+        self._overrides.add(field)
         if field == "profile":
             _sync_profile(value)
 
     def __repr__(self) -> str:
-        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "convSpatialReuse", "preparedExecution", "convDiag", "disableAutoPrepare", "profile", "gpuTiming")
+        names = ("backend", "useDGPU", "tileLimit", "resolvedTileLimit", "tileSync", "scratchPolicy", "convSpatialReuse", "preparedExecution", "convDiag", "disableAutoPrepare", "profile", "gpuTiming")
         return "MatrixManConfig(" + ", ".join(f"{n}={self._values[n]!r}" for n in names) + ")"
 
     @property
@@ -174,6 +197,10 @@ class Configuration:
     def profiling(self, value: bool) -> None:
         set_profiling(value)
 
+    @property
+    def scratchPolicy(self) -> str:
+        return scratch_policy(self._values)
+
 
 def _property(field: str):
     return property(lambda self: self._values[field], lambda self, value: self._set(field, value))
@@ -183,6 +210,30 @@ for _field in _DEFAULTS:
     if _field != "resolvedTileLimit":
         setattr(Configuration, _field, _property(_field))
 Configuration.resolvedTileLimit = property(lambda self: self._values["resolvedTileLimit"])
+
+def _validate_values(values: dict[str, Any]) -> None:
+    fresh = bool(values.get("debugFreshScratch"))
+    epoch = bool(values.get("scratchEpochPool"))
+    unsafe = bool(values.get("unsafeScratchReuse"))
+    clear = bool(values.get("debugClearReusedScratch"))
+    if fresh and epoch:
+        raise ValueError("debugFreshScratch and scratchEpochPool are incompatible")
+    if unsafe and (fresh or epoch):
+        raise ValueError("unsafeScratchReuse cannot be combined with fresh or epoch scratch policy")
+    if clear and not epoch:
+        raise ValueError("debugClearReusedScratch requires scratchEpochPool")
+
+
+def scratch_policy(values: dict[str, Any] | None = None) -> str:
+    values = values or config._values
+    if values.get("debugFreshScratch"):
+        return "fresh"
+    if values.get("scratchEpochPool"):
+        return "epoch"
+    if values.get("unsafeScratchReuse"):
+        return "unsafe_reuse"
+    return "safe"
+
 
 config = Configuration()
 

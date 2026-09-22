@@ -147,7 +147,8 @@ def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset
     )
     sync_started = time.perf_counter()
     with profiling.stage("readback_synchronization_wait"):
-        gm.glFinish()
+        profiling.sync_finish("final_output_readback")
+    resources.reclaim_retired_scratch_textures(rt)
     if profiling.enabled:
         profiling.counters["readback_sync_calls"] += 1
     if profiling.enabled:

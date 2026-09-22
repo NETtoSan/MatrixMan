@@ -42,6 +42,21 @@ def thread_cpu_supported() -> bool:
     return _thread_cpu_clock is not None
 
 
+def sync_finish(reason: str):
+    """Run one glFinish and attribute its wall time to a sync reason."""
+    if not enabled:
+        return gm.glFinish()
+    wall_started = time.perf_counter()
+    cpu_started = thread_cpu_time()
+    try:
+        return gm.glFinish()
+    finally:
+        record = sync_timings[str(reason)]
+        record["calls"] += 1
+        record["wall_seconds"] += time.perf_counter() - wall_started
+        record["thread_cpu_seconds"] += thread_cpu_time() - cpu_started
+
+
 started = time.perf_counter()
 ops: dict[str, dict[str, float]] = defaultdict(
     lambda: {"calls": 0, "total": 0.0, "thread_cpu_seconds": 0.0, "max": 0.0}
@@ -69,6 +84,10 @@ gl_call_timings: dict[str, dict[str, float]] = defaultdict(
 conv_stage_timings: dict[str, dict[str, float]] = defaultdict(
     lambda: {"calls": 0, "wall_seconds": 0.0, "thread_cpu_seconds": 0.0}
 )
+sync_timings: dict[str, dict[str, float]] = defaultdict(
+    lambda: {"calls": 0, "wall_seconds": 0.0, "thread_cpu_seconds": 0.0}
+)
+conv_cost_records: list[dict] = []
 _gl_state = {
     "program": 0,
     "active_texture": 0,
@@ -275,6 +294,8 @@ def reset() -> None:
     stage_timings.clear()
     gl_call_timings.clear()
     conv_stage_timings.clear()
+    sync_timings.clear()
+    conv_cost_records.clear()
     _gl_state.update({
         "program": 0,
         "active_texture": 0,
@@ -291,6 +312,43 @@ def reset() -> None:
         glstate.reset_counters()
     except ImportError:
         pass
+
+
+def record_convolution_cost(input_shape, output_shape, descriptor, source=None) -> None:
+    """Record static Conv MAC metadata without touching GPU tensor contents."""
+    if not enabled:
+        return
+    input_shape = tuple(int(value) for value in input_shape)
+    output_shape = tuple(int(value) for value in output_shape)
+    n, cin, _hin, _win = input_shape
+    _nout, cout, hout, wout = output_shape
+    kh, kw = descriptor.kernel
+    groups = int(descriptor.groups)
+    macs = int(n * hout * wout * cout * (cin // groups) * kh * kw)
+    if source is None:
+        source_name = "<unknown>"
+        source_path = "<unknown>"
+        source_class = "<unknown>"
+    else:
+        source_name = str(source.qualified_name)
+        source_path = str(source.module_path)
+        source_class = source_name.rsplit(".", 1)[-1]
+    conv_cost_records.append({
+        "source_module": source_name,
+        "source_path": source_path,
+        "source_class": source_class,
+        "family": {"dense": "Conv2D", "depthwise": "DWConv", "grouped": "GroupedConv"}.get(
+            descriptor.path, str(descriptor.path)
+        ),
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+        "kernel": tuple(int(value) for value in descriptor.kernel),
+        "stride": tuple(int(value) for value in descriptor.stride),
+        "groups": groups,
+        "cin": cin,
+        "cout": cout,
+        "macs": macs,
+    })
 
 
 def _parameter_group_key(operation: str | None, parameter_role: str, shape, cacheable: bool) -> tuple:
@@ -560,6 +618,12 @@ def diagnostic_snapshot() -> dict:
     return {
         "stages": {name: dict(value) for name, value in stage_timings.items()},
         "gl_calls": {name: dict(value) for name, value in gl_call_timings.items()},
+        "synchronization": {name: dict(value) for name, value in sync_timings.items()},
+        "sync_counters": {
+            name: int(value)
+            for name, value in counters.items()
+            if "pool" in name or "scratch" in name or "consolidation" in name or "tiled" in name
+        },
         "state_cache_skips": glstate.snapshot(),
     }
 
@@ -665,6 +729,42 @@ def report(frame_count: int | None = None) -> None:
     elapsed = time.perf_counter() - started
     print("\nMatrixMan profile\n-----------------")
     print(f"total backend time: {elapsed:.3f}s")
+    if conv_cost_records:
+        total_macs = sum(record["macs"] for record in conv_cost_records)
+        print("CONVOLUTION COST (static MACs)")
+        print(f"  calls={len(conv_cost_records)} total_MACs={total_macs:,}")
+        if frame_count:
+            print(f"  calls/frame={len(conv_cost_records) / frame_count:.2f} MACs/frame={total_macs / frame_count:,.0f}")
+        print("  ranked convolution operations:")
+        for rank, record in enumerate(sorted(conv_cost_records, key=lambda item: item["macs"], reverse=True), 1):
+            percent = (100.0 * record["macs"] / total_macs) if total_macs else 0.0
+            print(
+                f"    {rank:>3}. {record['source_module']} "
+                f"class={record['source_class']} path={record['source_path']} "
+                f"family={record['family']} "
+                f"input={list(record['input_shape'])} output={list(record['output_shape'])} "
+                f"kernel={record['kernel'][0]}x{record['kernel'][1]} "
+                f"stride={record['stride'][0]}x{record['stride'][1]} "
+                f"groups={record['groups']} MACs={record['macs']:,} "
+                f"percent={percent:.2f}%"
+            )
+
+        def _aggregate(key: str):
+            totals = defaultdict(lambda: {"calls": 0, "macs": 0})
+            for record in conv_cost_records:
+                item = totals[record[key]]
+                item["calls"] += 1
+                item["macs"] += record["macs"]
+            return sorted(totals.items(), key=lambda item: item[1]["macs"], reverse=True)
+
+        print("  by primitive family:")
+        for name, values in _aggregate("family"):
+            percent = 100.0 * values["macs"] / total_macs if total_macs else 0.0
+            print(f"    {name}: calls={values['calls']} MACs={values['macs']:,} percent={percent:.2f}%")
+        print("  by source module class:")
+        for name, values in _aggregate("source_class"):
+            percent = 100.0 * values["macs"] / total_macs if total_macs else 0.0
+            print(f"    {name}: calls={values['calls']} MACs={values['macs']:,} percent={percent:.2f}%")
     names = ("convolution.default", "native_batch_norm.default", "silu_.default", "add.Tensor", "mul.Tensor", "div.Tensor", "sigmoid.default", "mm.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default")
     for name in names:
         record = ops.get(name)
@@ -707,6 +807,40 @@ def report(frame_count: int | None = None) -> None:
     print(f"  prepared convolution deferrals: {int(counters['prepared_convolution_deferrals'])}")
     print(f"  fused Conv+BatchNorm calls: {int(counters['fused_batch_norm_calls'])}")
     print(f"  fused Conv+BatchNorm+SiLU calls: {int(counters['fused_silu_calls'])}")
+    print(
+        "  Conv families: "
+        f"dense={int(counters['dense_conv_calls'])} "
+        f"dense_1x1_specialized={int(counters['dense_1x1_specialized_calls'])} "
+        f"dense_3x3_specialized={int(counters['dense_3x3_specialized_calls'])} "
+        f"grouped={int(counters['grouped_conv_calls'])} "
+        f"grouped_specialized={int(counters['grouped_conv_specialized_calls'])} "
+        f"depthwise_specialized={int(counters['depthwise_specialized_calls'])} "
+        f"depthwise_generic_fallback={int(counters['depthwise_generic_fallback_calls'])}"
+    )
+    print(
+        "  depthwise Conv: "
+        f"specialized={int(counters['depthwise_specialized_calls'])} "
+        f"generic_fallback={int(counters['depthwise_generic_fallback_calls'])} "
+        f"program_cache_hits={int(counters['depthwise_program_cache_hits'])} "
+        f"program_cache_misses={int(counters['depthwise_program_cache_misses'])} "
+        f"tiled_cache_hits={int(counters['depthwise_tile_program_cache_hits'])} "
+        f"tiled_cache_misses={int(counters['depthwise_tile_program_cache_misses'])}"
+    )
+    print(
+        "  dense 1x1 program cache: "
+        f"hits={int(counters['dense_1x1_program_cache_hits'])} "
+        f"misses={int(counters['dense_1x1_program_cache_misses'])}"
+    )
+    print(
+        "  dense 3x3 program cache: "
+        f"hits={int(counters['dense_3x3_program_cache_hits'])} "
+        f"misses={int(counters['dense_3x3_program_cache_misses'])}"
+    )
+    print(
+        "  grouped 3x3 program cache: "
+        f"hits={int(counters['grouped_conv_program_cache_hits'])} "
+        f"misses={int(counters['grouped_conv_program_cache_misses'])}"
+    )
     print(f"  PrivateUse1 dispatch calls: {int(counters['privateuse1_dispatch_calls'])}")
     try:
         from . import glstate
@@ -732,9 +866,103 @@ def report(frame_count: int | None = None) -> None:
     print(f"  tiled per-tile glFinish calls: {int(counters['tiled_per_tile_sync_calls'])}")
     print(f"  pre-consolidation glFinish executed: {int(counters['pre_consolidation_sync_calls'])}")
     print(f"  pre-consolidation glFinish skipped: {int(counters['pre_consolidation_sync_skips'])}")
-    print(f"  post-consolidation synchronization elisions: {int(counters['consolidation_sync_elisions'])}")
+    print(f"  post-consolidation glFinish calls: {int(counters['post_consolidation_sync_calls'])}")
+    print(
+        "  pool-safety glFinish calls: "
+        f"{int(counters['activation_pool_reuse_sync_calls'] + counters['activation_pool_eviction_sync_calls'] + counters['scratch_pool_reuse_sync_calls'] + counters['scratch_pool_eviction_sync_calls'])}"
+    )
     print(f"  tiled convolution sync mode: {config.tileSync}")
     print(f"  physical tile limit: {config.resolvedTileLimit}")
+    print("SYNC PROFILE")
+    print(f"  glFinish total: {int(counters['glFinish_calls'])} calls, {counters['glFinish_seconds']:.3f}s")
+    sync_order = (
+        "per_tile", "pre_consolidation", "post_consolidation",
+        "activation_reuse", "activation_release", "activation_eviction",
+        "scratch_reuse", "scratch_release", "scratch_eviction",
+        "final_output_readback", "backend_synchronize",
+    )
+    for reason in sync_order:
+        record = sync_timings.get(reason, {"calls": 0, "wall_seconds": 0.0, "thread_cpu_seconds": 0.0})
+        print(
+            f"  {reason}: calls={int(record['calls'])} "
+            f"wall={record['wall_seconds']:.3f}s "
+            f"thread_cpu={record['thread_cpu_seconds']:.3f}s"
+        )
+    other_syncs = sorted(set(sync_timings) - set(sync_order))
+    for reason in other_syncs:
+        record = sync_timings[reason]
+        print(
+            f"  {reason}: calls={int(record['calls'])} "
+            f"wall={record['wall_seconds']:.3f}s "
+            f"thread_cpu={record['thread_cpu_seconds']:.3f}s"
+        )
+    def _frame_value(value):
+        return value / frame_count if frame_count else value
+
+    print("TILED CONV")
+    tiled_calls = counters["tiled_conv_calls"]
+    tiled_tiles = counters["tiled_conv_tiles"]
+    if frame_count:
+        tiled_call_rate = f"{_frame_value(tiled_calls):.2f}/frame"
+        tile_draw_rate = f"{_frame_value(counters['tiled_draw_calls']):.2f}/frame"
+    else:
+        tiled_call_rate = "total; frame count unavailable"
+        tile_draw_rate = "total; frame count unavailable"
+    print(
+        f"  logical calls={int(tiled_calls)} ({tiled_call_rate}) "
+        f"tile draws={int(counters['tiled_draw_calls'])} "
+        f"({tile_draw_rate}) "
+        f"avg tiles/Conv={tiled_tiles / tiled_calls if tiled_calls else 0.0:.2f}"
+    )
+    print(f"  consolidation draws={int(counters['consolidation_draw_calls'])}")
+    for stage_name in (
+        "tile_render", "tile_render_submission", "consolidation_draw_submission",
+        "post_consolidation_synchronization",
+    ):
+        record = conv_stage_timings.get(stage_name, {"calls": 0, "wall_seconds": 0.0})
+        print(f"  {stage_name}: wall={record['wall_seconds']:.3f}s calls={int(record['calls'])}")
+    for reason in ("per_tile", "pre_consolidation", "post_consolidation"):
+        record = sync_timings.get(reason, {"calls": 0, "wall_seconds": 0.0})
+        print(f"  {reason} wait: wall={record['wall_seconds']:.3f}s calls={int(record['calls'])}")
+    print("ACTIVATION POOL")
+    print(
+        f"  acquires={int(counters['activation_pool_acquires'])} "
+        f"reuses={int(counters['activation_pool_reuses'])} "
+        f"allocations={int(counters['activation_pool_allocations'])} "
+        f"releases={int(counters['activation_pool_releases'])}"
+    )
+    for reason in ("activation_reuse", "activation_release", "activation_eviction"):
+        record = sync_timings.get(reason, {"calls": 0, "wall_seconds": 0.0})
+        print(f"  {reason}: syncs={int(record['calls'])} wall={record['wall_seconds']:.3f}s")
+    print("SCRATCH POOL")
+    print(
+        f"  acquires={int(counters['scratch_pool_acquires'])} "
+        f"reuses={int(counters['scratch_pool_reuses'])} "
+        f"allocations={int(counters['scratch_pool_allocations'])} "
+        f"releases={int(counters['scratch_texture_releases'])} "
+        f"pool releases={int(counters['scratch_pool_releases'])}"
+    )
+    print(
+        f"  fresh allocations={int(counters['scratch_fresh_allocations'])} "
+        f"fresh releases={int(counters['scratch_fresh_releases'])} "
+        f"cross-epoch reuses={int(counters['scratch_cross_epoch_reuses'])} "
+        f"same-epoch reuse attempts={int(counters['scratch_same_epoch_reuse_attempts'])} "
+        f"reused clears={int(counters['scratch_reused_clears'])} "
+        f"retired={int(counters['scratch_retired_textures'])} "
+        f"retired bytes={int(counters['scratch_retired_bytes'])} "
+        f"current retired={int(counters['scratch_retired_current'])} "
+        f"current bytes={int(counters['scratch_retired_bytes_current'])} "
+        f"reclaims={int(counters['scratch_retired_reclaims'])} "
+        f"promotions={int(counters['scratch_retired_promotions'])} "
+        f"safe-point evictions={int(counters['scratch_retired_evictions'])}"
+    )
+    print(
+        f"  reusable pool textures={int(counters['scratch_pool_current'])} "
+        f"bytes={int(counters['scratch_pool_bytes'])}"
+    )
+    for reason in ("scratch_reuse", "scratch_release", "scratch_eviction"):
+        record = sync_timings.get(reason, {"calls": 0, "wall_seconds": 0.0})
+        print(f"  {reason}: syncs={int(record['calls'])} wall={record['wall_seconds']:.3f}s")
     print("GPU timing:")
     print(f"  timer-query capability: {'available' if _gpu_timer_capable else 'unavailable'}")
     print(f"  API: {_gpu_timer_api}")

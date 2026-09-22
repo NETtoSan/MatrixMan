@@ -18,25 +18,15 @@ from demo.yolo_helpers import detections, first_tensor, preprocess_frame
 from drivers import matrixman
 from drivers.matrixman.backend import get_backend
 
-# Select CUDA, OpenGL, or auto detection through MATRIXMAN_BACKEND.
-preferences = os.environ.get("MATRIXMAN_BACKEND", "auto").strip().lower() or "auto"
-matrixman.prefer("opengl")
 
-matrixman.profiling = True
-matrixman.trace = True
 
-# Keep the demo's conservative legacy-GPU execution settings in one place.
-matrixman.config.convDiag = True
-matrixman.config.tileLimit = 640
-matrixman.config.tileSync = "end"
-matrixman.config.convSpatialReuse = True
-
-matrixman.config.useDGPU = True
+#matrixman.config.convDiag = True
+matrixman.config.trace = True
 
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="MatrixMan VisDrone tracking demo")
-    parser.add_argument("--model", type=Path, default=base / "models/VisDrone-small/weights/best.pt")
+    parser.add_argument("--model", type=Path, default=base / "models/VisDrone-arm64-480/weights/best.pt")
     parser.add_argument("--video", type=Path, default=base / "videos/video0.mp4")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.25)
@@ -132,6 +122,8 @@ def main() -> int:
             cap.release()
             if not args.no_display:
                 cv2.destroyAllWindows()
+        if matrixman.profiling:
+            matrixman.profile_report(frame_count=frame_count)
         print(f"completed frames: {frame_count}")
         return 0
     finally:

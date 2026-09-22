@@ -36,7 +36,7 @@ class OpenGLBackend(Backend):
         return matmul.render_matmul(a, b)
 
     def synchronize(self):
-        gm.glFinish()
+        profiling.sync_finish("backend_synchronize")
 
 
 def device_info() -> dict[str, str]:

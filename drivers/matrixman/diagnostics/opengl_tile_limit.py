@@ -11,18 +11,23 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
 
-DEFAULT_SIZES = (256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+AUTO_MAX_TILE_LIMIT = 2048
+DEFAULT_SIZES = (128, 256, 384, 512, 768, 1024, 1536, 2048)
 DEFAULT_TIMEOUT = 30.0
 MAX_ESTIMATED_BYTES = 768 * 1024 * 1024
-AUTOTUNE_SCHEMA_VERSION = 1
+AUTOTUNE_SCHEMA_VERSION = 3
+AUTOTUNE_POLICY_VERSION = 2
+DEFAULT_SAFE_TILE_LIMIT = 256
 _GL_LIMITS = {
     "GL_MAX_TEXTURE_SIZE": (0x0D33, 1),
     "GL_MAX_RENDERBUFFER_SIZE": (0x84E8, 1),
@@ -31,6 +36,64 @@ _GL_LIMITS = {
     "GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS": (0x8B4D, 1),
     "GL_MAX_FRAGMENT_UNIFORM_COMPONENTS": (0x8B49, 1),
 }
+
+
+@dataclass(frozen=True)
+class TileLimitPolicy:
+    requested: int | str
+    autotune_result: int | None
+    policy_cap: int | None
+    hard_cap: int
+    resolved: int
+    known_device: str | None
+
+
+def is_known_gm45(vendor: str | None, renderer: str | None) -> bool:
+    """Match the GM45 family conservatively across Mesa renderer spellings."""
+    text = f"{vendor or ''} {renderer or ''}".lower()
+    return bool(
+        re.search(r"\bgm45\b", text)
+        or re.search(r"gma\s*4500mhd", text)
+        or "gm45 express chipset" in text
+    )
+
+
+def _hard_gl_cap(limits: dict[str, int | tuple[int, int]]) -> int:
+    values = [
+        int(limits["GL_MAX_TEXTURE_SIZE"]),
+        min(int(value) for value in limits["GL_MAX_VIEWPORT_DIMS"]),
+        int(limits["GL_MAX_RENDERBUFFER_SIZE"]),
+    ]
+    hard_cap = min(values)
+    if hard_cap <= 0:
+        raise ValueError(f"invalid OpenGL physical tile limits: {values}")
+    return hard_cap
+
+
+def resolve_tile_limit_policy(
+    requested: int | str,
+    info: dict[str, str],
+    limits: dict[str, int | tuple[int, int]],
+    autotune_result: int | None = None,
+) -> TileLimitPolicy:
+    """Resolve a physical packed-atlas tile limit without changing tileSync."""
+    hard_cap = _hard_gl_cap(limits)
+    known_device = "GM45" if is_known_gm45(info.get("vendor"), info.get("renderer")) else None
+    policy_cap = None
+    if requested != "auto":
+        resolved = int(requested)
+        if resolved > hard_cap:
+            raise ValueError(
+                f"requested tileLimit={resolved} exceeds OpenGL physical limit {hard_cap}"
+            )
+        return TileLimitPolicy(requested, None, policy_cap, hard_cap, resolved, known_device)
+
+    if autotune_result is None or int(autotune_result) <= 0:
+        autotune_result = DEFAULT_SAFE_TILE_LIMIT
+    resolved = min(int(autotune_result), hard_cap)
+    if resolved <= 0:
+        raise ValueError("autotuned tileLimit resolved to an invalid value")
+    return TileLimitPolicy(requested, int(autotune_result), policy_cap, hard_cap, resolved, known_device)
 
 
 def _text(value) -> str:
@@ -168,7 +231,14 @@ def _cache_key(info: dict[str, str]) -> str:
     return json.dumps({field: str(info.get(field, "unavailable")) for field in fields}, sort_keys=True)
 
 
-def autotune_tile_limit(info: dict[str, str], *, refresh: bool = False, timeout: float = DEFAULT_TIMEOUT) -> int:
+def autotune_tile_limit(
+    info: dict[str, str],
+    *,
+    limits: dict[str, int | tuple[int, int]] | None = None,
+    refresh: bool = False,
+    timeout: float = DEFAULT_TIMEOUT,
+    progress=None,
+) -> int:
     """Return the largest passing size, using the same isolated Conv tests as the CLI."""
     path = _cache_path()
     key = _cache_key(info)
@@ -176,33 +246,55 @@ def autotune_tile_limit(info: dict[str, str], *, refresh: bool = False, timeout:
         try:
             cache = json.loads(path.read_text(encoding="utf-8"))
             entry = cache.get("entries", {}).get(key, {})
-            if entry.get("schema") == AUTOTUNE_SCHEMA_VERSION and int(entry.get("tile_limit", 0)) > 0:
+            if (
+                entry.get("schema") == AUTOTUNE_SCHEMA_VERSION
+                and entry.get("policy_version") == AUTOTUNE_POLICY_VERSION
+                and int(entry.get("tile_limit", 0)) > 0
+            ):
+                if progress is not None:
+                    progress(f"cached result: {int(entry['tile_limit'])}")
                 return int(entry["tile_limit"])
         except (OSError, ValueError, TypeError):
             pass
 
-    command = [
-        sys.executable, "-m", "drivers.matrixman.diagnostics.opengl_tile_limit",
-        "--autotune-worker", "--timeout", str(timeout),
-    ]
-    try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True,
-            timeout=max(60.0, timeout * len(DEFAULT_SIZES) + 20.0), check=False,
-        )
-        worker = next((json.loads(line) for line in reversed(completed.stdout.splitlines()) if line.startswith("{")), None)
-        passed = [int(value) for value in (worker or {}).get("passed", [])]
-    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
-        passed = []
+    hard_cap = _hard_gl_cap(limits) if limits is not None else None
+    passed = []
+    for size in DEFAULT_SIZES:
+        if hard_cap is not None and size > hard_cap:
+            if progress is not None:
+                progress(f"trying {size} ... [SKIP hard GL limit]")
+            continue
+        _one, practical = _memory_estimate(size)
+        if practical > MAX_ESTIMATED_BYTES:
+            if progress is not None:
+                progress(f"trying {size} ... [SKIP memory estimate]")
+            continue
+        try:
+            result = _run_child(size, timeout)
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError) as exc:
+            result = {"result": f"FAIL {type(exc).__name__}"}
+        passed_result = result.get("result") == "PASS"
+        if passed_result:
+            passed.append(size)
+        if progress is not None:
+            progress(f"trying {size} ... [{'OK' if passed_result else 'FAIL'}]")
     resolved = max(passed) if passed else 256
+    if not passed and progress is not None:
+        progress("autotune failed; falling back to tileLimit: 256")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         cache = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         if not isinstance(cache, dict):
             cache = {}
         entries = cache.setdefault("entries", {})
-        entries[key] = {"schema": AUTOTUNE_SCHEMA_VERSION, "tile_limit": resolved, "validated_sizes": passed}
-        path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if passed:
+            entries[key] = {
+                "schema": AUTOTUNE_SCHEMA_VERSION,
+                "policy_version": AUTOTUNE_POLICY_VERSION,
+                "tile_limit": resolved,
+                "validated_sizes": passed,
+            }
+            path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except OSError:
         pass
     return resolved

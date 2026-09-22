@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import inspect
 import time
 import weakref
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from . import gpumatrix as gm
 from . import gpu_stress
 from . import metadata, profiling
 from . import runtime
+from ...config import config
 from .tensor import _TextureOwner, owner_from_texture
 from .storage import StorageLayout, matrix_red_rgba, numel, pack_linear_rgba, packed_atlas_size
 
@@ -86,40 +88,269 @@ def allocate_matrix_texture(n: int) -> int:
     return gpu_stress.create_texture(n)
 
 
-def acquire_scratch_texture(width: int, height: int) -> int:
+def acquire_scratch_texture(
+    width: int,
+    height: int,
+    operation: str | None = None,
+    tile: int | None = None,
+) -> int:
     """Acquire an empty RGBA32F texture from the runtime's bounded pool."""
     rt = runtime.runtime_required()
     key = (int(width), int(height))
-    pooled = rt.scratch_texture_pool.get(key)
+    policy = config.scratchPolicy
+    pooled = None if policy == "fresh" else rt.scratch_texture_pool.get(key)
+    if profiling.enabled:
+        profiling.counters["scratch_pool_acquires"] += 1
     if pooled:
+        if policy == "safe":
+            _finish_before_pool_reuse("scratch_reuse")
         texture = pooled.pop()
         if profiling.enabled:
             profiling.counters["scratch_texture_reuses"] += 1
+            profiling.counters["scratch_pool_reuses"] += 1
+            if policy == "epoch":
+                profiling.counters["scratch_cross_epoch_reuses"] += 1
+        _scratch_checkout(rt, texture, key, source="reuse", operation=operation, tile=tile)
+        _record_scratch_pool_stats(rt)
         return texture
     if profiling.enabled:
         profiling.counters["scratch_texture_allocations"] += 1
-    return create_rgba32f_texture(width, height)
+        profiling.counters["scratch_pool_allocations"] += 1
+        if policy == "fresh":
+            profiling.counters["scratch_fresh_allocations"] += 1
+    texture = create_rgba32f_texture(width, height)
+    _scratch_checkout(rt, texture, key, source="fresh", operation=operation, tile=tile)
+    _record_scratch_pool_stats(rt)
+    return texture
 
 
 def release_scratch_texture(owner) -> None:
     """Return a no-longer-live scratch owner to the bounded runtime pool."""
     texture = owner.texture
+    _scratch_release_metadata(owner, texture)
     owner.texture = 0
     if not texture or not runtime.is_active():
         return
     rt = runtime.runtime_required()
     key = (owner.layout.texture_width, owner.layout.texture_height)
+    policy = config.scratchPolicy
+    if policy in {"fresh", "epoch"}:
+        record = rt.scratch_texture_records.get(int(texture)) if _scratch_debug_enabled() else None
+        if record is not None and record["state"] != "retired":
+            raise AssertionError(f"scratch texture {texture} expected retired, got {record['state']}")
+        retired_bytes = int(owner.layout.texture_width) * int(owner.layout.texture_height) * 4 * 4
+        rt.retired_scratch_textures.append((int(texture), retired_bytes, key))
+        rt.retired_scratch_bytes += retired_bytes
+        if profiling.enabled:
+            profiling.counters["scratch_texture_releases"] += 1
+            if policy == "fresh":
+                profiling.counters["scratch_fresh_releases"] += 1
+            if policy == "epoch":
+                profiling.counters["scratch_epoch_releases"] += 1
+            profiling.counters["scratch_retired_textures"] += 1
+            profiling.counters["scratch_retired_bytes"] += retired_bytes
+            profiling.counters["scratch_retired_current"] = len(rt.retired_scratch_textures)
+            profiling.counters["scratch_retired_bytes_current"] = rt.retired_scratch_bytes
+        if record is not None:
+            print(f"SCRATCH retire tex={texture} gen={record['generation']} retired -> held")
+        return
     pooled = rt.scratch_texture_pool.setdefault(key, [])
     pooled_count = sum(len(textures) for textures in rt.scratch_texture_pool.values())
     if pooled_count >= runtime._MAX_SCRATCH_TEXTURES:
+        _finish_before_pool_reuse("scratch_eviction")
+        if _scratch_debug_enabled():
+            record = rt.scratch_texture_records.get(int(texture))
+            if record is not None:
+                if record["state"] != "pooled":
+                    raise AssertionError(f"scratch texture {texture} evicted from {record['state']}")
+                record["state"] = "deleted"
+                print(
+                    f"SCRATCH delete tex={texture} gen={record['generation']} "
+                    f"key={record['pool_key'][0]}x{record['pool_key'][1]}"
+                )
         texture_id = ctypes.c_uint(texture)
         gm.glDeleteTextures(1, ctypes.byref(texture_id))
         if profiling.enabled:
             profiling.counters["scratch_texture_evictions"] += 1
+            profiling.counters["scratch_pool_evictions"] += 1
         return
     pooled.append(texture)
     if profiling.enabled:
         profiling.counters["scratch_texture_releases"] += 1
+        profiling.counters["scratch_pool_releases"] += 1
+    _record_scratch_pool_stats(rt)
+
+
+def _scratch_debug_enabled() -> bool:
+    return config.scratchPolicy != "safe"
+
+
+def _record_scratch_pool_stats(rt) -> None:
+    if not profiling.enabled:
+        return
+    count = 0
+    bytes_total = 0
+    for key, textures in rt.scratch_texture_pool.items():
+        count += len(textures)
+        bytes_total += len(textures) * int(key[0]) * int(key[1]) * 4 * 4
+    profiling.counters["scratch_pool_current"] = count
+    profiling.counters["scratch_pool_bytes"] = bytes_total
+
+
+def _scratch_site() -> str:
+    frame = inspect.currentframe()
+    try:
+        caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
+        if caller is None:
+            return "unknown"
+        return f"{caller.f_code.co_filename.rsplit('/', 1)[-1]}:{caller.f_lineno}"
+    finally:
+        del frame
+
+
+def _scratch_record(rt, texture: int, key: tuple[int, int]) -> dict:
+    record = rt.scratch_texture_records.get(int(texture))
+    if record is None:
+        record = {
+            "texture": int(texture), "generation": 0, "width": int(key[0]),
+            "height": int(key[1]), "pool_key": tuple(key), "state": "deleted",
+            "owner": None, "operation": None, "tile": None,
+            "last_release_site": None, "next_acquire_site": None,
+        }
+        rt.scratch_texture_records[int(texture)] = record
+    return record
+
+
+def _scratch_checkout(
+    rt,
+    texture: int,
+    key: tuple[int, int],
+    *,
+    source: str,
+    operation: str | None,
+    tile: int | None,
+) -> None:
+    if not _scratch_debug_enabled():
+        return
+    record = _scratch_record(rt, texture, key)
+    if record["state"] == "checked_out":
+        raise AssertionError(f"scratch texture {texture} acquired while checked_out")
+    if record["state"] == "retired":
+        if profiling.enabled:
+            profiling.counters["scratch_same_epoch_reuse_attempts"] += 1
+        raise AssertionError(f"retired scratch texture {texture} acquired before safe-point promotion")
+    if record["state"] == "deleted":
+        # A fresh GL name has no prior record; a recorded deleted name must
+        # never re-enter the pool or be checked out again.
+        if record["generation"]:
+            raise AssertionError(f"deleted scratch texture {texture} acquired")
+    record["generation"] += 1
+    record["width"], record["height"] = int(key[0]), int(key[1])
+    record["pool_key"] = tuple(key)
+    record["state"] = "checked_out"
+    record["owner"] = None
+    record["operation"] = operation
+    record["tile"] = tile
+    record["source"] = source
+    record["next_acquire_site"] = _scratch_site()
+    print(
+        f"SCRATCH acquire tex={texture} gen={record['generation']} "
+        f"source={source} key={key[0]}x{key[1]} op={operation or '-'} "
+        f"tile={tile if tile is not None else '-'} site={record['next_acquire_site']}"
+    )
+
+
+def _scratch_assign_owner(owner, operation: str | None, tile: int | None) -> None:
+    if not _scratch_debug_enabled() or not owner.texture:
+        return
+    rt = runtime.runtime_required()
+    record = rt.scratch_texture_records.get(int(owner.texture))
+    if record is None or record["state"] != "checked_out":
+        raise AssertionError(f"scratch texture {owner.texture} missing checked_out record")
+    record["owner"] = id(owner)
+    record["operation"] = operation
+    record["tile"] = tile
+
+
+def _scratch_release_metadata(owner, texture: int) -> None:
+    if not _scratch_debug_enabled() or not texture:
+        return
+    rt = runtime.runtime_required()
+    record = rt.scratch_texture_records.get(int(texture))
+    if record is None:
+        raise AssertionError(f"scratch texture {texture} released without a record")
+    if record["state"] != "checked_out":
+        raise AssertionError(f"scratch texture {texture} released from {record['state']}")
+    next_state = "retired" if config.scratchPolicy in {"fresh", "epoch"} else "pooled"
+    print(
+        f"SCRATCH state tex={texture} checked_out -> {next_state} "
+        f"gen={record['generation']}"
+    )
+    record["state"] = next_state
+    record["owner"] = None
+    record["last_release_site"] = _scratch_site()
+    print(
+        f"SCRATCH release tex={texture} gen={record['generation']} "
+        f"op={record['operation'] or 'unknown'} tile={record['tile'] if record['tile'] is not None else '-'} "
+        f"site={record['last_release_site']}"
+    )
+
+
+def reclaim_retired_scratch_textures(rt=None) -> None:
+    """Delete fresh-scratch diagnostic textures after a caller's global wait."""
+    policy = config.scratchPolicy
+    if policy not in {"fresh", "epoch"}:
+        return
+    rt = rt or runtime.runtime_required()
+    if not rt.retired_scratch_textures:
+        return
+    reclaimed = len(rt.retired_scratch_textures)
+    reclaimed_bytes = rt.retired_scratch_bytes
+    for texture, _size, key in rt.retired_scratch_textures:
+        record = rt.scratch_texture_records.get(int(texture)) if _scratch_debug_enabled() else None
+        if record is not None:
+            if record["state"] != "retired":
+                raise AssertionError(f"scratch texture {texture} reclaimed from {record['state']}")
+        if policy == "epoch":
+            pooled_count = sum(len(textures) for textures in rt.scratch_texture_pool.values())
+            if pooled_count < runtime._MAX_SCRATCH_TEXTURES:
+                rt.scratch_texture_pool.setdefault(key, []).append(texture)
+                if record is not None:
+                    record["state"] = "pooled"
+                if profiling.enabled:
+                    profiling.counters["scratch_retired_promotions"] += 1
+                if record is not None:
+                    print(f"SCRATCH reclaim tex={texture} retired -> pooled")
+                continue
+            if profiling.enabled:
+                profiling.counters["scratch_retired_evictions"] += 1
+        texture_id = ctypes.c_uint(texture)
+        gm.glDeleteTextures(1, ctypes.byref(texture_id))
+        if record is not None:
+            record["state"] = "deleted"
+            print(f"SCRATCH reclaim tex={texture} retired -> deleted")
+    rt.retired_scratch_textures.clear()
+    rt.retired_scratch_bytes = 0
+    _record_scratch_pool_stats(rt)
+    if profiling.enabled:
+        profiling.counters["scratch_retired_reclaims"] += reclaimed
+        profiling.counters["scratch_retired_reclaim_bytes"] += reclaimed_bytes
+        profiling.counters["scratch_retired_current"] = 0
+        profiling.counters["scratch_retired_bytes_current"] = 0
+
+
+def scratch_assign_owner(owner, operation: str | None, tile: int | None) -> None:
+    """DEBUG-only metadata hook for tiled scratch ownership."""
+    _scratch_assign_owner(owner, operation, tile)
+
+
+def scratch_was_reused(texture: int) -> bool:
+    """Return whether this checkout came from the reusable scratch pool."""
+    if not _scratch_debug_enabled():
+        return False
+    rt = runtime.runtime_required()
+    record = rt.scratch_texture_records.get(int(texture))
+    return bool(record and record.get("source") == "reuse")
 
 
 def _activation_pool_key(
@@ -149,6 +380,29 @@ def _activation_texture_bytes(key: tuple) -> int:
     return int(key[-2]) * int(key[-1]) * 4 * 4
 
 
+def _finish_before_pool_reuse(resource_kind: str) -> None:
+    """Complete prior GL users before a pooled texture becomes reusable.
+
+    A texture owner can become unreachable while its draw is still queued on
+    the compatibility driver.  Reusing that texture name as a later FBO or
+    sampler resource is therefore a real lifetime boundary, especially on
+    old Intel drivers.  Keep the wait at the pool boundary rather than after
+    every operator or Conv.  This is synchronization only; it does not add a
+    readback or a CPU arithmetic path.
+    """
+    with profiling.stage("pool_reuse_synchronization"):
+        profiling.sync_finish(resource_kind)
+    if profiling.enabled:
+        counter_name = {
+            "activation_reuse": "activation_pool_reuse_sync_calls",
+            "activation_eviction": "activation_pool_eviction_sync_calls",
+            "scratch_reuse": "scratch_pool_reuse_sync_calls",
+            "scratch_eviction": "scratch_pool_eviction_sync_calls",
+        }.get(resource_kind)
+        if counter_name is not None:
+            profiling.counters[counter_name] += 1
+
+
 def _record_activation_pool_stats(rt) -> None:
     current_count = len(rt.activation_texture_pool_order)
     current_bytes = int(rt.activation_texture_pool_bytes)
@@ -175,8 +429,11 @@ def acquire_activation_texture(shape: tuple[int, ...]):
         key = _activation_pool_key(rt, width, height)
     with profiling.stage("activation_pool_acquire_lookup"):
         pooled = rt.activation_texture_pool.get(key)
+    if profiling.enabled:
+        profiling.counters["activation_pool_acquires"] += 1
     if pooled:
         with profiling.stage("activation_pool_resource_retrieval"):
+            _finish_before_pool_reuse("activation_reuse")
             texture = pooled.pop()
             rt.activation_texture_pool_order.remove((key, texture))
             rt.activation_texture_pool_bytes -= _activation_texture_bytes(key)
@@ -213,6 +470,7 @@ def release_activation_texture(owner) -> None:
             len(rt.activation_texture_pool_order) >= runtime._MAX_ACTIVATION_TEXTURES
             or rt.activation_texture_pool_bytes + texture_bytes > runtime._MAX_ACTIVATION_POOL_BYTES
         ):
+            _finish_before_pool_reuse("activation_eviction")
             texture_id = ctypes.c_uint(texture)
             gm.glDeleteTextures(1, ctypes.byref(texture_id))
             if profiling.enabled:

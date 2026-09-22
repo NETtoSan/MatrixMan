@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import math
 import time
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -28,6 +29,107 @@ _last_tile_output_texture: int | None = None
 _last_dispatch_metadata: dict | None = None
 _last_conv_program_status = "cached"
 _conv_diag_index = 0
+_tiled_conv_index = 0
+
+
+@dataclass(frozen=True)
+class ConvolutionDescriptor:
+    """Validated internal description of an aten.convolution.default call."""
+
+    path: str
+    in_channels: int
+    out_channels: int
+    groups: int
+    in_channels_per_group: int
+    out_channels_per_group: int
+    depthwise_multiplier: int | None
+    kernel: tuple[int, int]
+    stride: tuple[int, int]
+    padding: tuple[int, int]
+    dilation: tuple[int, int]
+
+
+def _pair_for_classification(value, name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        return (value, value)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (int(value[0]), int(value[1]))
+    raise RuntimeError(f"gm45 convolution expects {name} as int or pair")
+
+
+def classify_convolution(*, in_channels: int, out_channels: int,
+                         weight_in_channels: int, groups: int,
+                         kernel, stride=(1, 1), padding=(0, 0),
+                         dilation=(1, 1), transposed: bool = False,
+                         output_padding=(0, 0)) -> ConvolutionDescriptor:
+    """Classify and validate the currently supported Conv2D families.
+
+    This is deliberately a policy/description layer.  It does not select a
+    different shader or alter the existing convolution arithmetic.
+    """
+    kernel = _pair_for_classification(kernel, "kernel")
+    stride = _pair_for_classification(stride, "stride")
+    padding = _pair_for_classification(padding, "padding")
+    dilation = _pair_for_classification(dilation, "dilation")
+    output_padding = _pair_for_classification(output_padding, "output_padding")
+    in_channels = int(in_channels)
+    out_channels = int(out_channels)
+    weight_in_channels = int(weight_in_channels)
+    groups = int(groups)
+
+    if transposed:
+        raise RuntimeError("gm45 convolution does not support transposed convolution")
+    if output_padding != (0, 0):
+        raise RuntimeError("gm45 convolution requires output_padding=(0,0)")
+    if dilation != (1, 1):
+        raise RuntimeError("gm45 convolution currently supports dilation=(1,1) only")
+    if groups < 1 or in_channels % groups != 0 or out_channels % groups != 0:
+        raise RuntimeError("gm45 grouped convolution requires positive groups dividing Cin and Cout")
+
+    in_per_group = in_channels // groups
+    out_per_group = out_channels // groups
+    if weight_in_channels != in_per_group:
+        raise RuntimeError("gm45 grouped convolution weight shape does not match Cin/groups")
+    if kernel[0] not in {1, 3} or kernel[1] not in {1, 3}:
+        raise RuntimeError("gm45 convolution currently supports only 1x1 and 3x3 kernels")
+    if stride not in {(1, 1), (2, 2)}:
+        raise RuntimeError("gm45 convolution currently supports stride 1 or 2")
+    if padding not in {(0, 0), (1, 1)}:
+        raise RuntimeError("gm45 convolution currently supports padding 0 or 1")
+    if groups > 1 and kernel != (3, 3):
+        raise RuntimeError("gm45 grouped convolution currently supports only 3x3 kernels")
+    if groups > 1 and (stride, padding) not in {
+        ((2, 2), (1, 1)), ((1, 1), (1, 1))
+    }:
+        raise RuntimeError("gm45 grouped convolution supports only stride 1/2 with padding 1")
+
+    if groups == 1:
+        path = "dense"
+        multiplier = None
+    elif groups == in_channels:
+        if weight_in_channels != 1 or out_channels % in_channels != 0:
+            raise RuntimeError("gm45 depthwise convolution requires a valid integer multiplier")
+        path = "depthwise"
+        multiplier = out_channels // in_channels
+    elif 1 < groups < in_channels:
+        path = "grouped"
+        multiplier = None
+    else:
+        raise RuntimeError("gm45 convolution group configuration is unsupported")
+
+    return ConvolutionDescriptor(
+        path=path,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        groups=groups,
+        in_channels_per_group=in_per_group,
+        out_channels_per_group=out_per_group,
+        depthwise_multiplier=multiplier,
+        kernel=kernel,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+    )
 
 
 def _begin_conv_program_status() -> None:
@@ -176,28 +278,581 @@ void main()
     return source.encode("ascii")
 
 
-def _conv_program(params: tuple) -> tuple[int, int, int, int]:
+def _depthwise_shader_source(params: tuple) -> bytes:
+    """Build the GLSL 1.20 depthwise variant with no Cin accumulation loop."""
+    (
+        in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w,
+        stride_h, stride_w, pad_h, pad_w, has_bias, _groups, input_offset,
+        input_tex_w, input_tex_h, weight_tex_w, weight_tex_h, bias_tex_w,
+        out_tex_w,
+        *tail,
+    ) = params
+    fused_silu = bool(tail[0]) if tail else False
+    multiplier = out_c // in_c
+    bias_expr = "read_bias(oc)" if has_bias else "0.0"
+    source = f"""
+#version 120
+uniform sampler2D input_tex;
+uniform sampler2D weight_tex;
+uniform sampler2D bias_tex;
+
+float pick_component(vec4 value, int component)
+{{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}}
+
+float read_input(int ic, int iy, int ix)
+{{
+    int linear_index = INPUT_OFFSET + ((ic * IN_H) + iy) * IN_W + ix;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / INPUT_TEX_W) * INPUT_TEX_W;
+    int y = texel / INPUT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(INPUT_TEX_W), float(INPUT_TEX_H));
+    return pick_component(texture2D(input_tex, uv), component);
+}}
+
+float read_weight(int oc, int ky, int kx)
+{{
+    int linear_index = ((oc * K_H + ky) * K_W) + kx;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / WEIGHT_TEX_W) * WEIGHT_TEX_W;
+    int y = texel / WEIGHT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(WEIGHT_TEX_W), float(WEIGHT_TEX_H));
+    return pick_component(texture2D(weight_tex, uv), component);
+}}
+
+float read_bias(int oc)
+{{
+    int linear_index = oc;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / BIAS_TEX_W) * BIAS_TEX_W;
+    int y = texel / BIAS_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(BIAS_TEX_W), float(BIAS_TEX_H));
+    return pick_component(texture2D(bias_tex, uv), component);
+}}
+
+float compute_output(int out_index)
+{{
+    if (out_index >= OUT_NUMEL) return 0.0;
+    int ox = out_index - (out_index / OUT_W) * OUT_W;
+    int tmp0 = out_index / OUT_W;
+    int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
+    int oc = tmp0 / OUT_H;
+    int input_channel = oc / DEPTHWISE_MULTIPLIER;
+    float acc = {bias_expr};
+    for (int ky = 0; ky < K_H; ++ky) {{
+        int iy = oy * STRIDE_H + ky - PAD_H;
+        if (iy >= 0 && iy < IN_H) {{
+            for (int kx = 0; kx < K_W; ++kx) {{
+                int ix = ox * STRIDE_W + kx - PAD_W;
+                if (ix >= 0 && ix < IN_W) {{
+                    acc += read_input(input_channel, iy, ix) * read_weight(oc, ky, kx);
+                }}
+            }}
+        }}
+    }}
+    return {"acc / (1.0 + exp(-acc))" if fused_silu else "acc"};
+}}
+
+void main()
+{{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
+    gl_FragColor = vec4(
+        compute_output(base),
+        compute_output(base + 1),
+        compute_output(base + 2),
+        compute_output(base + 3)
+    );
+}}
+"""
+    replacements = {
+        "IN_C": in_c, "IN_H": in_h, "IN_W": in_w,
+        "OUT_C": out_c, "OUT_H": out_h, "OUT_W": out_w,
+        "OUT_NUMEL": out_c * out_h * out_w,
+        "DEPTHWISE_MULTIPLIER": multiplier,
+        "K_H": kernel_h, "K_W": kernel_w,
+        "STRIDE_H": stride_h, "STRIDE_W": stride_w,
+        "PAD_H": pad_h, "PAD_W": pad_w, "INPUT_OFFSET": input_offset,
+        "INPUT_TEX_W": input_tex_w, "INPUT_TEX_H": input_tex_h,
+        "WEIGHT_TEX_W": weight_tex_w, "WEIGHT_TEX_H": weight_tex_h,
+        "BIAS_TEX_W": bias_tex_w,
+        "BIAS_TEX_H": max(1, packed_atlas_size(max(out_c, 1))[1]),
+        "OUT_TEX_W": out_tex_w,
+    }
+    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _dense_1x1_shader_source(params: tuple) -> bytes:
+    """Build the GLSL 1.20 dense 1x1 variant.
+
+    The generic kernel/ky/kx loops and per-tap bounds checks are unnecessary;
+    the only remaining accumulation is across input channels.
+    """
+    (
+        in_c, in_h, in_w, out_c, out_h, out_w, _kernel_h, _kernel_w,
+        stride_h, stride_w, pad_h, pad_w, has_bias, _groups, input_offset,
+        input_tex_w, input_tex_h, weight_tex_w, weight_tex_h, bias_tex_w,
+        out_tex_w,
+        *tail,
+    ) = params
+    fused_silu = bool(tail[0]) if tail else False
+    bias_expr = "read_bias(oc)" if has_bias else "0.0"
+    source = f"""
+#version 120
+uniform sampler2D input_tex;
+uniform sampler2D weight_tex;
+uniform sampler2D bias_tex;
+
+float pick_component(vec4 value, int component)
+{{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}}
+
+float read_input(int ic, int iy, int ix)
+{{
+    int linear_index = INPUT_OFFSET + ((ic * IN_H) + iy) * IN_W + ix;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / INPUT_TEX_W) * INPUT_TEX_W;
+    int y = texel / INPUT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(INPUT_TEX_W), float(INPUT_TEX_H));
+    return pick_component(texture2D(input_tex, uv), component);
+}}
+
+float read_weight(int oc, int ic)
+{{
+    int linear_index = oc * IN_C + ic;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / WEIGHT_TEX_W) * WEIGHT_TEX_W;
+    int y = texel / WEIGHT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(WEIGHT_TEX_W), float(WEIGHT_TEX_H));
+    return pick_component(texture2D(weight_tex, uv), component);
+}}
+
+float read_bias(int oc)
+{{
+    int texel = oc / 4;
+    int component = oc - texel * 4;
+    int x = texel - (texel / BIAS_TEX_W) * BIAS_TEX_W;
+    int y = texel / BIAS_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(BIAS_TEX_W), float(BIAS_TEX_H));
+    return pick_component(texture2D(bias_tex, uv), component);
+}}
+
+float compute_output(int out_index)
+{{
+    if (out_index >= OUT_NUMEL) return 0.0;
+    int ox = out_index - (out_index / OUT_W) * OUT_W;
+    int tmp0 = out_index / OUT_W;
+    int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
+    int oc = tmp0 / OUT_H;
+    int iy = oy * STRIDE_H - PAD_H;
+    int ix = ox * STRIDE_W - PAD_W;
+    float acc = {bias_expr};
+    if (iy >= 0 && iy < IN_H && ix >= 0 && ix < IN_W) {{
+        for (int ic = 0; ic < IN_C; ++ic) {{
+            acc += read_input(ic, iy, ix) * read_weight(oc, ic);
+        }}
+    }}
+    return {"acc / (1.0 + exp(-acc))" if fused_silu else "acc"};
+}}
+
+void main()
+{{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
+    gl_FragColor = vec4(
+        compute_output(base),
+        compute_output(base + 1),
+        compute_output(base + 2),
+        compute_output(base + 3)
+    );
+}}
+"""
+    replacements = {
+        "IN_C": in_c, "IN_H": in_h, "IN_W": in_w,
+        "OUT_H": out_h, "OUT_W": out_w,
+        "OUT_NUMEL": out_c * out_h * out_w,
+        "STRIDE_H": stride_h, "STRIDE_W": stride_w,
+        "PAD_H": pad_h, "PAD_W": pad_w, "INPUT_OFFSET": input_offset,
+        "INPUT_TEX_W": input_tex_w, "INPUT_TEX_H": input_tex_h,
+        "WEIGHT_TEX_W": weight_tex_w, "WEIGHT_TEX_H": weight_tex_h,
+        "BIAS_TEX_W": bias_tex_w,
+        "BIAS_TEX_H": max(1, packed_atlas_size(max(out_c, 1))[1]),
+        "OUT_TEX_W": out_tex_w,
+    }
+    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _dense_3x3_shader_source(params: tuple) -> bytes:
+    """Build the dense 3x3 GLSL variant with spatial taps explicitly unrolled.
+
+    MatrixMan's flattened NCHW packing does not make fixed-spatial channel
+    groups RGBA-contiguous, so this deliberately keeps scalar channel reads.
+    It removes only generic kernel-loop/indexing overhead that is provably
+    unnecessary for a fixed 3x3 dense convolution.
+    """
+    (
+        in_c, in_h, in_w, out_c, out_h, out_w, _kernel_h, _kernel_w,
+        stride_h, stride_w, pad_h, pad_w, has_bias, _groups, input_offset,
+        input_tex_w, input_tex_h, weight_tex_w, weight_tex_h, bias_tex_w,
+        out_tex_w,
+        *tail,
+    ) = params
+    fused_silu = bool(tail[0]) if tail else False
+    bias_expr = "read_bias(oc)" if has_bias else "0.0"
+    taps = []
+    for ky in range(3):
+        for kx in range(3):
+            taps.append(
+                f"""        if (iy{ky}x{kx} >= 0 && iy{ky}x{kx} < IN_H && ix{ky}x{kx} >= 0 && ix{ky}x{kx} < IN_W) {{
+            acc += read_input(ic, iy{ky}x{kx}, ix{ky}x{kx}) * read_weight(oc, ic, {ky}, {kx});
+        }}"""
+            )
+    source = f"""
+#version 120
+uniform sampler2D input_tex;
+uniform sampler2D weight_tex;
+uniform sampler2D bias_tex;
+
+float pick_component(vec4 value, int component)
+{{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}}
+
+float read_input(int ic, int iy, int ix)
+{{
+    int linear_index = INPUT_OFFSET + ((ic * IN_H) + iy) * IN_W + ix;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / INPUT_TEX_W) * INPUT_TEX_W;
+    int y = texel / INPUT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(INPUT_TEX_W), float(INPUT_TEX_H));
+    return pick_component(texture2D(input_tex, uv), component);
+}}
+
+float read_weight(int oc, int ic, int ky, int kx)
+{{
+    int linear_index = (((oc * IN_C + ic) * 3 + ky) * 3) + kx;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / WEIGHT_TEX_W) * WEIGHT_TEX_W;
+    int y = texel / WEIGHT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(WEIGHT_TEX_W), float(WEIGHT_TEX_H));
+    return pick_component(texture2D(weight_tex, uv), component);
+}}
+
+float read_bias(int oc)
+{{
+    int texel = oc / 4;
+    int component = oc - texel * 4;
+    int x = texel - (texel / BIAS_TEX_W) * BIAS_TEX_W;
+    int y = texel / BIAS_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(BIAS_TEX_W), float(BIAS_TEX_H));
+    return pick_component(texture2D(bias_tex, uv), component);
+}}
+
+float compute_output(int out_index)
+{{
+    if (out_index >= OUT_NUMEL) return 0.0;
+    int ox = out_index - (out_index / OUT_W) * OUT_W;
+    int tmp0 = out_index / OUT_W;
+    int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
+    int oc = tmp0 / OUT_H;
+    int iy0 = oy * STRIDE_H - PAD_H;
+    int ix0 = ox * STRIDE_W - PAD_W;
+    int iy0x0 = iy0; int ix0x0 = ix0;
+    int iy0x1 = iy0; int ix0x1 = ix0 + 1;
+    int iy0x2 = iy0; int ix0x2 = ix0 + 2;
+    int iy1x0 = iy0 + 1; int ix1x0 = ix0;
+    int iy1x1 = iy0 + 1; int ix1x1 = ix0 + 1;
+    int iy1x2 = iy0 + 1; int ix1x2 = ix0 + 2;
+    int iy2x0 = iy0 + 2; int ix2x0 = ix0;
+    int iy2x1 = iy0 + 2; int ix2x1 = ix0 + 1;
+    int iy2x2 = iy0 + 2; int ix2x2 = ix0 + 2;
+    float acc = {bias_expr};
+    for (int ic = 0; ic < IN_C; ++ic) {{
+{chr(10).join(taps)}
+    }}
+    return {"acc / (1.0 + exp(-acc))" if fused_silu else "acc"};
+}}
+
+void main()
+{{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
+    gl_FragColor = vec4(
+        compute_output(base),
+        compute_output(base + 1),
+        compute_output(base + 2),
+        compute_output(base + 3)
+    );
+}}
+"""
+    replacements = {
+        "IN_C": in_c, "IN_H": in_h, "IN_W": in_w,
+        "OUT_H": out_h, "OUT_W": out_w,
+        "OUT_NUMEL": out_c * out_h * out_w,
+        "STRIDE_H": stride_h, "STRIDE_W": stride_w,
+        "PAD_H": pad_h, "PAD_W": pad_w, "INPUT_OFFSET": input_offset,
+        "INPUT_TEX_W": input_tex_w, "INPUT_TEX_H": input_tex_h,
+        "WEIGHT_TEX_W": weight_tex_w, "WEIGHT_TEX_H": weight_tex_h,
+        "BIAS_TEX_W": bias_tex_w,
+        "BIAS_TEX_H": max(1, packed_atlas_size(max(out_c, 1))[1]),
+        "OUT_TEX_W": out_tex_w,
+    }
+    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _grouped_3x3_shader_source(params: tuple) -> bytes:
+    """Build grouped 3x3 GLSL with group math hoisted and small groups unrolled."""
+    (
+        in_c, in_h, in_w, out_c, out_h, out_w, _kernel_h, _kernel_w,
+        stride_h, stride_w, pad_h, pad_w, has_bias, groups, input_offset,
+        input_tex_w, input_tex_h, weight_tex_w, weight_tex_h, bias_tex_w,
+        out_tex_w,
+        *tail,
+    ) = params
+    in_per_group = in_c // groups
+    fused_silu = bool(tail[0]) if tail else False
+    bias_expr = "read_bias(oc)" if has_bias else "0.0"
+    if in_per_group in {2, 3}:
+        channel_body = "\n".join(
+            f"            acc += read_input(input_channel_start + {ic}, iy{{ky}}x{{kx}}, ix{{ky}}x{{kx}}) * read_weight(oc, {ic}, {{ky}}, {{kx}});"
+            for ic in range(in_per_group)
+        )
+    else:
+        channel_body = """            for (int ic = 0; ic < IN_C_PER_GROUP; ++ic) {{
+                acc += read_input(input_channel_start + ic, iy{ky}x{kx}, ix{ky}x{kx}) * read_weight(oc, ic, {ky}, {kx});
+            }}"""
+    taps = []
+    for ky in range(3):
+        for kx in range(3):
+            taps.append(
+                f"""        if (iy{ky}x{kx} >= 0 && iy{ky}x{kx} < IN_H && ix{ky}x{kx} >= 0 && ix{ky}x{kx} < IN_W) {{
+{channel_body.format(ky=ky, kx=kx)}
+        }}"""
+            )
+    source = f"""
+#version 120
+uniform sampler2D input_tex;
+uniform sampler2D weight_tex;
+uniform sampler2D bias_tex;
+
+float pick_component(vec4 value, int component)
+{{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}}
+
+float read_input(int ic, int iy, int ix)
+{{
+    int linear_index = INPUT_OFFSET + ((ic * IN_H) + iy) * IN_W + ix;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / INPUT_TEX_W) * INPUT_TEX_W;
+    int y = texel / INPUT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(INPUT_TEX_W), float(INPUT_TEX_H));
+    return pick_component(texture2D(input_tex, uv), component);
+}}
+
+float read_weight(int oc, int ic, int ky, int kx)
+{{
+    int linear_index = (((oc * IN_C_PER_GROUP + ic) * 3 + ky) * 3) + kx;
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / WEIGHT_TEX_W) * WEIGHT_TEX_W;
+    int y = texel / WEIGHT_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(WEIGHT_TEX_W), float(WEIGHT_TEX_H));
+    return pick_component(texture2D(weight_tex, uv), component);
+}}
+
+float read_bias(int oc)
+{{
+    int texel = oc / 4;
+    int component = oc - texel * 4;
+    int x = texel - (texel / BIAS_TEX_W) * BIAS_TEX_W;
+    int y = texel / BIAS_TEX_W;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(BIAS_TEX_W), float(BIAS_TEX_H));
+    return pick_component(texture2D(bias_tex, uv), component);
+}}
+
+float compute_output(int out_index)
+{{
+    if (out_index >= OUT_NUMEL) return 0.0;
+    int ox = out_index - (out_index / OUT_W) * OUT_W;
+    int tmp0 = out_index / OUT_W;
+    int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
+    int oc = tmp0 / OUT_H;
+    int group = oc / OUT_C_PER_GROUP;
+    int input_channel_start = group * IN_C_PER_GROUP;
+    int iy0 = oy * STRIDE_H - PAD_H;
+    int ix0 = ox * STRIDE_W - PAD_W;
+    int iy0x0 = iy0; int ix0x0 = ix0;
+    int iy0x1 = iy0; int ix0x1 = ix0 + 1;
+    int iy0x2 = iy0; int ix0x2 = ix0 + 2;
+    int iy1x0 = iy0 + 1; int ix1x0 = ix0;
+    int iy1x1 = iy0 + 1; int ix1x1 = ix0 + 1;
+    int iy1x2 = iy0 + 1; int ix1x2 = ix0 + 2;
+    int iy2x0 = iy0 + 2; int ix2x0 = ix0;
+    int iy2x1 = iy0 + 2; int ix2x1 = ix0 + 1;
+    int iy2x2 = iy0 + 2; int ix2x2 = ix0 + 2;
+    float acc = {bias_expr};
+{chr(10).join(taps)}
+    return {"acc / (1.0 + exp(-acc))" if fused_silu else "acc"};
+}}
+
+void main()
+{{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
+    gl_FragColor = vec4(
+        compute_output(base),
+        compute_output(base + 1),
+        compute_output(base + 2),
+        compute_output(base + 3)
+    );
+}}
+"""
+    replacements = {
+        "IN_C": in_c, "IN_H": in_h, "IN_W": in_w,
+        "OUT_H": out_h, "OUT_W": out_w,
+        "OUT_NUMEL": out_c * out_h * out_w,
+        "GROUPS": groups, "IN_C_PER_GROUP": in_per_group,
+        "OUT_C_PER_GROUP": out_c // groups,
+        "STRIDE_H": stride_h, "STRIDE_W": stride_w,
+        "PAD_H": pad_h, "PAD_W": pad_w, "INPUT_OFFSET": input_offset,
+        "INPUT_TEX_W": input_tex_w, "INPUT_TEX_H": input_tex_h,
+        "WEIGHT_TEX_W": weight_tex_w, "WEIGHT_TEX_H": weight_tex_h,
+        "BIAS_TEX_W": bias_tex_w,
+        "BIAS_TEX_H": max(1, packed_atlas_size(max(out_c, 1))[1]),
+        "OUT_TEX_W": out_tex_w,
+    }
+    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _conv_cache_key(params: tuple, descriptor: ConvolutionDescriptor, variant: str) -> tuple:
+    """Keep family identity in addition to the complete shader signature."""
+    return (variant, descriptor, params)
+
+
+def _conv_program(params: tuple, descriptor: ConvolutionDescriptor,
+                  *, force_generic_dense_1x1: bool = False,
+                  force_generic_dense_3x3: bool = False,
+                  force_generic_grouped: bool = False) -> tuple[int, int, int, int]:
     b = _backend()
     rt = b._runtime_required()
+    specialized_1x1 = (
+        descriptor.path == "dense" and descriptor.kernel == (1, 1)
+        and not force_generic_dense_1x1
+    )
+    specialized_3x3 = (
+        descriptor.path == "dense" and descriptor.kernel == (3, 3)
+        and not force_generic_dense_3x3
+    )
+    specialized_grouped = (
+        descriptor.path == "grouped" and descriptor.kernel == (3, 3)
+        and not force_generic_grouped
+    )
+    variant = (
+        "conv2d_dense_1x1" if specialized_1x1
+        else "conv2d_dense_3x3" if specialized_3x3
+        else "conv2d_grouped_3x3" if specialized_grouped
+        else "conv2d"
+    )
+    key = _conv_cache_key(params, descriptor, variant)
     with profiling.conv_stage("program_cache_lookup"):
-        cached = params in rt.conv_programs
+        cached = key in rt.conv_programs
+    if descriptor.path == "depthwise" and b._profile_enabled:
+        b._profile_counters[
+            "depthwise_program_cache_hits" if cached else "depthwise_program_cache_misses"
+        ] += 1
+    if specialized_1x1 and b._profile_enabled:
+        b._profile_counters[
+            "dense_1x1_program_cache_hits" if cached else "dense_1x1_program_cache_misses"
+        ] += 1
+    if specialized_3x3 and b._profile_enabled:
+        b._profile_counters[
+            "dense_3x3_program_cache_hits" if cached else "dense_3x3_program_cache_misses"
+        ] += 1
+    if specialized_grouped and b._profile_enabled:
+        b._profile_counters[
+            "grouped_conv_program_cache_hits" if cached else "grouped_conv_program_cache_misses"
+        ] += 1
     if not cached:
         _note_conv_program_status("compiled")
-        b._trace(f"gm45.compile -> convolution GLSL fragment shader params={params}")
+        if specialized_1x1:
+            compile_name = "dense 1x1"
+        elif specialized_3x3:
+            compile_name = "dense 3x3"
+        elif specialized_grouped:
+            compile_name = "grouped 3x3"
+        else:
+            compile_name = descriptor.path
+        b._trace(f"gm45.compile -> {compile_name} convolution GLSL fragment shader params={params}")
         with profiling.conv_stage("shader_source_generation"):
-            source = _conv_shader_source(params)
+            if descriptor.path == "depthwise":
+                source = _depthwise_shader_source(params)
+            elif specialized_1x1:
+                source = _dense_1x1_shader_source(params)
+            elif specialized_3x3:
+                source = _dense_3x3_shader_source(params)
+            elif specialized_grouped:
+                source = _grouped_3x3_shader_source(params)
+            else:
+                source = _conv_shader_source(params)
         with profiling.conv_stage("shader_compile_link"):
             program = gm.make_program(source)
-        rt.conv_programs[params] = program
+        rt.conv_programs[key] = program
         with profiling.conv_stage("uniform_location_setup"):
-            rt.conv_uniforms[params] = (
+            rt.conv_uniforms[key] = (
                 gm.glGetUniformLocation(program, b"input_tex"),
                 gm.glGetUniformLocation(program, b"weight_tex"),
                 gm.glGetUniformLocation(program, b"bias_tex"),
             )
     with profiling.conv_stage("program_retrieval"):
-        input_loc, weight_loc, bias_loc = rt.conv_uniforms[params]
-        return rt.conv_programs[params], input_loc, weight_loc, bias_loc
+        input_loc, weight_loc, bias_loc = rt.conv_uniforms[key]
+        return rt.conv_programs[key], input_loc, weight_loc, bias_loc
 
 
 def _spatial_reuse_enabled() -> bool:
@@ -381,36 +1036,36 @@ void main()
     return source.encode("ascii")
 
 
-def _conv_spatial_program(params: tuple) -> tuple[int, int, int, int]:
+def _conv_spatial_program(params: tuple, descriptor: ConvolutionDescriptor) -> tuple[int, int, int, int]:
     b = _backend()
     rt = b._runtime_required()
+    key = _conv_cache_key(params, descriptor, "conv2d_spatial")
     with profiling.conv_stage("program_cache_lookup"):
-        cached = params in rt.conv_spatial_programs
+        cached = key in rt.conv_spatial_programs
     if not cached:
         _note_conv_program_status("compiled")
-        b._trace(f"gm45.compile -> spatial-reuse convolution GLSL shader params={params}")
+        b._trace(f"gm45.compile -> {descriptor.path} spatial-reuse convolution GLSL shader params={params}")
         with profiling.conv_stage("shader_source_generation"):
             source = _conv_spatial_shader_source(params)
         with profiling.conv_stage("shader_compile_link"):
             program = gm.make_program(source)
-        rt.conv_spatial_programs[params] = program
+        rt.conv_spatial_programs[key] = program
         with profiling.conv_stage("uniform_location_setup"):
-            rt.conv_spatial_uniforms[params] = (
+            rt.conv_spatial_uniforms[key] = (
                 gm.glGetUniformLocation(program, b"input_tex"),
                 gm.glGetUniformLocation(program, b"weight_tex"),
                 gm.glGetUniformLocation(program, b"bias_tex"),
             )
     with profiling.conv_stage("program_retrieval"):
-        return rt.conv_spatial_programs[params], *rt.conv_spatial_uniforms[params]
+        return rt.conv_spatial_programs[key], *rt.conv_spatial_uniforms[key]
 
 
-def _render_convolution_spatial(input_tensor, out_owner, weight_owner, bias_owner, params):
+def _render_convolution_spatial(input_tensor, out_owner, weight_owner, bias_owner, params, descriptor):
     b = _backend()
-    b._kernel_log(f"Conv2D RGBA spatial reuse {b._shape_text(input_tensor.shape)} -> {b._shape_text((1, params[3], params[4], params[5]))}")
-    program, input_loc, weight_loc, bias_loc = _conv_spatial_program(params)
+    program, input_loc, weight_loc, bias_loc = _conv_spatial_program(params, descriptor)
     rt = b._runtime_required()
     b._trace(
-        "gm45.kernel -> spatial-neighbor-reuse convolution shader:\n"
+        f"gm45.kernel -> {descriptor.path} spatial-neighbor-reuse convolution shader:\n"
         f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)}\n"
         f"  weight texture #{weight_owner.texture} shape=[{params[3]},{params[0]},{params[6]},{params[7]}]\n"
         f"  -> output texture #{out_owner.texture} shape={[1, params[3], params[4], params[5]]}"
@@ -447,8 +1102,34 @@ def _render_convolution_spatial(input_tensor, out_owner, weight_owner, bias_owne
     return b.MatrixManTensor._from_owner(out_owner, (1, params[3], params[4], params[5]))
 
 
-def _conv_tile_shader_source(params: tuple, tile_x: int, tile_y: int) -> bytes:
-    source = _conv_shader_source(params).decode("ascii")
+def _conv_tile_shader_source(params: tuple, tile_x: int, tile_y: int,
+                             descriptor: ConvolutionDescriptor | None = None,
+                             *, force_generic_dense_1x1: bool = False,
+                             force_generic_dense_3x3: bool = False,
+                             force_generic_grouped: bool = False) -> bytes:
+    if descriptor is not None and descriptor.path == "depthwise":
+        source_builder = _depthwise_shader_source
+    elif (
+        descriptor is not None and descriptor.path == "dense"
+        and descriptor.kernel == (1, 1)
+        and not force_generic_dense_1x1
+    ):
+        source_builder = _dense_1x1_shader_source
+    elif (
+        descriptor is not None and descriptor.path == "dense"
+        and descriptor.kernel == (3, 3)
+        and not force_generic_dense_3x3
+    ):
+        source_builder = _dense_3x3_shader_source
+    elif (
+        descriptor is not None and descriptor.path == "grouped"
+        and descriptor.kernel == (3, 3)
+        and not force_generic_grouped
+    ):
+        source_builder = _grouped_3x3_shader_source
+    else:
+        source_builder = _conv_shader_source
+    source = source_builder(params).decode("ascii")
     out_tex_w = params[-2] if len(params) > 21 else params[-1]
     old = f"int base = (tex_y * {out_tex_w} + tex_x) * 4;"
     new = f"int base = ((tex_y + {tile_y}) * {out_tex_w} + tex_x + {tile_x}) * 4;"
@@ -462,16 +1143,47 @@ def _program_key(fragment_source: bytes) -> tuple[bytes, bytes]:
     return gm.VERTEX_SHADER, fragment_source
 
 
-def _conv_tile_program(fragment_source: bytes) -> tuple[int, int, int, int]:
+def _conv_tile_program(fragment_source: bytes, descriptor: ConvolutionDescriptor,
+                       *, specialized_dense_1x1: bool = False,
+                       specialized_dense_3x3: bool = False,
+                       specialized_grouped: bool = False) -> tuple[int, int, int, int]:
     b = _backend()
     rt = b._runtime_required()
     with profiling.conv_stage("shader_variant_key_construction"):
-        key = _program_key(fragment_source)
+        variant = (
+            "conv2d_tiled_dense_1x1" if specialized_dense_1x1
+            else "conv2d_tiled_dense_3x3" if specialized_dense_3x3
+            else "conv2d_tiled_grouped_3x3" if specialized_grouped
+            else "conv2d_tiled"
+        )
+        key = (variant, descriptor, _program_key(fragment_source))
     with profiling.conv_stage("program_cache_lookup"):
         cached = key in rt.conv_tile_programs
+    if descriptor.path == "depthwise" and b._profile_enabled:
+        b._profile_counters[
+            "depthwise_tile_program_cache_hits" if cached else "depthwise_tile_program_cache_misses"
+        ] += 1
+    if specialized_dense_1x1 and b._profile_enabled:
+        b._profile_counters[
+            "dense_1x1_program_cache_hits" if cached else "dense_1x1_program_cache_misses"
+        ] += 1
+    if specialized_dense_3x3 and b._profile_enabled:
+        b._profile_counters[
+            "dense_3x3_program_cache_hits" if cached else "dense_3x3_program_cache_misses"
+        ] += 1
+    if specialized_grouped and b._profile_enabled:
+        b._profile_counters[
+            "grouped_conv_program_cache_hits" if cached else "grouped_conv_program_cache_misses"
+        ] += 1
     if not cached:
         _note_conv_program_status("compiled")
-        b._trace("gm45.compile -> tiled convolution GLSL fragment shader")
+        compile_name = (
+            "dense 1x1" if specialized_dense_1x1
+            else "dense 3x3" if specialized_dense_3x3
+            else "grouped 3x3" if specialized_grouped
+            else descriptor.path
+        )
+        b._trace(f"gm45.compile -> {compile_name} convolution GLSL fragment shader (tiled)")
         with profiling.conv_stage("shader_compile_link"):
             program = gm.make_program(fragment_source)
         rt.conv_tile_programs[key] = program
@@ -518,10 +1230,13 @@ void main() {{
 """.encode("ascii")
 
 
-def _new_physical_packed_owner(width: int, height: int):
+def _new_physical_packed_owner(width: int, height: int, operation: str | None = None, tile: int | None = None):
     b = _backend()
-    texture = _resources.acquire_scratch_texture(width, height)
-    return b._TextureOwner(texture, StorageLayout("packed_rgba", width, height, width * height * 4))
+    texture = _resources.acquire_scratch_texture(width, height, operation, tile)
+    owner = b._TextureOwner(texture, StorageLayout("packed_rgba", width, height, width * height * 4))
+    owner._scratch_reused = _resources.scratch_was_reused(texture)
+    _resources.scratch_assign_owner(owner, operation, tile)
+    return owner
 
 
 def _as_pair(value, name: str) -> tuple[int, int]:
@@ -623,8 +1338,11 @@ def diagnostic_tile_geometry() -> dict:
     return metadata
 
 
-def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params):
-    global _last_tile_output_texture, _last_dispatch_metadata
+def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner, params, descriptor,
+                              *, force_generic_dense_1x1: bool = False,
+                              force_generic_dense_3x3: bool = False,
+                              force_generic_grouped: bool = False):
+    global _last_tile_output_texture, _last_dispatch_metadata, _tiled_conv_index
     b = _backend()
     sync_mode = _tile_sync_mode()
     full_w, full_h = out_owner.layout.texture_width, out_owner.layout.texture_height
@@ -641,9 +1359,10 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         b._profile_counters["tiled_conv_tiles"] += tiles_x * tiles_y
         b._profile_counters["tiled_conv_max_tile_width"] = max(b._profile_counters["tiled_conv_max_tile_width"], width_limit)
         b._profile_counters["tiled_conv_max_tile_height"] = max(b._profile_counters["tiled_conv_max_tile_height"], height_limit)
-    b._kernel_log(f"Tiled Conv2D {b._shape_text(input_tensor.shape)} -> {b._shape_text((1, params[3], params[4], params[5]))} tiles={tiles_x}x{tiles_y}")
-    b._trace("gm45.conv -> tiled dispatch\n" f"  logical atlas: {full_w}x{full_h}\n" f"  tile limit: {width_limit}x{height_limit}\n" f"  physical tiles: {tiles_x}x{tiles_y} = {tiles_x * tiles_y}")
+    b._trace("gm45.conv -> tiled " f"{descriptor.path} dispatch\n" f"  logical atlas: {full_w}x{full_h}\n" f"  tile limit: {width_limit}x{height_limit}\n" f"  physical tiles: {tiles_x}x{tiles_y} = {tiles_x * tiles_y}")
     rt = b._runtime_required()
+    _tiled_conv_index += 1
+    tiled_operation = f"conv#{_tiled_conv_index}"
     _tile_diagnostic_snapshots.clear()
     _last_tile_geometry.clear()
     _last_tile_output_texture = out_owner.texture
@@ -666,14 +1385,36 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                 "logical_region": (origin_x, origin_y, tile_w, tile_h),
                 "texture_size": (tile_w, tile_h),
             })
-            tile = _new_physical_packed_owner(tile_w, tile_h)
+            tile = _new_physical_packed_owner(tile_w, tile_h, tiled_operation, render_sequence_index)
             tile_owners.append(tile)
             _last_tile_geometry[-1]["texture"] = tile.texture
             if b._profile_enabled:
                 b._profile_counters["tiled_draw_calls"] += 1
             with profiling.conv_stage("shader_source_generation"):
-                tile_source = _conv_tile_shader_source(params, origin_x, origin_y)
-            program, input_loc, weight_loc, bias_loc = _conv_tile_program(tile_source)
+                tile_source = _conv_tile_shader_source(
+                    params, origin_x, origin_y, descriptor,
+                    force_generic_dense_1x1=force_generic_dense_1x1,
+                    force_generic_dense_3x3=force_generic_dense_3x3,
+                    force_generic_grouped=force_generic_grouped,
+                )
+            specialized_dense_1x1 = (
+                descriptor.path == "dense" and descriptor.kernel == (1, 1)
+                and not force_generic_dense_1x1
+            )
+            specialized_dense_3x3 = (
+                descriptor.path == "dense" and descriptor.kernel == (3, 3)
+                and not force_generic_dense_3x3
+            )
+            specialized_grouped = (
+                descriptor.path == "grouped" and descriptor.kernel == (3, 3)
+                and not force_generic_grouped
+            )
+            program, input_loc, weight_loc, bias_loc = _conv_tile_program(
+                tile_source, descriptor,
+                specialized_dense_1x1=specialized_dense_1x1,
+                specialized_dense_3x3=specialized_dense_3x3,
+                specialized_grouped=specialized_grouped,
+            )
             with profiling.conv_stage("viewport_state_setup"):
                 gm.glViewport(0, 0, tile_w, tile_h)
             with profiling.conv_stage("fbo_output_binding"):
@@ -681,6 +1422,21 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                 gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, tile.texture, 0)
             if gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER) != gm.GL_FRAMEBUFFER_COMPLETE:
                 raise RuntimeError("gm45 tiled convolution framebuffer incomplete")
+            if config.debugClearReusedScratch and tile._scratch_reused:
+                # Reused textures may contain stale edge/tail texels.  Clear
+                # the complete physical attachment, not only the tile draw
+                # viewport.  Scissor is explicitly disabled because the
+                # preceding consolidation pass uses it.
+                gm.gl.glDisable(_GL_SCISSOR_TEST)
+                gm.glViewport(0, 0, tile_w, tile_h)
+                gm.glClearColor(0.0, 0.0, 0.0, 0.0)
+                gm.glClear(gm.GL_COLOR_BUFFER_BIT)
+                if b._profile_enabled:
+                    b._profile_counters["scratch_reused_clears"] += 1
+                print(
+                    f"SCRATCH clear tex={tile.texture} size={tile_w}x{tile_h} "
+                    f"op={tiled_operation} tile={render_sequence_index}"
+                )
             with profiling.conv_stage("glUseProgram"):
                 gm.glUseProgram(program)
             with profiling.conv_stage("input_texture_binding"):
@@ -695,7 +1451,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
             with profiling.conv_stage("uniform_setup"):
                 gm.glUniform1i(weight_loc, 1)
                 gm.glUniform1i(bias_loc, 2)
-            with profiling.conv_stage("draw_submission"):
+            with profiling.conv_stage("tile_render_submission"):
                 with profiling.gpu_timer("Conv2D", gpu_metadata):
                     gm.glBegin(gm.GL_QUADS)
                     gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
@@ -704,7 +1460,7 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                 raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
             if sync_mode == "per_tile":
                 with profiling.conv_stage("synchronization_wait"):
-                    gm.glFinish()
+                    profiling.sync_finish("per_tile")
                 if b._profile_enabled:
                     b._profile_counters["tiled_per_tile_sync_calls"] += 1
             elif sync_mode == "flush":
@@ -735,19 +1491,20 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                 + b._profile_counters["glFlush_seconds"] - flush_before_tiles
             )
         # Per-tile mode already completed every producer before reaching this
-        # point.  A second barrier before the copy pass is therefore redundant.
-        # Keep the old barrier available for callers that explicitly disable
-        # the skip, and retain end-mode's documented single barrier.
+        # point.  End mode has no earlier barrier, so it needs one before the
+        # copy pass; otherwise old Intel drivers may sample incomplete tile
+        # FBO writes.  The skip switch only elides the redundant per-tile
+        # barrier and never weakens end-mode ordering.
         if sync_mode != "flush":
             should_finish_before_consolidation = (
-                not _skip_pre_consolidation_sync()
-                and sync_mode in {"per_tile", "end"}
+                sync_mode == "end"
+                or (sync_mode == "per_tile" and not _skip_pre_consolidation_sync())
             )
             if should_finish_before_consolidation:
                 if b._profile_enabled:
                     b._profile_counters["pre_consolidation_sync_calls"] += 1
                 with profiling.conv_stage("synchronization_wait"):
-                    gm.glFinish()
+                    profiling.sync_finish("pre_consolidation")
             elif b._profile_enabled:
                 b._profile_counters["pre_consolidation_sync_skips"] += 1
             b._trace(
@@ -761,13 +1518,18 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         }
         consolidation_started = time.perf_counter()
         _consolidate_tiles(tile_owners, _last_tile_geometry, out_owner, full_w, full_h, width_limit, height_limit, rt)
-        # The consolidation draw is ordered after the tile draws by the same
-        # GL context.  Its output is either consumed by a later queued draw or
-        # synchronized once by the eventual CPU readback; no glFinish is
-        # required here.  This also permits the scratch tiles to return to the
-        # pool without serializing the whole pipeline.
+        # The final tiled output is the producer/consumer boundary for both
+        # the next GPU operator and the scratch owners below.  On old Intel
+        # compatibility drivers, queue ordering alone is insufficient to make
+        # the FBO write visible to the next sampler, while Conv diagnostics'
+        # readback happened to provide this wait.  Keep one narrow barrier per
+        # tiled Conv rather than adding a wait to every Conv or operator.
+        with profiling.conv_stage("post_consolidation_synchronization"):
+            profiling.sync_finish("post_consolidation")
         if b._profile_enabled:
-            b._profile_counters["consolidation_sync_elisions"] += 1
+            b._profile_counters["post_consolidation_sync_calls"] += 1
+        if b._profile_enabled:
+            b._profile_counters["consolidation_sync_calls"] += 1
         if b._profile_enabled:
             b._profile_conv["consolidation"] += time.perf_counter() - consolidation_started
         return b.MatrixManTensor._from_owner(out_owner, tuple(int(v) for v in (1, params[3], params[4], params[5])))
@@ -810,7 +1572,7 @@ def _consolidate_tiles(tile_owners, geometries, out_owner, full_w, full_h, width
                 gm.glBindTexture(gm.GL_TEXTURE_2D, tile.texture)
             with profiling.conv_stage("uniform_setup"):
                 gm.glUniform1i(tile_loc, 0)
-            with profiling.conv_stage("draw_submission"):
+            with profiling.conv_stage("consolidation_draw_submission"):
                 with profiling.gpu_timer("consolidation"):
                     gm.glBegin(gm.GL_QUADS)
                     gm.glVertex2f(-1.0, -1.0); gm.glVertex2f(1.0, -1.0)
@@ -842,32 +1604,15 @@ def _validate_convolution(args, b):
         raise RuntimeError("gm45 convolution weights must be contiguous float32")
     if bias_tensor is not None and (not isinstance(bias_tensor, torch.Tensor) or bias_tensor.device.type != "cpu" or bias_tensor.dtype != torch.float32 or not bias_tensor.is_contiguous()):
         raise RuntimeError("gm45 convolution bias must be a contiguous CPU float32 tensor or None")
-    if transposed:
-        raise RuntimeError("gm45 convolution does not support transposed convolution")
-    if output_padding != (0, 0):
-        raise RuntimeError("gm45 convolution requires output_padding=(0,0)")
-    if dilation != (1, 1):
-        raise RuntimeError("gm45 convolution currently supports dilation=(1,1) only")
     _, in_c, in_h, in_w = (int(v) for v in input_tensor.shape)
     out_c, weight_in_c, kernel_h, kernel_w = (int(v) for v in weight_tensor.shape)
-    if groups < 1 or in_c % groups != 0 or out_c % groups != 0:
-        raise RuntimeError("gm45 grouped convolution requires positive groups dividing Cin and Cout")
-    input_channels_per_group = in_c // groups
-    grouped = groups > 1 and weight_in_c == input_channels_per_group
-    if groups != 1 and not grouped:
-        raise RuntimeError("gm45 grouped convolution weight shape does not match Cin/groups")
-    if groups == 1 and weight_in_c != in_c:
-        raise RuntimeError("gm45 convolution input channels do not match weight channels")
-    if groups > 1 and (kernel_h, kernel_w) != (3, 3):
-        raise RuntimeError("gm45 grouped convolution currently supports only 3x3 kernels")
-    if kernel_h not in {1, 3} or kernel_w not in {1, 3}:
-        raise RuntimeError("gm45 convolution currently supports only 1x1 and 3x3 kernels")
-    if stride not in {(1, 1), (2, 2)}:
-        raise RuntimeError("gm45 convolution currently supports stride 1 or 2")
-    if padding not in {(0, 0), (1, 1)}:
-        raise RuntimeError("gm45 convolution currently supports padding 0 or 1")
-    if groups > 1 and (stride, padding) not in {((2, 2), (1, 1)), ((1, 1), (1, 1))}:
-        raise RuntimeError("gm45 grouped convolution supports only stride 1/2 with padding 1")
+    conv_descriptor = classify_convolution(
+        in_channels=in_c, out_channels=out_c,
+        weight_in_channels=weight_in_c, groups=groups,
+        kernel=(kernel_h, kernel_w), stride=stride, padding=padding,
+        dilation=dilation, transposed=transposed,
+        output_padding=output_padding,
+    )
     if bias_tensor is not None and tuple(bias_tensor.shape) != (out_c,):
         raise RuntimeError("gm45 convolution bias shape must be [out_channels]")
     out_h = (in_h + 2 * padding[0] - kernel_h) // stride[0] + 1
@@ -876,7 +1621,7 @@ def _validate_convolution(args, b):
     out_owner = b._new_empty_packed_texture(out_shape)
     return (input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
             out_owner, (in_c, in_h, in_w, out_c, out_h, out_w, kernel_h, kernel_w,
-                         groups))
+                         groups), conv_descriptor)
 
 
 def _upload_convolution_parameters(weight_tensor, bias_tensor, b):
@@ -908,13 +1653,81 @@ def _convolution_params(input_tensor, out_owner, dimensions, stride, padding,
     )
 
 
+def _convolution_trace_name(descriptor: ConvolutionDescriptor) -> str:
+    """Return the concise semantic name used by the normal operation trace."""
+    return {
+        "dense": "Conv2D",
+        "depthwise": "DWConv",
+        "grouped": "GroupedConv",
+    }[descriptor.path]
+
+
+def _trace_convolution_family(b, input_tensor, out_shape, descriptor,
+                              implementation: str) -> None:
+    """Emit concise semantic naming plus existing detailed trace metadata."""
+    from ... import source_context
+
+    details = [
+        f"  family: {descriptor.path}",
+        f"  groups: {descriptor.groups}",
+    ]
+    if descriptor.path in {"grouped", "depthwise"}:
+        details.append(
+            f"  channels/group: in={descriptor.in_channels_per_group} "
+            f"out={descriptor.out_channels_per_group}"
+        )
+    if descriptor.path == "depthwise":
+        details.append(f"  multiplier: {descriptor.depthwise_multiplier}")
+    details.append(f"  implementation: {implementation}")
+    source = source_context.current()
+    if source is not None:
+        details.insert(0, f"  source module: {source.qualified_name}")
+        details.insert(1, f"  source module index: {source.module_path}")
+        if source.fused:
+            details.insert(2, "  source module state: fused")
+    b._kernel_log(
+        f"{_convolution_trace_name(descriptor)} "
+        f"{b._shape_text(input_tensor.shape)} -> {b._shape_text(out_shape)}"
+    )
+    b._trace("\n".join(details))
+
+
 def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_owner,
                                  weight_owner, bias_owner, dimensions, stride,
                                  padding, out_shape, b, *, fused_silu=False,
                                  allow_spatial_reuse=True, prepared=False,
-                                 fused_batch_norm=False):
+                                 fused_batch_norm=False, conv_descriptor=None,
+                                 force_generic_dense_1x1=False,
+                                 force_generic_dense_3x3=False,
+                                 force_generic_grouped=False):
     global _conv_diag_index
     _begin_conv_program_status()
+    if conv_descriptor is None:
+        conv_descriptor = classify_convolution(
+            in_channels=int(dimensions[0]), out_channels=int(dimensions[3]),
+            weight_in_channels=int(weight_tensor.shape[1]), groups=int(dimensions[8]),
+            kernel=(int(dimensions[6]), int(dimensions[7])), stride=stride,
+            padding=padding, dilation=(1, 1),
+        )
+    if b._profile_enabled:
+        if conv_descriptor.path == "depthwise":
+            b._profile_counters["depthwise_specialized_calls"] += 1
+        elif conv_descriptor.groups == conv_descriptor.in_channels:
+            b._profile_counters["depthwise_generic_fallback_calls"] += 1
+        elif conv_descriptor.path == "dense":
+            b._profile_counters["dense_conv_calls"] += 1
+            if conv_descriptor.kernel == (1, 1) and not force_generic_dense_1x1:
+                b._profile_counters["dense_1x1_specialized_calls"] += 1
+            if conv_descriptor.kernel == (3, 3) and not force_generic_dense_3x3:
+                b._profile_counters["dense_3x3_specialized_calls"] += 1
+        elif conv_descriptor.path == "grouped":
+            b._profile_counters["grouped_conv_calls"] += 1
+            if conv_descriptor.kernel == (3, 3) and not force_generic_grouped:
+                b._profile_counters["grouped_conv_specialized_calls"] += 1
+        from ... import source_context
+        profiling.record_convolution_cost(
+            input_tensor.shape, out_shape, conv_descriptor, source_context.current()
+        )
     if config.convDiag:
         from . import conv_diagnostics
         conv_diagnostics.set_context(input_tensor.shape, out_shape)
@@ -923,20 +1736,44 @@ def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_o
         bias_tensor, weight_owner, bias_owner, fused_silu=fused_silu,
     )
     tile_limit = _tile_limit()
-    if allow_spatial_reuse and not fused_silu and _spatial_reuse_enabled() and _conv_spatial_reuse_supported(
+    use_spatial = allow_spatial_reuse and not fused_silu and _spatial_reuse_enabled() and _conv_spatial_reuse_supported(
         input_tensor, out_owner, params, tile_limit
-    ):
+    )
+    use_tiled = not use_spatial and (
+        out_owner.layout.texture_width > tile_limit
+        or out_owner.layout.texture_height > tile_limit
+    )
+    if conv_descriptor.path == "depthwise":
+        implementation = "specialized depthwise GLSL"
+    elif conv_descriptor.path == "dense" and conv_descriptor.kernel == (1, 1) and not force_generic_dense_1x1:
+        implementation = "specialized dense 1x1 GLSL"
+    elif conv_descriptor.path == "dense" and conv_descriptor.kernel == (3, 3) and not force_generic_dense_3x3:
+        implementation = "specialized dense 3x3 GLSL"
+    elif conv_descriptor.path == "grouped" and conv_descriptor.kernel == (3, 3) and not force_generic_grouped:
+        implementation = "specialized grouped 3x3 GLSL"
+    else:
+        implementation = f"{conv_descriptor.path} GLSL"
+    if use_spatial:
+        implementation += " (spatial reuse)"
+    _trace_convolution_family(b, input_tensor, out_shape, conv_descriptor, implementation)
+    if use_spatial:
         result = _render_convolution_spatial(
-            input_tensor, out_owner, weight_owner, bias_owner, params
+            input_tensor, out_owner, weight_owner, bias_owner, params, conv_descriptor
         )
-    elif out_owner.layout.texture_width > tile_limit or out_owner.layout.texture_height > tile_limit:
+    elif use_tiled:
         result = _render_convolution_tiled(
-            input_tensor, out_owner, weight_owner, bias_owner, params
+            input_tensor, out_owner, weight_owner, bias_owner, params, conv_descriptor,
+            force_generic_dense_1x1=force_generic_dense_1x1,
+            force_generic_dense_3x3=force_generic_dense_3x3,
+            force_generic_grouped=force_generic_grouped,
         )
     else:
         result = _render_convolution_direct(
             input_tensor, weight_tensor, bias_tensor, out_owner,
-            weight_owner, bias_owner, params, out_shape, b,
+            weight_owner, bias_owner, params, out_shape, b, conv_descriptor,
+            force_generic_dense_1x1=force_generic_dense_1x1,
+            force_generic_dense_3x3=force_generic_dense_3x3,
+            force_generic_grouped=force_generic_grouped,
         )
     if config.convDiag:
         try:
@@ -975,7 +1812,7 @@ def reset_conv_diagnostics() -> None:
 
 
 def _pending_descriptor(input_tensor, weight_tensor, bias_tensor, out_owner,
-                        dimensions, stride, padding, out_shape) -> dict:
+                        dimensions, stride, padding, out_shape, conv_descriptor) -> dict:
     return {
         "input_tensor": input_tensor,
         "weight_tensor": weight_tensor,
@@ -985,6 +1822,7 @@ def _pending_descriptor(input_tensor, weight_tensor, bias_tensor, out_owner,
         "stride": stride,
         "padding": padding,
         "out_shape": out_shape,
+        "conv_descriptor": conv_descriptor,
     }
 
 
@@ -1011,6 +1849,7 @@ def materialize_pending(tensor, *, override_parameters=None):
         fused_silu=bool(descriptor.get("fused_silu", False)),
         prepared=True,
         fused_batch_norm=bool(descriptor.get("fused_batch_norm", False)),
+        conv_descriptor=descriptor["conv_descriptor"],
     )
     tensor._owner = result._owner
     tensor._shape = result._shape
@@ -1072,7 +1911,7 @@ def try_fuse_silu(input_tensor):
     return materialize_pending(input_tensor)
 
 
-def _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_owner, weight_owner, bias_owner, params, out_shape, b):
+def _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_owner, weight_owner, bias_owner, params, out_shape, b, descriptor, *, force_generic_dense_1x1=False, force_generic_dense_3x3=False, force_generic_grouped=False):
     """Render a non-tiled Conv2D into the final packed output texture."""
     global _last_dispatch_metadata, _last_tile_geometry
     _last_tile_geometry.clear()
@@ -1085,10 +1924,14 @@ def _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_own
         "texture_size": (out_owner.layout.texture_width, out_owner.layout.texture_height),
         "texture": out_owner.texture,
     })
-    b._kernel_log(f"Conv2D {b._shape_text(input_tensor.shape)} -> {b._shape_text(out_shape)}")
-    program, input_loc, weight_loc, bias_loc = _conv_program(params)
+    program, input_loc, weight_loc, bias_loc = _conv_program(
+        params, descriptor,
+        force_generic_dense_1x1=force_generic_dense_1x1,
+        force_generic_dense_3x3=force_generic_dense_3x3,
+        force_generic_grouped=force_generic_grouped,
+    )
     rt = b._runtime_required()
-    b._trace("gm45.kernel -> convolution shader:\n" f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)}\n" f"  weight texture #{weight_owner.texture} shape={list(weight_tensor.shape)}\n" f"  bias texture #{bias_owner.texture if bias_tensor is not None else 'none'}\n" f"  -> output texture #{out_owner.texture} shape={list(out_shape)}")
+    b._trace(f"gm45.kernel -> {descriptor.path} convolution shader:\n" f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)}\n" f"  weight texture #{weight_owner.texture} shape={list(weight_tensor.shape)}\n" f"  bias texture #{bias_owner.texture if bias_tensor is not None else 'none'}\n" f"  -> output texture #{out_owner.texture} shape={list(out_shape)}")
     with profiling.conv_stage("viewport_state_setup"):
         gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
     with profiling.conv_stage("fbo_output_binding"):
@@ -1126,12 +1969,94 @@ def _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_own
     return b.MatrixManTensor._from_owner(out_owner, out_shape)
 
 
+def _execute_diagnostic_path(args, path: str):
+    """Render one Conv through an explicitly selected internal shader family.
+
+    This is diagnostic-only and intentionally bypasses prepared deferral.  It
+    exists to compare the depthwise specialization with the generic grouped
+    shader on identical resources without adding a production configuration
+    switch or changing ordinary dispatch.
+    """
+    if path not in {"depthwise", "grouped"}:
+        raise RuntimeError(f"unsupported diagnostic convolution path: {path}")
+    b = _backend()
+    (
+        input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
+        out_owner, dimensions, descriptor,
+    ) = _validate_convolution(args, b)
+    descriptor = replace(descriptor, path=path)
+    weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
+    return _render_prepared_convolution(
+        input_tensor, weight_tensor, bias_tensor, out_owner,
+        weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+        allow_spatial_reuse=False, prepared=True,
+        conv_descriptor=descriptor,
+    )
+
+
+def _execute_diagnostic_dense_1x1(args, *, specialized: bool):
+    """Render dense 1x1 through either shader for correctness/benchmark probes."""
+    b = _backend()
+    (
+        input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
+        out_owner, dimensions, descriptor,
+    ) = _validate_convolution(args, b)
+    if descriptor.path != "dense" or descriptor.kernel != (1, 1):
+        raise RuntimeError("dense 1x1 diagnostic requires groups=1 and kernel=1x1")
+    weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
+    return _render_prepared_convolution(
+        input_tensor, weight_tensor, bias_tensor, out_owner,
+        weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+        allow_spatial_reuse=False, prepared=True,
+        conv_descriptor=descriptor,
+        force_generic_dense_1x1=not specialized,
+    )
+
+
+def _execute_diagnostic_dense_3x3(args, *, specialized: bool):
+    """Render dense 3x3 through either shader for correctness/benchmark probes."""
+    b = _backend()
+    (
+        input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
+        out_owner, dimensions, descriptor,
+    ) = _validate_convolution(args, b)
+    if descriptor.path != "dense" or descriptor.kernel != (3, 3):
+        raise RuntimeError("dense 3x3 diagnostic requires groups=1 and kernel=3x3")
+    weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
+    return _render_prepared_convolution(
+        input_tensor, weight_tensor, bias_tensor, out_owner,
+        weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+        allow_spatial_reuse=False, prepared=True,
+        conv_descriptor=descriptor,
+        force_generic_dense_3x3=not specialized,
+    )
+
+
+def _execute_diagnostic_grouped(args, *, specialized: bool):
+    """Render grouped 3x3 through either shader for correctness/benchmark probes."""
+    b = _backend()
+    (
+        input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
+        out_owner, dimensions, descriptor,
+    ) = _validate_convolution(args, b)
+    if descriptor.path != "grouped" or descriptor.kernel != (3, 3):
+        raise RuntimeError("grouped diagnostic requires 1 < groups < Cin and kernel=3x3")
+    weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
+    return _render_prepared_convolution(
+        input_tensor, weight_tensor, bias_tensor, out_owner,
+        weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
+        allow_spatial_reuse=False, prepared=True,
+        conv_descriptor=descriptor,
+        force_generic_grouped=not specialized,
+    )
+
+
 def execute(args):
     b = _backend()
     conv_started = time.perf_counter()
 
     (input_tensor, weight_tensor, bias_tensor,
-     stride, padding, out_shape, out_owner, dimensions) = _validate_convolution(args, b)
+     stride, padding, out_shape, out_owner, dimensions, conv_descriptor) = _validate_convolution(args, b)
 
     if b._profile_enabled:
         b._profile_conv["prepare"] += time.perf_counter() - conv_started
@@ -1145,7 +2070,7 @@ def execute(args):
             profiling.counters["prepared_convolution_deferrals"] += 1
         output._pending_convolution = _pending_descriptor(
             input_tensor, weight_tensor, bias_tensor, out_owner,
-            dimensions, stride, padding, out_shape,
+            dimensions, stride, padding, out_shape, conv_descriptor,
         )
         return output
 
@@ -1154,6 +2079,7 @@ def execute(args):
         input_tensor, weight_tensor, bias_tensor, out_owner,
         weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
         prepared=False,
+        conv_descriptor=conv_descriptor,
     )
 
 
@@ -1161,10 +2087,11 @@ def execute_prepared(args):
     """Execute a prepared Conv2D without deferred prepared-execution routing."""
     b = _backend()
     (input_tensor, weight_tensor, bias_tensor,
-     stride, padding, out_shape, out_owner, dimensions) = _validate_convolution(args, b)
+     stride, padding, out_shape, out_owner, dimensions, conv_descriptor) = _validate_convolution(args, b)
     weight_owner, bias_owner = _upload_convolution_parameters(weight_tensor, bias_tensor, b)
     return _render_prepared_convolution(
         input_tensor, weight_tensor, bias_tensor, out_owner,
         weight_owner, bias_owner, dimensions, stride, padding, out_shape, b,
         allow_spatial_reuse=False,
+        conv_descriptor=conv_descriptor,
     )

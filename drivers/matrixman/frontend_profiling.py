@@ -9,7 +9,6 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 
-
 def _truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 

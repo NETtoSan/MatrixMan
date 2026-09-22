@@ -389,12 +389,12 @@ def _test_consolidation() -> bool:
             StorageLayout("packed_rgba", atlas, atlas, atlas * atlas * 4),
         )
         runtime = runtime_module.runtime_required()
-        gm.glFinish()
+        profiling.sync_finish("compatibility")
         convolution._consolidate_tiles(
             tile_owners, geometries, destination, atlas, atlas,
             width_limit, height_limit, runtime,
         )
-        gm.glFinish()
+        profiling.sync_finish("compatibility")
         actual = tensor.readback_tensor(
             destination, (1, 1, atlas, atlas * 4)
         ).reshape(atlas, atlas, 4).numpy()
@@ -620,6 +620,7 @@ def main() -> int:
                 print(f"glFinish time: {counters['glFinish_seconds']:.3f}s")
                 print(f"pre-consolidation glFinish executed: {int(counters['pre_consolidation_sync_calls'])}")
                 print(f"pre-consolidation glFinish skipped: {int(counters['pre_consolidation_sync_skips'])}")
+                print(f"post-consolidation glFinish calls: {int(counters['post_consolidation_sync_calls'])}")
                 print(f"glFlush count: {int(counters['glFlush_calls'])}")
                 print(f"glFlush time: {counters['glFlush_seconds']:.3f}s")
             else:

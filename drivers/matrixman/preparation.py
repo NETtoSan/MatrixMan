@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from .config import config
+from . import source_context
 
 
 _PREPARATION_MARKER = "_matrixman_preparation_kind"
@@ -111,6 +112,46 @@ def auto_prepare(model: nn.Module) -> LazyPreparedModel:
     if isinstance(model, LazyPreparedModel):
         return model
     return LazyPreparedModel(model)
+
+
+def _qualified_module_name(module: nn.Module) -> str:
+    module_type = type(module)
+    return f"{module_type.__module__}.{module_type.__qualname__}"
+
+
+def _install_source_module_hooks(model: nn.Module) -> None:
+    """Attach context-only hooks used by detailed primitive diagnostics."""
+    seen: set[int] = set()
+    for module_path, module in model.named_modules(remove_duplicate=False):
+        if id(module) in seen or getattr(module, "_matrixman_source_hooks_installed", False):
+            continue
+        seen.add(id(module))
+        qualified_name = getattr(
+            module, "_matrixman_source_module_identity", None
+        ) or _qualified_module_name(module)
+        preferred = bool(
+            getattr(module, "_matrixman_source_module_preferred", False)
+            or qualified_name.startswith("ultralytics.")
+        )
+        info = source_context.SourceModuleInfo(
+            qualified_name=qualified_name,
+            module_path=module_path or "<root>",
+            preferred=preferred,
+            fused=bool(getattr(module, "_matrixman_source_module_fused", False)),
+        )
+
+        def pre_hook(_module, _inputs, _info=info):
+            source_context.push(_info)
+
+        def post_hook(_module, _inputs, _output):
+            source_context.pop()
+
+        module.register_forward_pre_hook(pre_hook)
+        try:
+            module.register_forward_hook(post_hook, always_call=True)
+        except TypeError:  # Older PyTorch without always_call support.
+            module.register_forward_hook(post_hook)
+        module._matrixman_source_hooks_installed = True
 
 
 class PreparedCudaConvSiLU(nn.Module):
@@ -235,6 +276,15 @@ class PreparedOpenGLConvSiLU(nn.Module):
         self.conv = conv
         self.bn = nn.Identity()
         self.act = activation
+        if source is not None:
+            source_type = type(source)
+            self._matrixman_source_module_identity = (
+                f"{source_type.__module__}.{source_type.__qualname__}"
+            )
+            self._matrixman_source_module_preferred = True
+            self._matrixman_source_module_fused = bool(
+                getattr(source, "_matrixman_source_module_fused", False)
+            )
         if source is not None:
             for key, value in source.__dict__.items():
                 if not key.startswith("_") and key not in {"training"}:
@@ -464,6 +514,7 @@ def _prepare_model(model: nn.Module, *, backend: str, inplace: bool, diagnostics
         report.detection_head_skipped += dfl_count
         if dfl_count:
             report.skip_reasons["detection_head:direct_openGL_chain_unavailable"] += dfl_count
+        _install_source_module_hooks(target)
     report.remaining_batch_norm_modules = sum(
         isinstance(module, nn.BatchNorm2d) for module in target.modules()
     )

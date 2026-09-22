@@ -27,6 +27,25 @@ true spellings are `1`, `true`, `yes`, and `on`; the accepted false spellings
 are the empty string, `0`, `false`, `no`, and `off`. Other boolean values raise
 `ValueError` while configuration is loaded or assigned.
 
+## Normal OpenGL use
+
+Normal MatrixMan usage requires no environment variables. The backend selector
+chooses the available device, and the OpenGL correctness-first defaults are
+`tileLimit=256`, `tileSync="per_tile"`, safe bounded scratch pooling, and safe
+activation pooling. Diagnostics and profiling are off.
+
+Advanced tiling overrides are available through `MATRIXMAN_TILE_LIMIT` and
+`MATRIXMAN_TILE_SYNC`. Diagnostic controls include `MATRIXMAN_PROFILE` and
+`MATRIXMAN_CONV_DIAG`.
+
+The scratch-lifetime variables
+`MATRIXMAN_DEBUG_UNSAFE_SCRATCH_REUSE`, `MATRIXMAN_DEBUG_FRESH_SCRATCH`,
+`MATRIXMAN_SCRATCH_EPOCH_POOL`, and
+`MATRIXMAN_DEBUG_CLEAR_REUSED_SCRATCH` are experimental internal debugging
+controls only. They are disabled by default and are not part of normal user
+configuration. Incompatible combinations are rejected during configuration
+loading or assignment.
+
 ## Python-native configuration
 
 Assignments use camelCase attributes and are type-checked immediately:
@@ -66,7 +85,7 @@ values = matrixman.config.asDict()        # shallow copy of current values
 
 ## Configuration reference
 
-The following 30 variables are the active `MATRIXMAN_*` mappings in the
+The following variables are the active `MATRIXMAN_*` mappings in the
 current source. Diagnostic and benchmark-only controls are included because
 they are intentionally supported by the centralized configuration object.
 
@@ -101,6 +120,10 @@ preference, active renderer, and whether the preference could be verified.
 | `MATRIXMAN_CONV_SPATIAL_REUSE` | `config.convSpatialReuse` | `bool` | `False` | boolean spellings above | Enables the experimental OpenGL spatial-reuse convolution path. | Set before the convolution that should use it. |
 | `MATRIXMAN_PREPARED_EXECUTION` | `config.preparedExecution` | `bool` | `True` | boolean spellings above | Enables the conservative OpenGL deferred Conv preparation path and inference Conv+BatchNorm folding. | OpenGL-only; set before first MatrixMan use for a stable run. |
 | `MATRIXMAN_CONV_DIAG` | `config.convDiag` | `bool` | `False` | boolean spellings above | Enables the single persistent OpenCV Conv diagnostics window with input/kernel/output heatmaps. | Diagnostic-only; slow and adds explicit Conv readbacks. |
+| `MATRIXMAN_DEBUG_UNSAFE_SCRATCH_REUSE` | `config.unsafeScratchReuse` | `bool` | `False` | boolean spellings above | Experimental internal scratch-lifetime diagnostic; disables safe scratch reuse fencing. | Debug-only; incompatible with fresh/epoch scratch modes. |
+| `MATRIXMAN_DEBUG_FRESH_SCRATCH` | `config.debugFreshScratch` | `bool` | `False` | boolean spellings above | Experimental internal diagnostic that allocates fresh scratch textures and retires them. | Debug-only; incompatible with epoch scratch mode. |
+| `MATRIXMAN_SCRATCH_EPOCH_POOL` | `config.scratchEpochPool` | `bool` | `False` | boolean spellings above | Experimental internal epoch scratch-pool diagnostic. | Debug-only; not a supported correctness default. |
+| `MATRIXMAN_DEBUG_CLEAR_REUSED_SCRATCH` | `config.debugClearReusedScratch` | `bool` | `False` | boolean spellings above | Experimental reused-scratch clearing diagnostic. | Debug-only; requires epoch scratch mode. |
 | `MATRIXMAN_DISABLE_AUTO_PREPARE` | `config.disableAutoPrepare` | `bool` | `False` | boolean spellings above | Disables lazy CUDA/OpenGL preparation when using `matrixman.auto_prepare(model)`. Explicit `matrixman.prepare()` remains enabled. | Read when the wrapped model is invoked. |
 | `MATRIXMAN_SKIP_PRE_CONSOLIDATION_SYNC` | `config.skipPreConsolidationSync` | `bool` | `True` | boolean spellings above | Skips the redundant synchronization before tiled-output consolidation; set false only to retain the legacy barrier. | Set before the relevant tiled convolution. |
 | `MATRIXMAN_DIAGNOSTIC_TILES` | `config.diagnosticTiles` | `bool` | `False` | boolean spellings above | Captures OpenGL tiled-convolution diagnostic snapshots. | Diagnostic-only; affects later tiled convolution dispatches. |
@@ -179,6 +202,15 @@ entry in the cache. If none exists, or if
 worker, chooses the largest passing configured size, and caches the result for
 reuse. Cache entries are keyed by those device/driver identity strings and
 include the autotune schema version.
+
+The autotuner is a mechanism; the resolved value is still passed through the
+tile-limit safety policy. `GL_MAX_TEXTURE_SIZE`, `GL_MAX_VIEWPORT_DIMS`, and
+`GL_MAX_RENDERBUFFER_SIZE` are hard upper bounds, not proof that a larger tile
+is numerically or driver-safe. AUTO independently tests physical candidates
+`128, 256, 384, 512, 768, 1024, 1536, 2048` and selects the largest passing
+candidate. GM45 remains documented as having a conservative default of 256,
+but AUTO is not capped by that default. Explicit integer overrides are
+validated against the reported hard bounds but are not silently rewritten.
 
 The cache file is:
 

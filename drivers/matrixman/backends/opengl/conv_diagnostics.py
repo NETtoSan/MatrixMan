@@ -12,6 +12,18 @@ import math
 
 WINDOW_NAME = "MatrixMan Conv Diagnostics"
 
+# Keep the diagnostics viewer a fixed, laptop-friendly size.  The canvas and
+# panels deliberately do not depend on tensor dimensions so one persistent
+# window is reused without resizing as Conv layers change.
+WINDOW_WIDTH = 1080
+WINDOW_HEIGHT = 420
+PANEL_WIDTH = 250
+PANEL_HEIGHT = 270
+PANEL_IMAGE_WIDTH = 234
+PANEL_IMAGE_HEIGHT = 230
+PANEL_GAP = 10
+PANEL_TOP = 110
+
 _cv2 = None
 _np = None
 _window_created = False
@@ -51,12 +63,29 @@ def _ensure_window() -> None:
         return
     cv2, _ = _load_gui()
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 1580, 620)
+    cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
     _window_created = True
     _window_create_count += 1
 
 
-def _finite_heatmap(values, size=(360, 300)):
+def _fit_image(image, size):
+    """Scale an image into ``size`` while preserving its aspect ratio."""
+    cv2, np = _load_gui()
+    target_width, target_height = size
+    source_height, source_width = image.shape[:2]
+    scale = min(target_width / max(1, source_width),
+                target_height / max(1, source_height))
+    width = max(1, int(round(source_width * scale)))
+    height = max(1, int(round(source_height * scale)))
+    resized = cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
+    result = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    x = (target_width - width) // 2
+    y = (target_height - height) // 2
+    result[y:y + height, x:x + width] = resized
+    return result
+
+
+def _finite_heatmap(values, size=(PANEL_IMAGE_WIDTH, PANEL_IMAGE_HEIGHT)):
     cv2, np = _load_gui()
     array = np.asarray(values, dtype=np.float32)
     if array.ndim != 2:
@@ -78,7 +107,7 @@ def _finite_heatmap(values, size=(360, 300)):
     image = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
     image = cv2.applyColorMap(image, cv2.COLORMAP_TURBO)
     image[~finite] = (0, 0, 255)
-    return cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
+    return _fit_image(image, size)
 
 
 def _raw_texture_image(values):
@@ -118,21 +147,9 @@ def _raw_texture_image(values):
     return np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
 
-def _fit_physical_image(image, size=(356, 300)):
+def _fit_physical_image(image, size=(PANEL_IMAGE_WIDTH, PANEL_IMAGE_HEIGHT)):
     """Scale a physical image without changing its width/height ratio."""
-    cv2, np = _load_gui()
-    target_width, target_height = size
-    source_height, source_width = image.shape[:2]
-    scale = min(target_width / max(1, source_width),
-                target_height / max(1, source_height))
-    width = max(1, int(round(source_width * scale)))
-    height = max(1, int(round(source_height * scale)))
-    resized = cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
-    result = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-    x = (target_width - width) // 2
-    y = (target_height - height) // 2
-    result[y:y + height, x:x + width] = resized
-    return result
+    return _fit_image(image, size)
 
 
 def _text(canvas, value, origin, scale=0.52, color=(230, 230, 230), thickness=1):
@@ -147,16 +164,20 @@ def _shape(value) -> str:
 
 def _panel(title, values=None, *, raw=False):
     cv2, np = _load_gui()
-    panel = np.zeros((360, 380, 3), dtype=np.uint8)
+    panel = np.zeros((PANEL_HEIGHT, PANEL_WIDTH, 3), dtype=np.uint8)
     panel[:] = (28, 28, 28)
-    _text(panel, title, (12, 24), scale=0.62, color=(255, 255, 255), thickness=2)
+    _text(panel, title, (10, 22), scale=0.52, color=(255, 255, 255), thickness=1)
     if values is None:
-        heatmap = np.zeros((300, 356, 3), dtype=np.uint8)
+        heatmap = np.zeros((PANEL_IMAGE_HEIGHT, PANEL_IMAGE_WIDTH, 3), dtype=np.uint8)
     elif raw:
-        heatmap = _fit_physical_image(_raw_texture_image(values))
+        heatmap = _fit_physical_image(
+            _raw_texture_image(values), size=(PANEL_IMAGE_WIDTH, PANEL_IMAGE_HEIGHT)
+        )
     else:
-        heatmap = _finite_heatmap(values, size=(356, 300))
-    panel[38:338, 12:368] = heatmap
+        heatmap = _finite_heatmap(
+            values, size=(PANEL_IMAGE_WIDTH, PANEL_IMAGE_HEIGHT)
+        )
+    panel[32:32 + PANEL_IMAGE_HEIGHT, 8:8 + PANEL_IMAGE_WIDTH] = heatmap
     return panel
 
 
@@ -196,13 +217,15 @@ def _render_latest():
             _panel("OUTPUT", output_values[0, output_channel]),
             _panel("OPENGL RAW", raw_texture_values, raw=True),
         ]
-    canvas = np.zeros((580, 1560, 3), dtype=np.uint8)
+    canvas = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 3), dtype=np.uint8)
     canvas[:] = (18, 18, 18)
     _render_status_dots(canvas)
-    _text(canvas, f"Conv {_input_shape} -> {_output_shape}", (18, 70), scale=0.62)
+    _text(canvas, f"Conv {_input_shape} -> {_output_shape}", (18, 70), scale=0.52)
+    grid_width = 4 * PANEL_WIDTH + 3 * PANEL_GAP
+    grid_left = (WINDOW_WIDTH - grid_width) // 2
     for index, panel in enumerate(panels):
-        x = 10 + index * 385
-        canvas[150:510, x:x + 380] = panel
+        x = grid_left + index * (PANEL_WIDTH + PANEL_GAP)
+        canvas[PANEL_TOP:PANEL_TOP + PANEL_HEIGHT, x:x + PANEL_WIDTH] = panel
     cv2.imshow(WINDOW_NAME, canvas)
 
 

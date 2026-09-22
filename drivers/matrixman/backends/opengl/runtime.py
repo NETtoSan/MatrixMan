@@ -70,6 +70,9 @@ class _GlRuntime:
     postprocess_uniforms: dict[tuple, int]
     conv_spatial_uniforms: dict[tuple, tuple[int, int, int]]
     scratch_texture_pool: dict[tuple[int, int], list[int]]
+    scratch_texture_records: dict[int, dict]
+    retired_scratch_textures: list[tuple[int, int, tuple[int, int]]]
+    retired_scratch_bytes: int
     activation_texture_pool: dict[tuple, list[int]]
     activation_texture_pool_order: list[tuple[tuple, int]]
     activation_texture_pool_bytes: int
@@ -150,7 +153,9 @@ def init() -> None:
         fill_uniforms={}, cat_uniforms={}, cat_dim0_2d_uniforms={},
         cat_lastdim_uniforms={}, cat_dim1_3d_uniforms={}, maxpool_uniforms={},
         upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={}, postprocess_uniforms={}, conv_spatial_uniforms={},
-        scratch_texture_pool={}, activation_texture_pool={}, activation_texture_pool_order=[],
+        scratch_texture_pool={}, scratch_texture_records={}, retired_scratch_textures=[],
+        retired_scratch_bytes=0,
+        activation_texture_pool={}, activation_texture_pool_order=[],
         activation_texture_pool_bytes=0, activation_texture_pool_peak_count=0,
         activation_texture_pool_peak_bytes=0, parameter_cache={}, parameter_cache_current={},
         fused_parameter_cache={},
@@ -160,24 +165,37 @@ def init() -> None:
     profiling.install_gl_profilers()
     profiling.install_program_profiler()
     profiling.initialize_gpu_timing()
+    from ...diagnostics import opengl_tile_limit
+    info = {
+        "vendor": _gl_text(gm.glGetString(0x1F00)),
+        "renderer": _gl_text(gm.glGetString(0x1F01)),
+        "opengl": _gl_text(gm.glGetString(0x1F02)),
+        "glsl": _gl_text(gm.glGetString(0x8B8C)),
+    }
+    limits = opengl_tile_limit._limits(gm)
+    autotune_result = None
     if config.tileLimit == "auto":
-        try:
-            from ...diagnostics.opengl_tile_limit import autotune_tile_limit
-
-            info = {
-                "vendor": _gl_text(gm.glGetString(0x1F00)),
-                "renderer": _gl_text(gm.glGetString(0x1F01)),
-                "opengl": _gl_text(gm.glGetString(0x1F02)),
-                "glsl": _gl_text(gm.glGetString(0x8B8C)),
-            }
-            resolved = autotune_tile_limit(info, refresh=config.tileAutotuneRefresh)
-            config.resolveTileLimit(resolved)
-            print(f"MatrixMan OpenGL: tileLimit=auto resolvedTileLimit={resolved}")
-        except Exception as exc:
-            config.resolveTileLimit(256)
-            print(f"MatrixMan OpenGL warning: tile autotuning failed ({exc}); using validated fallback 256")
-    else:
-        config.resolveTileLimit(config.tileLimit)
+        print("MatrixMan tileLimit is set to AUTO", flush=True)
+        autotune_result = opengl_tile_limit.autotune_tile_limit(
+            info,
+            limits=limits,
+            refresh=config.tileAutotuneRefresh,
+            progress=lambda message: print(f"  {message}", flush=True),
+        )
+    policy = opengl_tile_limit.resolve_tile_limit_policy(
+        config.tileLimit, info, limits, autotune_result
+    )
+    config.resolveTileLimit(policy.resolved)
+    if config.profile or config.debug:
+        print("MatrixMan OpenGL config:")
+        print(f"  tileLimit requested: {policy.requested}")
+        print(f"  autotune result: {policy.autotune_result or 'n/a'}")
+        cap_text = policy.policy_cap or policy.hard_cap
+        cap_reason = "GL hard cap" if policy.policy_cap is None else "device policy cap"
+        print(f"  policy cap: {cap_text} ({cap_reason})")
+        print(f"  resolved tileLimit: {policy.resolved}")
+    elif config.tileLimit == "auto":
+        print(f"resolved tileLimit: {policy.resolved}", flush=True)
 
 
 def _gl_text(value) -> str:
@@ -200,6 +218,11 @@ def shutdown() -> None:
     from .tensor import live_textures
     from . import profiling
     profiling.shutdown_gpu_timing()
+
+    if _runtime.retired_scratch_textures:
+        profiling.sync_finish("backend_synchronize")
+        from . import resources
+        resources.reclaim_retired_scratch_textures(_runtime)
 
     for owner in list(live_textures):
         if owner.texture:
