@@ -1725,9 +1725,11 @@ def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_o
             if conv_descriptor.kernel == (3, 3) and not force_generic_grouped:
                 b._profile_counters["grouped_conv_specialized_calls"] += 1
         from ... import source_context
-        profiling.record_convolution_cost(
+        cost_record = profiling.record_convolution_cost(
             input_tensor.shape, out_shape, conv_descriptor, source_context.current()
         )
+    else:
+        cost_record = None
     if config.convDiag:
         from . import conv_diagnostics
         conv_diagnostics.set_context(input_tensor.shape, out_shape)
@@ -1743,6 +1745,9 @@ def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_o
         out_owner.layout.texture_width > tile_limit
         or out_owner.layout.texture_height > tile_limit
     )
+    if cost_record is not None:
+        cost_record["tiled"] = bool(use_tiled)
+        cost_record["tile_count"] = 1
     if conv_descriptor.path == "depthwise":
         implementation = "specialized depthwise GLSL"
     elif conv_descriptor.path == "dense" and conv_descriptor.kernel == (1, 1) and not force_generic_dense_1x1:
@@ -1756,25 +1761,33 @@ def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_o
     if use_spatial:
         implementation += " (spatial reuse)"
     _trace_convolution_family(b, input_tensor, out_shape, conv_descriptor, implementation)
-    if use_spatial:
-        result = _render_convolution_spatial(
-            input_tensor, out_owner, weight_owner, bias_owner, params, conv_descriptor
-        )
-    elif use_tiled:
-        result = _render_convolution_tiled(
-            input_tensor, out_owner, weight_owner, bias_owner, params, conv_descriptor,
-            force_generic_dense_1x1=force_generic_dense_1x1,
-            force_generic_dense_3x3=force_generic_dense_3x3,
-            force_generic_grouped=force_generic_grouped,
-        )
-    else:
-        result = _render_convolution_direct(
-            input_tensor, weight_tensor, bias_tensor, out_owner,
-            weight_owner, bias_owner, params, out_shape, b, conv_descriptor,
-            force_generic_dense_1x1=force_generic_dense_1x1,
-            force_generic_dense_3x3=force_generic_dense_3x3,
-            force_generic_grouped=force_generic_grouped,
-        )
+    scope_token = profiling.begin_convolution_scope(cost_record)
+    try:
+        if use_spatial:
+            result = _render_convolution_spatial(
+                input_tensor, out_owner, weight_owner, bias_owner, params, conv_descriptor
+            )
+        elif use_tiled:
+            result = _render_convolution_tiled(
+                input_tensor, out_owner, weight_owner, bias_owner, params, conv_descriptor,
+                force_generic_dense_1x1=force_generic_dense_1x1,
+                force_generic_dense_3x3=force_generic_dense_3x3,
+                force_generic_grouped=force_generic_grouped,
+            )
+        else:
+            result = _render_convolution_direct(
+                input_tensor, weight_tensor, bias_tensor, out_owner,
+                weight_owner, bias_owner, params, out_shape, b, conv_descriptor,
+                force_generic_dense_1x1=force_generic_dense_1x1,
+                force_generic_dense_3x3=force_generic_dense_3x3,
+                force_generic_grouped=force_generic_grouped,
+            )
+        if cost_record is not None and use_tiled:
+            cost_record["tile_count"] = int(
+                (_last_dispatch_metadata or {}).get("physical_tile_count", 1)
+            )
+    finally:
+        profiling.finish_convolution_scope(scope_token)
     if config.convDiag:
         try:
             from . import conv_diagnostics

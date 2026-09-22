@@ -8,6 +8,7 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 from . import gpumatrix as gm
 from ...config import config, profiling_enabled
@@ -53,8 +54,14 @@ def sync_finish(reason: str):
     finally:
         record = sync_timings[str(reason)]
         record["calls"] += 1
-        record["wall_seconds"] += time.perf_counter() - wall_started
+        elapsed = time.perf_counter() - wall_started
+        record["wall_seconds"] += elapsed
         record["thread_cpu_seconds"] += thread_cpu_time() - cpu_started
+        scope = _active_convolution_scope.get()
+        if scope is not None:
+            scope["sync_seconds"][str(reason)] += elapsed
+            if str(reason) in {"per_tile", "pre_consolidation", "post_consolidation"}:
+                scope["completion_observed"] = True
 
 
 started = time.perf_counter()
@@ -117,6 +124,10 @@ _gpu_timer_dropped = 0
 gpu_timings: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "total": 0.0, "max": 0.0})
 gpu_timing_samples: list[dict] = []
 _exit_hook_registered = False
+_profile_report_emitted = False
+_active_convolution_scope: ContextVar[dict | None] = ContextVar(
+    "matrixman_active_convolution_scope", default=None
+)
 
 
 def set_enabled(value: bool) -> None:
@@ -162,6 +173,7 @@ def register_exit_hook() -> None:
             active is not None
             and active.name == "opengl"
             and enabled
+            and not _profile_report_emitted
             and (ops or counters or gpu_timings or conv)
         ):
             report()
@@ -283,8 +295,9 @@ def shutdown_gpu_timing() -> None:
 
 
 def reset() -> None:
-    global started, _gpu_timer_dropped
+    global started, _gpu_timer_dropped, _profile_report_emitted
     started = time.perf_counter()
+    _profile_report_emitted = False
     ops.clear()
     counters.clear()
     parameters.clear()
@@ -314,10 +327,10 @@ def reset() -> None:
         pass
 
 
-def record_convolution_cost(input_shape, output_shape, descriptor, source=None) -> None:
+def record_convolution_cost(input_shape, output_shape, descriptor, source=None) -> dict | None:
     """Record static Conv MAC metadata without touching GPU tensor contents."""
     if not enabled:
-        return
+        return None
     input_shape = tuple(int(value) for value in input_shape)
     output_shape = tuple(int(value) for value in output_shape)
     n, cin, _hin, _win = input_shape
@@ -333,7 +346,7 @@ def record_convolution_cost(input_shape, output_shape, descriptor, source=None) 
         source_name = str(source.qualified_name)
         source_path = str(source.module_path)
         source_class = source_name.rsplit(".", 1)[-1]
-    conv_cost_records.append({
+    record = {
         "source_module": source_name,
         "source_path": source_path,
         "source_class": source_class,
@@ -348,7 +361,52 @@ def record_convolution_cost(input_shape, output_shape, descriptor, source=None) 
         "cin": cin,
         "cout": cout,
         "macs": macs,
-    })
+        "tiled": False,
+        "tile_count": 1,
+        "wall_seconds": 0.0,
+        "sync_seconds": {},
+        "submission_wall_seconds": 0.0,
+        "completion_wall_seconds": None,
+        "completion_observed": False,
+        "completion_observed": False,
+    }
+    record["identity"] = (
+        record["source_path"], record["family"], record["input_shape"],
+        record["output_shape"], record["kernel"], record["stride"],
+        record["groups"], record["cin"], record["cout"],
+    )
+    conv_cost_records.append(record)
+    return record
+
+
+def begin_convolution_scope(record: dict | None):
+    """Start observing an existing logical Conv dispatch, without GPU work."""
+    if not enabled or record is None:
+        return None
+    scope = {
+        "record": record,
+        "started": time.perf_counter(),
+        "sync_seconds": defaultdict(float),
+    }
+    return _active_convolution_scope.set(scope)
+
+
+def finish_convolution_scope(token) -> None:
+    """Finalize wall/sync attribution for a logical Conv dispatch."""
+    if token is None:
+        return
+    scope = _active_convolution_scope.get()
+    if scope is not None:
+        record = scope["record"]
+        record["wall_seconds"] = time.perf_counter() - scope["started"]
+        record["sync_seconds"] = dict(scope["sync_seconds"])
+        sync_seconds = sum(scope["sync_seconds"].values())
+        record["submission_wall_seconds"] = max(0.0, record["wall_seconds"] - sync_seconds)
+        record["completion_wall_seconds"] = (
+            record["wall_seconds"] if scope["completion_observed"] else None
+        )
+        record["completion_observed"] = bool(scope["completion_observed"])
+    _active_convolution_scope.reset(token)
 
 
 def _parameter_group_key(operation: str | None, parameter_role: str, shape, cacheable: bool) -> tuple:
@@ -723,9 +781,11 @@ def dispatch_timer(fn):
 
 
 def report(frame_count: int | None = None) -> None:
+    global _profile_report_emitted
     collect_gpu_timing()
     if not enabled and not _gpu_timing_enabled():
         return
+    _profile_report_emitted = True
     elapsed = time.perf_counter() - started
     print("\nMatrixMan profile\n-----------------")
     print(f"total backend time: {elapsed:.3f}s")
@@ -765,6 +825,98 @@ def report(frame_count: int | None = None) -> None:
         for name, values in _aggregate("source_class"):
             percent = 100.0 * values["macs"] / total_macs if total_macs else 0.0
             print(f"    {name}: calls={values['calls']} MACs={values['macs']:,} percent={percent:.2f}%")
+
+        runtime_groups = {}
+        for record in conv_cost_records:
+            group = runtime_groups.setdefault(record["identity"], {
+                "record": record,
+                "calls": 0,
+                "reported_wall_seconds": 0.0,
+                "submission_wall_seconds": 0.0,
+                "completion_wall_seconds": 0.0,
+                "observed_calls": 0,
+                "sync_seconds": 0.0,
+                "sync_by_reason": defaultdict(float),
+            })
+            group["calls"] += 1
+            group["submission_wall_seconds"] += record["submission_wall_seconds"]
+            if record["completion_observed"]:
+                group["observed_calls"] += 1
+                group["completion_wall_seconds"] += record["completion_wall_seconds"]
+                group["reported_wall_seconds"] += record["completion_wall_seconds"]
+            else:
+                group["reported_wall_seconds"] += record["submission_wall_seconds"]
+            for reason, seconds in record["sync_seconds"].items():
+                group["sync_seconds"] += seconds
+                group["sync_by_reason"][reason] += seconds
+
+        def _runtime_line(rank, group):
+            record = group["record"]
+            wall = group["reported_wall_seconds"]
+            sync = group["sync_seconds"]
+            total_group_macs = record["macs"] * group["calls"]
+            fully_observed = group["observed_calls"] == group["calls"]
+            ns_per_mac = (
+                wall * 1_000_000_000.0 / total_group_macs
+                if fully_observed and total_group_macs else None
+            )
+            sync_percent = 100.0 * sync / wall if wall else 0.0
+            reasons = group["sync_by_reason"]
+            observed_label = (
+                "yes" if group["observed_calls"] == group["calls"]
+                else "no" if group["observed_calls"] == 0
+                else "mixed"
+            )
+            wall_label = "completion_wall" if fully_observed else "submission_wall"
+            print(
+                f"    {rank:>3}. path={record['source_path']} class={record['source_class']} "
+                f"family={record['family']} input={list(record['input_shape'])} "
+                f"output={list(record['output_shape'])} "
+                f"kernel={record['kernel'][0]}x{record['kernel'][1]} "
+                f"stride={record['stride'][0]}x{record['stride'][1]} groups={record['groups']} "
+                f"calls={group['calls']} MACs/call={record['macs']:,} "
+                f"total_MACs={total_group_macs:,} tiled={'yes' if record['tiled'] else 'no'} "
+                f"tiles={record['tile_count']} completion_observed={observed_label} "
+                f"submission_wall={group['submission_wall_seconds']:.6f}s "
+                f"completion_wall={group['completion_wall_seconds']:.6f}s "
+                f"{wall_label}={wall:.6f}s "
+                f"avg_wall={wall / group['calls']:.6f}s total_sync={sync:.6f}s "
+                f"avg_sync={sync / group['calls']:.6f}s sync_percent={sync_percent:.2f}% "
+                f"ns_per_MAC={ns_per_mac:.4f}" if ns_per_mac is not None
+                else
+                f"ns_per_MAC=unavailable"
+            )
+            if reasons:
+                print(
+                    "       sync breakdown: "
+                    + " ".join(
+                        f"{name}={value:.6f}s"
+                        for name, value in sorted(reasons.items())
+                    )
+                )
+
+        print("CONVOLUTION RUNTIME ATTRIBUTION")
+        print("  ranked by wall time:")
+        for rank, group in enumerate(
+            sorted(runtime_groups.values(), key=lambda item: item["reported_wall_seconds"], reverse=True), 1
+        ):
+            _runtime_line(rank, group)
+        print("  ranked by efficiency (highest ns/MAC first):")
+        for rank, group in enumerate(
+            sorted(
+                (
+                    group for group in runtime_groups.values()
+                    if group["observed_calls"] == group["calls"]
+                ),
+                key=lambda item: (
+                    item["completion_wall_seconds"] * 1_000_000_000.0 /
+                    (item["record"]["macs"] * item["calls"])
+                    if item["record"]["macs"] and item["calls"] else 0.0
+                ),
+                reverse=True,
+            ), 1
+        ):
+            _runtime_line(rank, group)
     names = ("convolution.default", "native_batch_norm.default", "silu_.default", "add.Tensor", "mul.Tensor", "div.Tensor", "sigmoid.default", "mm.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default")
     for name in names:
         record = ops.get(name)
