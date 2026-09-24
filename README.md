@@ -1,5 +1,9 @@
 # MatrixMan
 
+<p align="center">
+  <img src="docs/assets/mascot.png" alt="MatrixMan mascot" width="320">
+</p>
+
 ## What it is
 
 MatrixMan is an experimental PyTorch backend for running tensor operations on GPUs that are unsupported by modern CUDA, ROCm, or vendor-specific compute stacks.
