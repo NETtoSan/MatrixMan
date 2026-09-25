@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from . import gpumatrix as gm, glstate
 from . import adapter
+from . import sync_policy
 from ...config import config
 
 
@@ -22,6 +23,7 @@ class _GlRuntime:
     tile_copy_programs: dict[tuple[bytes, bytes], int]
     batchnorm_programs: dict[tuple, int]
     silu_programs: dict[tuple, int]
+    relu_programs: dict[tuple, int]
     packed_add_programs: dict[tuple, int]
     packed_sub_programs: dict[tuple, int]
     packed_strided_add_programs: dict[tuple, int]
@@ -29,6 +31,7 @@ class _GlRuntime:
     packed_broadcast_mul_programs: dict[tuple, int]
     packed_matmul_programs: dict[tuple, int]
     packed_sigmoid_programs: dict[tuple, int]
+    mean_programs: dict[tuple, int]
     scalar_add_programs: dict[tuple, int]
     stack_programs: dict[tuple, int]
     fill_programs: dict[tuple, int]
@@ -49,13 +52,16 @@ class _GlRuntime:
     tile_copy_uniforms: dict[tuple[bytes, bytes], int]
     batchnorm_uniforms: dict[tuple, tuple[int, int, int, int, int]]
     silu_uniforms: dict[tuple, int]
+    relu_uniforms: dict[tuple, int]
     packed_add_uniforms: dict[tuple, tuple[int, int]]
     packed_sub_uniforms: dict[tuple, tuple[int, int]]
     packed_strided_add_uniforms: dict[tuple, tuple[int, int]]
     packed_scalar_div_uniforms: dict[tuple, int]
     packed_broadcast_mul_uniforms: dict[tuple, tuple[int, int]]
     packed_matmul_uniforms: dict[tuple, tuple[int, int]]
+    packed_matmul_bias_uniforms: dict[tuple, int]
     packed_sigmoid_uniforms: dict[tuple, int]
+    mean_uniforms: dict[tuple, int]
     scalar_add_uniforms: dict[tuple, int]
     stack_uniforms: dict[tuple, tuple[int, ...]]
     fill_uniforms: dict[tuple, tuple]
@@ -73,9 +79,14 @@ class _GlRuntime:
     scratch_texture_records: dict[int, dict]
     retired_scratch_textures: list[tuple[int, int, tuple[int, int]]]
     retired_scratch_bytes: int
+    retired_deferred_scratch_textures: list[tuple[tuple[int, int], int, int, int]]
+    retired_deferred_scratch_bytes: int
     activation_texture_pool: dict[tuple, list[int]]
     activation_texture_pool_order: list[tuple[tuple, int]]
     activation_texture_pool_bytes: int
+    retired_activation_textures: list[tuple[tuple, int, int, int]]
+    retired_activation_bytes: int
+    completion_generation: int
     activation_texture_pool_peak_count: int
     activation_texture_pool_peak_bytes: int
     parameter_cache: dict[tuple, object]
@@ -136,27 +147,30 @@ def init() -> None:
     _runtime = _GlRuntime(
         window=window, context=context, fbo=fbo,
         add_programs={}, matmul_programs={}, conv_programs={}, conv_tile_programs={},
-        tile_copy_programs={}, batchnorm_programs={}, silu_programs={},
+        tile_copy_programs={}, batchnorm_programs={}, silu_programs={}, relu_programs={},
         packed_add_programs={}, packed_sub_programs={}, packed_strided_add_programs={},
         packed_scalar_div_programs={}, packed_broadcast_mul_programs={},
         packed_matmul_programs={},
-        packed_sigmoid_programs={}, scalar_add_programs={}, stack_programs={},
+        packed_sigmoid_programs={}, mean_programs={}, scalar_add_programs={}, stack_programs={},
         fill_programs={}, cat_programs={}, cat_dim0_2d_programs={},
         cat_lastdim_programs={}, cat_dim1_3d_programs={}, maxpool_programs={},
         upsample_programs={}, arange_programs={}, softmax_programs={}, postprocess_programs={}, conv_spatial_programs={},
         add_uniforms={}, matmul_uniforms={}, conv_uniforms={}, conv_tile_uniforms={},
-        tile_copy_uniforms={}, batchnorm_uniforms={}, silu_uniforms={},
+        tile_copy_uniforms={}, batchnorm_uniforms={}, silu_uniforms={}, relu_uniforms={},
         packed_add_uniforms={}, packed_sub_uniforms={}, packed_strided_add_uniforms={},
         packed_scalar_div_uniforms={}, packed_broadcast_mul_uniforms={},
-        packed_matmul_uniforms={},
-        packed_sigmoid_uniforms={}, scalar_add_uniforms={}, stack_uniforms={},
+        packed_matmul_uniforms={}, packed_matmul_bias_uniforms={},
+        packed_sigmoid_uniforms={}, mean_uniforms={}, scalar_add_uniforms={}, stack_uniforms={},
         fill_uniforms={}, cat_uniforms={}, cat_dim0_2d_uniforms={},
         cat_lastdim_uniforms={}, cat_dim1_3d_uniforms={}, maxpool_uniforms={},
         upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={}, postprocess_uniforms={}, conv_spatial_uniforms={},
         scratch_texture_pool={}, scratch_texture_records={}, retired_scratch_textures=[],
-        retired_scratch_bytes=0,
+        retired_scratch_bytes=0, retired_deferred_scratch_textures=[],
+        retired_deferred_scratch_bytes=0,
         activation_texture_pool={}, activation_texture_pool_order=[],
-        activation_texture_pool_bytes=0, activation_texture_pool_peak_count=0,
+        activation_texture_pool_bytes=0, retired_activation_textures=[],
+        retired_activation_bytes=0, completion_generation=0,
+        activation_texture_pool_peak_count=0,
         activation_texture_pool_peak_bytes=0, parameter_cache={}, parameter_cache_current={},
         fused_parameter_cache={},
     )
@@ -172,6 +186,7 @@ def init() -> None:
         "opengl": _gl_text(gm.glGetString(0x1F02)),
         "glsl": _gl_text(gm.glGetString(0x8B8C)),
     }
+    sync_policy.resolve(info)
     limits = opengl_tile_limit._limits(gm)
     autotune_result = None
     if config.tileLimit == "auto":
@@ -223,6 +238,10 @@ def shutdown() -> None:
         profiling.sync_finish("backend_synchronize")
         from . import resources
         resources.reclaim_retired_scratch_textures(_runtime)
+    if getattr(_runtime, "retired_deferred_scratch_textures", []):
+        # Deferred scratch may still be referenced by queued GL work.  This is
+        # teardown deletion safety, not a reuse wait.
+        profiling.sync_finish("backend_synchronize")
 
     for owner in list(live_textures):
         if owner.texture:
@@ -244,11 +263,13 @@ def shutdown() -> None:
         list(_runtime.add_programs.values()) + list(_runtime.matmul_programs.values())
         + list(_runtime.conv_programs.values()) + list(_runtime.conv_tile_programs.values())
         + list(_runtime.tile_copy_programs.values()) + list(_runtime.batchnorm_programs.values())
-        + list(_runtime.silu_programs.values()) + list(_runtime.packed_add_programs.values())
+        + list(_runtime.silu_programs.values()) + list(_runtime.relu_programs.values())
+        + list(_runtime.packed_add_programs.values())
         + list(_runtime.packed_sub_programs.values()) + list(_runtime.packed_strided_add_programs.values())
         + list(_runtime.packed_scalar_div_programs.values())
         + list(_runtime.packed_broadcast_mul_programs.values())
         + list(_runtime.packed_sigmoid_programs.values()) + list(_runtime.scalar_add_programs.values())
+        + list(_runtime.mean_programs.values())
         + list(_runtime.stack_programs.values()) + list(_runtime.fill_programs.values())
         + list(_runtime.cat_programs.values()) + list(_runtime.cat_dim0_2d_programs.values())
         + list(_runtime.cat_lastdim_programs.values()) + list(_runtime.cat_dim1_3d_programs.values())

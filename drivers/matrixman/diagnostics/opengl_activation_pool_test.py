@@ -17,6 +17,9 @@ def _fake_runtime():
         activation_texture_pool={},
         activation_texture_pool_order=[],
         activation_texture_pool_bytes=0,
+        retired_activation_textures=[],
+        retired_activation_bytes=0,
+        completion_generation=0,
         activation_texture_pool_peak_count=0,
         activation_texture_pool_peak_bytes=0,
     )
@@ -27,12 +30,15 @@ def main() -> int:
     original_is_active = runtime.is_active
     original_create = resources.create_rgba32f_texture
     original_delete = resources.gm.glDeleteTextures
+    original_sync_finish = resources.profiling.sync_finish
     original_enabled = resources.profiling.enabled
     original_counters = resources.profiling.counters
     original_max_textures = runtime._MAX_ACTIVATION_TEXTURES
+    original_activation_policy = resources.config.activationPool
     fake = _fake_runtime()
     next_texture = [100]
     deleted = []
+    sync_reasons = []
 
     def fake_create(_width, _height, _data=None):
         texture = next_texture[0]
@@ -50,6 +56,14 @@ def main() -> int:
         resources.gm.glDeleteTextures = fake_delete
         resources.profiling.enabled = True
         resources.profiling.counters.clear()
+        resources.config.activationPool = "safe"
+
+        def fake_sync_finish(reason):
+            sync_reasons.append(reason)
+            fake.completion_generation += 1
+            resources.promote_retired_activation_textures(fake)
+
+        resources.profiling.sync_finish = fake_sync_finish
 
         shape = (1, 4, 4, 4)
         first = resources.acquire_activation_texture(shape)
@@ -57,6 +71,7 @@ def main() -> int:
         resources.release_activation_texture(first)
         reused = resources.acquire_activation_texture(shape)
         assert reused.texture == first_texture
+        assert "activation_reuse" in sync_reasons
         resources.release_activation_texture(reused)
 
         different_shape = resources.acquire_activation_texture((1, 4, 4, 5))
@@ -109,7 +124,50 @@ def main() -> int:
         assert len(fake.activation_texture_pool_order) == 1
         assert int(resources.profiling.counters["activation_pool_evictions"]) == 1
 
+        # Deferred mode never waits merely to recycle a retired activation.
+        resources.clear_activation_pool(fake)
+        resources.config.activationPool = "deferred"
+        deferred_sync_count = int(resources.profiling.counters["activation_pool_reuse_sync_calls"])
+        fake.completion_generation = 4
+        deferred = resources.acquire_activation_texture(shape)
+        deferred_texture = deferred.texture
+        resources.release_activation_texture(deferred)
+        assert fake.retired_activation_textures[0][1] == deferred_texture
+        before_completion = resources.acquire_activation_texture(shape)
+        assert before_completion.texture != deferred_texture
+        assert int(resources.profiling.counters["activation_pool_reuse_sync_calls"]) == deferred_sync_count
+
+        # A later completion promotes all textures retired at generation 4.
+        fake.completion_generation = 5
+        resources.promote_retired_activation_textures(fake)
+        assert not fake.retired_activation_textures
+        reused_after_completion = resources.acquire_activation_texture(shape)
+        assert reused_after_completion.texture == deferred_texture
+        resources.release_activation_texture(reused_after_completion)
+
+        # A completion before retirement does not make the new retirement safe.
+        fake.completion_generation = 6
+        prior_completion = resources.acquire_activation_texture(shape)
+        assert prior_completion.texture == deferred_texture
+        resources.release_activation_texture(prior_completion)
+        resources.promote_retired_activation_textures(fake)
+        assert fake.retired_activation_textures
+        fake.completion_generation = 7
+        resources.promote_retired_activation_textures(fake)
+        assert not fake.retired_activation_textures
+        final_reuse = resources.acquire_activation_texture(shape)
+        assert final_reuse.texture == deferred_texture
+        resources.release_activation_texture(final_reuse)
+        assert int(resources.profiling.counters["activation_pool_retired"]) >= 3
+        assert int(resources.profiling.counters["activation_pool_promoted"]) >= 3
+
+        # Exact pool keys remain mandatory in deferred mode as well.
+        incompatible = resources.acquire_activation_texture((1, 4, 4, 5))
+        assert incompatible.texture != deferred_texture
+        resources.release_activation_texture(incompatible)
+
         before_clear = set(deleted)
+        fake.completion_generation = 8
         resources.clear_activation_pool(fake)
         assert not fake.activation_texture_pool_order
         assert len(deleted) > len(before_clear)
@@ -123,8 +181,10 @@ def main() -> int:
         runtime.runtime_required = original_runtime_required
         runtime.is_active = original_is_active
         runtime._MAX_ACTIVATION_TEXTURES = original_max_textures
+        resources.config.activationPool = original_activation_policy
         resources.create_rgba32f_texture = original_create
         resources.gm.glDeleteTextures = original_delete
+        resources.profiling.sync_finish = original_sync_finish
         resources.profiling.enabled = original_enabled
         resources.profiling.counters = original_counters
 

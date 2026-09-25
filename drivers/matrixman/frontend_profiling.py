@@ -9,13 +9,23 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 
+from .config import config as _config
+
 def _truthy(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    return str(value or "").strip().lower() in {
+        "1", "true", "yes", "on", "summary", "detail", "trace"
+    }
+
+
+def _detail_report_enabled() -> bool:
+    return str(_config.profile).strip().lower() in {
+        "detail", "trace"
+    } or _truthy(os.environ.get("MATRIXMAN_PROFILE_DETAIL"))
 
 
 # MATRIXMAN_PROFILE remains the main profiling switch.  The dedicated
 # variable allows frontend-only runs when backend profiling is not desired.
-enabled = _truthy(os.environ.get("MATRIXMAN_PROFILE")) or _truthy(
+enabled = bool(_config.profile) or bool(_config.profileDispatch) or _truthy(
     os.environ.get("MATRIXMAN_PROFILE_DISPATCH")
 )
 started = time.perf_counter()
@@ -266,6 +276,9 @@ def report(frame_count: int | None = None) -> None:
     print(f"dispatch callbacks: {sum(int(v['calls']) for v in ops.values())}")
     print(f"MatrixManTensor objects created: {counters['matrixman_tensor_objects_created']}")
     print(f"metadata-only views created: {counters['metadata_views_created']}")
+    if not _detail_report_enabled():
+        print("  frontend dispatch timing: collected (detail mode prints breakdown)")
+        return
     _print_table("ATen operators:", ops, frame_count)
     print("Dispatch categories:")
     for category in ("compute ops", "metadata/view ops", "factory ops",

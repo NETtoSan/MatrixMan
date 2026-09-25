@@ -1,4 +1,4 @@
-"""OpenGL DFL-oriented softmax operation."""
+"""OpenGL fixed-bin channel softmax operation."""
 
 from __future__ import annotations
 

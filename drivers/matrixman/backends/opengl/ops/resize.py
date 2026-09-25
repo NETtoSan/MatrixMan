@@ -48,8 +48,8 @@ float upsample_at(int out_index)
     int tmp0 = out_index / OUT_W;
     int oy = tmp0 - (tmp0 / OUT_H) * OUT_H;
     int c = tmp0 / OUT_H;
-    int ix = ox / 2;
-    int iy = oy / 2;
+    int ix = (ox * IN_W) / OUT_W;
+    int iy = (oy * IN_H) / OUT_H;
     int source_index = INPUT_OFFSET + ((c * IN_H) + iy) * IN_W + ix;
     return read_packed(source_index);
 }
@@ -103,12 +103,12 @@ def render_upsample_nearest2d(args):
 
     _, channels, in_h, in_w = (int(v) for v in input_tensor.shape)
     out_h, out_w = output_size
-    if out_h != in_h * 2 or out_w != in_w * 2:
-        raise RuntimeError("gm45 upsample_nearest2d currently supports only exact 2x spatial scaling")
-    if scale_h is not None and float(scale_h) != 2.0:
-        raise RuntimeError("gm45 upsample_nearest2d currently supports only scale_h=2.0")
-    if scale_w is not None and float(scale_w) != 2.0:
-        raise RuntimeError("gm45 upsample_nearest2d currently supports only scale_w=2.0")
+    if out_h <= 0 or out_w <= 0:
+        raise RuntimeError("gm45 upsample_nearest2d requires positive output dimensions")
+    if scale_h is not None and float(scale_h) <= 0.0:
+        raise RuntimeError("gm45 upsample_nearest2d requires positive scale_h")
+    if scale_w is not None and float(scale_w) <= 0.0:
+        raise RuntimeError("gm45 upsample_nearest2d requires positive scale_w")
 
     out_shape = (1, channels, out_h, out_w)
     out_owner = operation_context.output_texture(out_shape)

@@ -212,14 +212,14 @@ def metadata_split(args, kwargs) -> tuple["MatrixManTensor", ...]:
         raise RuntimeError("gm45 split expects an int split size or list of section sizes")
 
     # With contiguous flattened storage, a split is metadata-only only when each
-    # output is one contiguous run. Current YOLO uses 4D NCHW channel splitting
-    # and 3D [batch, channel, anchor] splitting in the DFL box decoder.
+    # output is one contiguous run. Channel splits of batch-leading tensors
+    # satisfy that condition without requiring model-specific knowledge.
     is_nchw_split = len(shape) == 4 and shape[0] == 1 and dim == 1
-    is_dfl_split = len(shape) == 3 and shape[0] == 1 and dim == 1 and split_size == 2
-    if not (is_nchw_split or is_dfl_split):
+    is_channel_split = len(shape) == 3 and shape[0] == 1 and dim == 1
+    if not (is_nchw_split or is_channel_split):
         raise RuntimeError(
-            "gm45 split currently supports only batch-1 NCHW channel splits and "
-            "the YOLO 3D [batch,channel,anchor] split_size=2 case"
+            "gm45 split currently supports only contiguous batch-1 channel splits "
+            "for rank-3 or rank-4 tensors"
         )
 
     inner_block = math.prod(shape[dim + 1 :])

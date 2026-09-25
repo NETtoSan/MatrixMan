@@ -19,14 +19,47 @@ from drivers import matrixman
 from drivers.matrixman.backend import get_backend
 
 
+# ============================================================
+# MATRIXMAN CONFIGURATION / HELP
+# ============================================================
+#
+# The package is the source of truth for all MatrixMan settings. To inspect
+# every public option from this demo, set MATRIXMAN_SHOW_CONFIG_HELP to True.
+# Leave the example assignments below commented unless you intentionally want
+# to override environment variables and MatrixMan defaults.
+MATRIXMAN_SHOW_CONFIG_HELP = False
 
-#matrixman.config.convDiag = True
-matrixman.config.trace = True
+matrixman.trace = True
+
+
+# matrixman.config.describe()
+# matrixman.config.describe("activation_pool")
+# matrixman.config.options("sync_policy")
+#
+# Example tuning:
+# matrixman.config.sync_policy = "safe"
+# matrixman.config.activation_pool = "deferred"
+# matrixman.config.scratch_pool = "deferred"
+# matrixman.config.tile_limit = 256
+#
+# Known useful GM45 combination (example only; not enabled):
+# matrixman.config.sync_policy = "safe"
+# matrixman.config.activation_pool = "deferred"
+# matrixman.config.scratch_pool = "deferred"
+# matrixman.config.tile_limit = 256
+# matrixman.profile = "summary"
+# matrixman.trace = False
+
+
+def show_matrixman_configuration_help() -> None:
+    """Print package-generated configuration help when explicitly requested."""
+    if MATRIXMAN_SHOW_CONFIG_HELP:
+        matrixman.config.describe()
 
 def parse_args() -> argparse.Namespace:
     base = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="MatrixMan VisDrone tracking demo")
-    parser.add_argument("--model", type=Path, default=base / "models/VisDrone-arm64-480/weights/best.pt")
+    parser.add_argument("--model", type=Path, default=base / "models/VisDrone-matrixman-optimized/weights/best.pt")
     parser.add_argument("--video", type=Path, default=base / "videos/video0.mp4")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.25)
@@ -52,6 +85,7 @@ def main() -> int:
     if args.imgsz <= 0 or args.imgsz > 640 or args.imgsz % 32:
         raise ValueError("--imgsz must be a positive multiple of 32 and no greater than 640")
 
+    show_matrixman_configuration_help()
     matrixman.init()
     try:
         info = get_backend().device_info()

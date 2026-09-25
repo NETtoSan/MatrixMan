@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from . import gpumatrix as gm, profiling
+from . import gpumatrix as gm, profiling, sync_policy
 from . import resources as _resources
 from .storage import StorageLayout, packed_atlas_size
 from ...config import config
@@ -86,16 +86,19 @@ def classify_convolution(*, in_channels: int, out_channels: int,
     if groups < 1 or in_channels % groups != 0 or out_channels % groups != 0:
         raise RuntimeError("gm45 grouped convolution requires positive groups dividing Cin and Cout")
 
+    if any(value <= 0 for value in kernel):
+        raise RuntimeError("gm45 convolution requires positive kernel dimensions")
+    if any(value <= 0 for value in stride):
+        raise RuntimeError("gm45 convolution requires positive stride dimensions")
+    if any(value < 0 for value in padding):
+        raise RuntimeError("gm45 convolution requires non-negative padding")
+
     in_per_group = in_channels // groups
     out_per_group = out_channels // groups
     if weight_in_channels != in_per_group:
         raise RuntimeError("gm45 grouped convolution weight shape does not match Cin/groups")
-    if kernel[0] not in {1, 3} or kernel[1] not in {1, 3}:
-        raise RuntimeError("gm45 convolution currently supports only 1x1 and 3x3 kernels")
     if stride not in {(1, 1), (2, 2)}:
         raise RuntimeError("gm45 convolution currently supports stride 1 or 2")
-    if padding not in {(0, 0), (1, 1)}:
-        raise RuntimeError("gm45 convolution currently supports padding 0 or 1")
     if groups > 1 and kernel != (3, 3):
         raise RuntimeError("gm45 grouped convolution currently supports only 3x3 kernels")
     if groups > 1 and (stride, padding) not in {
@@ -776,6 +779,31 @@ def _conv_cache_key(params: tuple, descriptor: ConvolutionDescriptor, variant: s
     return (variant, descriptor, params)
 
 
+def _generic_shader_compile_error(exc: Exception, descriptor: ConvolutionDescriptor) -> RuntimeError:
+    """Add device and descriptor context without introducing a fallback path."""
+    def _gl_text(value) -> str:
+        if value is None:
+            return "unavailable"
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        return str(value)
+
+    try:
+        renderer = _gl_text(gm.glGetString(0x1F01))
+        opengl = _gl_text(gm.glGetString(0x1F02))
+        glsl = _gl_text(gm.glGetString(0x8B8C))
+    except Exception:
+        renderer, opengl, glsl = "unavailable", "unavailable", "unavailable"
+    error = RuntimeError(
+        "gm45 generic GLSL convolution compilation failed: "
+        f"kernel={descriptor.kernel[0]}x{descriptor.kernel[1]} "
+        f"Cin={descriptor.in_channels} Cout={descriptor.out_channels} "
+        f"renderer={renderer} OpenGL={opengl} GLSL={glsl}: {exc}"
+    )
+    error.__cause__ = exc
+    return error
+
+
 def _conv_program(params: tuple, descriptor: ConvolutionDescriptor,
                   *, force_generic_dense_1x1: bool = False,
                   force_generic_dense_3x3: bool = False,
@@ -828,7 +856,7 @@ def _conv_program(params: tuple, descriptor: ConvolutionDescriptor,
         elif specialized_grouped:
             compile_name = "grouped 3x3"
         else:
-            compile_name = descriptor.path
+            compile_name = f"{descriptor.path} generic {descriptor.kernel[0]}x{descriptor.kernel[1]}"
         b._trace(f"gm45.compile -> {compile_name} convolution GLSL fragment shader params={params}")
         with profiling.conv_stage("shader_source_generation"):
             if descriptor.path == "depthwise":
@@ -841,8 +869,13 @@ def _conv_program(params: tuple, descriptor: ConvolutionDescriptor,
                 source = _grouped_3x3_shader_source(params)
             else:
                 source = _conv_shader_source(params)
-        with profiling.conv_stage("shader_compile_link"):
-            program = gm.make_program(source)
+        try:
+            with profiling.conv_stage("shader_compile_link"):
+                program = gm.make_program(source)
+        except Exception as exc:
+            if not (specialized_1x1 or specialized_3x3 or specialized_grouped or descriptor.path == "depthwise"):
+                raise _generic_shader_compile_error(exc, descriptor) from exc
+            raise
         rt.conv_programs[key] = program
         with profiling.conv_stage("uniform_location_setup"):
             rt.conv_uniforms[key] = (
@@ -1181,11 +1214,16 @@ def _conv_tile_program(fragment_source: bytes, descriptor: ConvolutionDescriptor
             "dense 1x1" if specialized_dense_1x1
             else "dense 3x3" if specialized_dense_3x3
             else "grouped 3x3" if specialized_grouped
-            else descriptor.path
+            else f"{descriptor.path} generic {descriptor.kernel[0]}x{descriptor.kernel[1]}"
         )
         b._trace(f"gm45.compile -> {compile_name} convolution GLSL fragment shader (tiled)")
-        with profiling.conv_stage("shader_compile_link"):
-            program = gm.make_program(fragment_source)
+        try:
+            with profiling.conv_stage("shader_compile_link"):
+                program = gm.make_program(fragment_source)
+        except Exception as exc:
+            if not (specialized_dense_1x1 or specialized_dense_3x3 or specialized_grouped or descriptor.path == "depthwise"):
+                raise _generic_shader_compile_error(exc, descriptor) from exc
+            raise
         rt.conv_tile_programs[key] = program
         with profiling.conv_stage("uniform_location_setup"):
             rt.conv_tile_uniforms[key] = (
@@ -1459,8 +1497,9 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
             if (err := gm.glGetError()):
                 raise RuntimeError(f"gm45 tiled convolution OpenGL error: 0x{err:04x}")
             if sync_mode == "per_tile":
-                with profiling.conv_stage("synchronization_wait"):
-                    profiling.sync_finish("per_tile")
+                if sync_policy.current().should_sync("per_tile_sync"):
+                    with profiling.conv_stage("synchronization_wait"):
+                        profiling.sync_finish("per_tile")
                 if b._profile_enabled:
                     b._profile_counters["tiled_per_tile_sync_calls"] += 1
             elif sync_mode == "flush":
@@ -1500,6 +1539,10 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
                 sync_mode == "end"
                 or (sync_mode == "per_tile" and not _skip_pre_consolidation_sync())
             )
+            should_finish_before_consolidation = (
+                should_finish_before_consolidation
+                and sync_policy.current().should_sync("pre_consolidation_sync")
+            )
             if should_finish_before_consolidation:
                 if b._profile_enabled:
                     b._profile_counters["pre_consolidation_sync_calls"] += 1
@@ -1524,8 +1567,9 @@ def _render_convolution_tiled(input_tensor, out_owner, weight_owner, bias_owner,
         # the FBO write visible to the next sampler, while Conv diagnostics'
         # readback happened to provide this wait.  Keep one narrow barrier per
         # tiled Conv rather than adding a wait to every Conv or operator.
-        with profiling.conv_stage("post_consolidation_synchronization"):
-            profiling.sync_finish("post_consolidation")
+        if sync_policy.current().should_sync("post_consolidation_sync"):
+            with profiling.conv_stage("post_consolidation_synchronization"):
+                profiling.sync_finish("post_consolidation")
         if b._profile_enabled:
             b._profile_counters["post_consolidation_sync_calls"] += 1
         if b._profile_enabled:
@@ -1615,8 +1659,14 @@ def _validate_convolution(args, b):
     )
     if bias_tensor is not None and tuple(bias_tensor.shape) != (out_c,):
         raise RuntimeError("gm45 convolution bias shape must be [out_channels]")
-    out_h = (in_h + 2 * padding[0] - kernel_h) // stride[0] + 1
-    out_w = (in_w + 2 * padding[1] - kernel_w) // stride[1] + 1
+    out_h = (in_h + 2 * padding[0] - (kernel_h - 1) - 1) // stride[0] + 1
+    out_w = (in_w + 2 * padding[1] - (kernel_w - 1) - 1) // stride[1] + 1
+    if out_h <= 0 or out_w <= 0:
+        raise RuntimeError(
+            f"gm45 convolution kernel {kernel_h}x{kernel_w} with input "
+            f"{in_h}x{in_w}, stride={stride}, padding={padding} produces "
+            "a non-positive output shape"
+        )
     out_shape = (1, out_c, out_h, out_w)
     out_owner = b._new_empty_packed_texture(out_shape)
     return (input_tensor, weight_tensor, bias_tensor, stride, padding, out_shape,
@@ -1757,9 +1807,14 @@ def _render_prepared_convolution(input_tensor, weight_tensor, bias_tensor, out_o
     elif conv_descriptor.path == "grouped" and conv_descriptor.kernel == (3, 3) and not force_generic_grouped:
         implementation = "specialized grouped 3x3 GLSL"
     else:
-        implementation = f"{conv_descriptor.path} GLSL"
+        implementation = (
+            f"generic {conv_descriptor.path} {conv_descriptor.kernel[0]}x"
+            f"{conv_descriptor.kernel[1]} GLSL"
+        )
     if use_spatial:
         implementation += " (spatial reuse)"
+    if cost_record is not None:
+        cost_record["implementation"] = implementation
     _trace_convolution_family(b, input_tensor, out_shape, conv_descriptor, implementation)
     scope_token = profiling.begin_convolution_scope(cost_record)
     try:

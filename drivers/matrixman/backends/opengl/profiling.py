@@ -10,8 +10,8 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
-from . import gpumatrix as gm
-from ...config import config, profiling_enabled
+from . import gpumatrix as gm, sync_policy
+from ...config import config, profile_mode, profiling_enabled, trace_enabled
 from ... import frontend_profiling
 
 
@@ -23,12 +23,17 @@ def _gpu_timing_enabled() -> bool:
 
 
 def _profile_detail() -> bool:
-    return bool(config.profileDetail)
+    return profile_mode() in {"detail", "trace"} or bool(config.profileDetail)
 
 
 def detailed_enabled() -> bool:
     """Return whether high-volume CPU-stage/GL-call instrumentation is active."""
     return bool(enabled and _profile_detail())
+
+
+def trace_logging_enabled() -> bool:
+    """Live diagnostics are controlled independently from counter collection."""
+    return trace_enabled()
 
 
 _thread_cpu_clock = getattr(time, "thread_time", None)
@@ -45,12 +50,21 @@ def thread_cpu_supported() -> bool:
 
 def sync_finish(reason: str):
     """Run one glFinish and attribute its wall time to a sync reason."""
+    completed = False
     if not enabled:
-        return gm.glFinish()
+        try:
+            result = gm.glFinish()
+            completed = True
+            return result
+        finally:
+            if completed:
+                _record_global_completion()
     wall_started = time.perf_counter()
     cpu_started = thread_cpu_time()
     try:
-        return gm.glFinish()
+        result = gm.glFinish()
+        completed = True
+        return result
     finally:
         record = sync_timings[str(reason)]
         record["calls"] += 1
@@ -62,6 +76,22 @@ def sync_finish(reason: str):
             scope["sync_seconds"][str(reason)] += elapsed
             if str(reason) in {"per_tile", "pre_consolidation", "post_consolidation"}:
                 scope["completion_observed"] = True
+        if completed:
+            _record_global_completion()
+
+
+def _record_global_completion() -> None:
+    """Advance completion state only after a real backend glFinish succeeds."""
+    try:
+        from . import resources, runtime
+        if not runtime.is_active():
+            return
+        rt = runtime.runtime_required()
+        rt.completion_generation = int(getattr(rt, "completion_generation", 0)) + 1
+        resources.promote_retired_activation_textures(rt)
+        resources.promote_retired_scratch_textures(rt)
+    except RuntimeError:
+        return
 
 
 started = time.perf_counter()
@@ -353,6 +383,7 @@ def record_convolution_cost(input_shape, output_shape, descriptor, source=None) 
         "family": {"dense": "Conv2D", "depthwise": "DWConv", "grouped": "GroupedConv"}.get(
             descriptor.path, str(descriptor.path)
         ),
+        "implementation": None,
         "input_shape": input_shape,
         "output_shape": output_shape,
         "kernel": tuple(int(value) for value in descriptor.kernel),
@@ -367,7 +398,6 @@ def record_convolution_cost(input_shape, output_shape, descriptor, source=None) 
         "sync_seconds": {},
         "submission_wall_seconds": 0.0,
         "completion_wall_seconds": None,
-        "completion_observed": False,
         "completion_observed": False,
     }
     record["identity"] = (
@@ -387,6 +417,7 @@ def begin_convolution_scope(record: dict | None):
         "record": record,
         "started": time.perf_counter(),
         "sync_seconds": defaultdict(float),
+        "completion_observed": False,
     }
     return _active_convolution_scope.set(scope)
 
@@ -775,9 +806,178 @@ def dispatch_timer(fn):
             record["total"] += elapsed
             record["thread_cpu_seconds"] += cpu_elapsed
             record["max"] = max(record["max"], elapsed)
-            if _profile_detail():
+            if trace_logging_enabled():
                 print(f"[MatrixMan profile] {name}: {elapsed:.6f}s")
     return wrapped
+
+
+def _human_count(value: int | float) -> str:
+    value = float(value)
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.3f}B"
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{int(value):,}"
+
+
+def _clean_conv_groups() -> list[dict]:
+    """Aggregate repeated logical convolution scopes without changing timings."""
+    groups = {}
+    for record in conv_cost_records:
+        group = groups.setdefault(record["identity"], {
+            "record": record, "calls": 0, "observed_calls": 0,
+            "reported_wall": 0.0, "submission_wall": 0.0,
+            "completion_wall": 0.0, "sync": 0.0, "tiled": False,
+        })
+        group["calls"] += 1
+        group["tiled"] = group["tiled"] or bool(record["tiled"])
+        group["submission_wall"] += record["submission_wall_seconds"]
+        group["sync"] += sum(record["sync_seconds"].values())
+        if record["completion_observed"]:
+            group["observed_calls"] += 1
+            group["completion_wall"] += record["completion_wall_seconds"] or 0.0
+            group["reported_wall"] += record["completion_wall_seconds"] or 0.0
+        else:
+            group["reported_wall"] += record["submission_wall_seconds"]
+    return list(groups.values())
+
+
+def _clean_report(frame_count: int | None, mode: str) -> None:
+    elapsed = time.perf_counter() - started
+    try:
+        from .backend import device_info
+        device = device_info()
+    except Exception:
+        device = {"renderer": "unavailable", "opengl": "unavailable", "glsl": "unavailable"}
+    print("\nMatrixMan profile\n-----------------")
+    print(
+        f"device: {device.get('renderer', 'unavailable')} / "
+        f"OpenGL {device.get('opengl', 'unavailable')} / "
+        f"GLSL {device.get('glsl', 'unavailable')}"
+    )
+    if frame_count is not None:
+        print(f"frames: {frame_count}")
+    print(f"backend time: {elapsed:.3f} s")
+    if frame_count:
+        print(f"average backend/frame: {elapsed / frame_count:.3f} s")
+
+    groups = _clean_conv_groups()
+    total_macs = sum(item["record"]["macs"] * item["calls"] for item in groups)
+    if groups:
+        print("\nMODEL COST")
+        print(f"  convolution calls: {sum(item['calls'] for item in groups)}")
+        print(f"  convolution MACs/frame: {_human_count(total_macs / frame_count) if frame_count else _human_count(total_macs)}")
+        first_shape = groups[0]["record"]["output_shape"]
+        print(f"  output shape: {list(first_shape)}")
+        print("\nTOP CONVOLUTIONS")
+        for rank, group in enumerate(sorted(groups, key=lambda item: item["reported_wall"], reverse=True)[:(5 if mode == "summary" else 20)], 1):
+            record = group["record"]
+            macs_call = record["macs"]
+            total_group_macs = macs_call * group["calls"]
+            observed = "yes" if group["observed_calls"] == group["calls"] else "no" if not group["observed_calls"] else "mixed"
+            ns_per_mac = (
+                group["completion_wall"] * 1e9 / total_group_macs
+                if observed == "yes" and total_group_macs else None
+            )
+            completion_text = (
+                f"{group['completion_wall']:.6f}s"
+                if observed == "yes" else "unavailable"
+            )
+            print(f"  {rank}. {record['source_module']}")
+            print(
+                f"     {record['cin']}->{record['cout']} "
+                f"{record['kernel'][0]}x{record['kernel'][1]} @"
+                f"{record['output_shape'][-2]}x{record['output_shape'][-1]} "
+                f"groups={record['groups']}"
+            )
+            if record.get("implementation"):
+                print(f"     implementation={record['implementation']}")
+            print(
+                f"     calls={group['calls']} MACs/call={_human_count(macs_call)} "
+                f"total_MACs={_human_count(total_group_macs)} "
+                f"percent={(100.0 * total_group_macs / total_macs if total_macs else 0.0):.2f}%"
+            )
+            print(
+                f"     tiled={'yes' if group['tiled'] else 'no'} tiles={record['tile_count']} "
+                f"completion_observed={observed} submission_wall={group['submission_wall']:.6f}s "
+                f"completion_wall={completion_text} "
+                f"reported_wall={group['reported_wall']:.6f}s avg_wall={group['reported_wall'] / group['calls']:.6f}s "
+                f"total_sync={group['sync']:.6f}s avg_sync={group['sync'] / group['calls']:.6f}s"
+            )
+            if ns_per_mac is not None:
+                print(f"     ns_per_MAC={ns_per_mac:.4f}")
+
+        if mode == "detail":
+            for title, key in (("CONVOLUTION FAMILIES", "family"), ("SOURCE CLASSES", "source_class")):
+                aggregate = defaultdict(lambda: {"calls": 0, "macs": 0})
+                for group in groups:
+                    aggregate[group["record"][key]]["calls"] += group["calls"]
+                    aggregate[group["record"][key]]["macs"] += group["record"]["macs"] * group["calls"]
+                print(f"\n{title}")
+                for name, values in sorted(aggregate.items(), key=lambda item: -item[1]["macs"]):
+                    print(f"  {name}: calls={values['calls']} MACs={_human_count(values['macs'])} ({100.0 * values['macs'] / total_macs if total_macs else 0.0:.2f}%)")
+
+    sync_total = counters["glFinish_seconds"]
+    print("\nSYNC")
+    print(f"  GPU completion wait wall time (glFinish): calls={int(counters['glFinish_calls'])} wall={sync_total:.3f}s")
+    for reason in ("per_tile", "activation_reuse", "scratch_reuse", "post_consolidation", "pre_consolidation", "activation_eviction", "scratch_eviction", "final_output_readback"):
+        item = sync_timings.get(reason)
+        if item and (item["calls"] or mode == "detail"):
+            print(f"  {reason}: calls={int(item['calls'])} wall={item['wall_seconds']:.3f}s")
+    if mode == "detail":
+        policy = sync_policy.diagnostics()
+        print("  policy: requested={0} resolved={1}".format(policy["requested"], policy["resolved"]))
+        print("  detailed sync reasons:")
+        for reason, item in sorted(sync_timings.items()):
+            print(f"    {reason}: calls={int(item['calls'])} wall={item['wall_seconds']:.6f}s")
+
+    print("\nPOOLS")
+    activation_acquires = int(counters["activation_pool_acquires"])
+    activation_reuses = int(counters["activation_pool_safe_reuses"] or counters["activation_pool_reuses"])
+    print(
+        f"  activation: acquires={activation_acquires} safe_reuses={activation_reuses} "
+        f"fresh_allocations={int(counters['activation_pool_fresh_allocations'] or counters['activation_pool_allocations'])} "
+        f"retired={int(counters['activation_pool_retired'])} promoted={int(counters['activation_pool_promoted'])} "
+        f"currently_retired={int(counters['activation_pool_current_retired'])} "
+        f"peak_retired={int(counters['activation_pool_peak_retired'])} "
+        f"peak_retired_bytes={int(counters['activation_pool_peak_retired_bytes'])}"
+    )
+    for label, prefix in (("scratch", "scratch_pool"),):
+        acquires = int(counters[f"{prefix}_acquires"])
+        reuses = int(counters[f"{prefix}_safe_reuses"] or counters[f"{prefix}_reuses"])
+        allocations = int(counters[f"{prefix}_fresh_allocations"] or counters[f"{prefix}_allocations"])
+        print(
+            f"  {label}: acquires={acquires} safe_reuses={reuses} "
+            f"fresh_allocations={allocations} reuse_rate={(100.0 * reuses / acquires if acquires else 0.0):.1f}% "
+            f"retired={int(counters['scratch_pool_retired'])} promoted={int(counters['scratch_pool_promoted'])} "
+            f"currently_retired={int(counters['scratch_pool_current_retired'])} "
+            f"peak_retired={int(counters['scratch_pool_peak_retired'])} "
+            f"peak_retired_bytes={int(counters['scratch_pool_peak_retired_bytes'])}"
+        )
+    if mode == "detail":
+        print("\nPARAMETER UPLOAD/CACHE")
+        for name in ("parameter_uploads", "parameter_upload_bytes", "repeated_parameter_uploads", "parameter_cache_hits", "parameter_cache_misses", "parameter_cache_invalidations"):
+            print(f"  {name}: {int(counters[name])}")
+        print("\nREADBACK")
+        for name in ("readback_calls", "readback_bytes", "readback_sync_seconds", "readback_transfer_seconds", "readback_conversion_seconds", "readback_total_seconds"):
+            print(f"  {name}: {counters[name]:.6f}" if name.endswith("seconds") else f"  {name}: {int(counters[name])}")
+        print("\nFRONTEND CPU")
+        print(f"  dispatches={sum(int(item['calls']) for item in ops.values())}")
+        print(f"  total_wall={sum(item['total'] for item in ops.values()):.6f}s")
+        print("\nGL CALLS")
+        for name, item in sorted(gl_call_timings.items()):
+            print(f"  {name}: calls={int(item['calls'])} redundant={int(item['redundant_calls'])}")
+        print("\nCURRENT COMPLETION-AWARE ATTRIBUTION")
+        print(f"  observed convolution scopes: {sum(item['observed_calls'] for item in groups)}/{sum(item['calls'] for item in groups)}")
+
+    print("\nREADBACK") if mode == "summary" and counters["readback_calls"] else None
+    if mode == "summary" and counters["readback_calls"]:
+        print(f"  calls={int(counters['readback_calls'])} bytes={int(counters['readback_bytes'])} total={counters['readback_total_seconds']:.3f}s")
+    print("\nRESULT")
+    print(f"  completed frames={frame_count if frame_count is not None else 'unknown'}")
 
 
 def report(frame_count: int | None = None) -> None:
@@ -786,6 +986,10 @@ def report(frame_count: int | None = None) -> None:
     if not enabled and not _gpu_timing_enabled():
         return
     _profile_report_emitted = True
+    mode = profile_mode()
+    if mode in {"summary", "detail"}:
+        _clean_report(frame_count, mode)
+        return
     elapsed = time.perf_counter() - started
     print("\nMatrixMan profile\n-----------------")
     print(f"total backend time: {elapsed:.3f}s")
@@ -802,6 +1006,7 @@ def report(frame_count: int | None = None) -> None:
                 f"    {rank:>3}. {record['source_module']} "
                 f"class={record['source_class']} path={record['source_path']} "
                 f"family={record['family']} "
+                f"implementation={record.get('implementation') or 'unknown'} "
                 f"input={list(record['input_shape'])} output={list(record['output_shape'])} "
                 f"kernel={record['kernel'][0]}x{record['kernel'][1]} "
                 f"stride={record['stride'][0]}x{record['stride'][1]} "
@@ -867,10 +1072,15 @@ def report(frame_count: int | None = None) -> None:
                 else "no" if group["observed_calls"] == 0
                 else "mixed"
             )
-            wall_label = "completion_wall" if fully_observed else "submission_wall"
+            completion_text = (
+                f"{group['completion_wall_seconds']:.6f}s"
+                if fully_observed else "unavailable"
+            )
+            ns_text = f"{ns_per_mac:.4f}" if ns_per_mac is not None else "unavailable"
             print(
                 f"    {rank:>3}. path={record['source_path']} class={record['source_class']} "
                 f"family={record['family']} input={list(record['input_shape'])} "
+                f"implementation={record.get('implementation') or 'unknown'} "
                 f"output={list(record['output_shape'])} "
                 f"kernel={record['kernel'][0]}x{record['kernel'][1]} "
                 f"stride={record['stride'][0]}x{record['stride'][1]} groups={record['groups']} "
@@ -878,13 +1088,10 @@ def report(frame_count: int | None = None) -> None:
                 f"total_MACs={total_group_macs:,} tiled={'yes' if record['tiled'] else 'no'} "
                 f"tiles={record['tile_count']} completion_observed={observed_label} "
                 f"submission_wall={group['submission_wall_seconds']:.6f}s "
-                f"completion_wall={group['completion_wall_seconds']:.6f}s "
-                f"{wall_label}={wall:.6f}s "
+                f"completion_wall={completion_text} reported_wall={wall:.6f}s "
                 f"avg_wall={wall / group['calls']:.6f}s total_sync={sync:.6f}s "
                 f"avg_sync={sync / group['calls']:.6f}s sync_percent={sync_percent:.2f}% "
-                f"ns_per_MAC={ns_per_mac:.4f}" if ns_per_mac is not None
-                else
-                f"ns_per_MAC=unavailable"
+                f"ns_per_MAC={ns_text}"
             )
             if reasons:
                 print(
@@ -917,7 +1124,7 @@ def report(frame_count: int | None = None) -> None:
             ), 1
         ):
             _runtime_line(rank, group)
-    names = ("convolution.default", "native_batch_norm.default", "silu_.default", "add.Tensor", "mul.Tensor", "div.Tensor", "sigmoid.default", "mm.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default")
+    names = ("convolution.default", "native_batch_norm.default", "silu_.default", "relu_.default", "relu.default", "add.Tensor", "add_.Tensor", "mean.dim", "mm.default", "matmul.default", "addmm.default", "mul.Tensor", "div.Tensor", "sigmoid.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default")
     for name in names:
         record = ops.get(name)
         if record:
@@ -1025,6 +1232,13 @@ def report(frame_count: int | None = None) -> None:
     )
     print(f"  tiled convolution sync mode: {config.tileSync}")
     print(f"  physical tile limit: {config.resolvedTileLimit}")
+    policy = sync_policy.diagnostics()
+    print("SYNC POLICY")
+    print(f"  requested: {policy['requested']}")
+    print(f"  resolved: {policy['resolved']}")
+    print(f"  device: {policy['device_key']}")
+    for category, decision in policy["decisions"].items():
+        print(f"  {category}: {decision}")
     print("SYNC PROFILE")
     print(f"  glFinish total: {int(counters['glFinish_calls'])} calls, {counters['glFinish_seconds']:.3f}s")
     sync_order = (
@@ -1081,7 +1295,23 @@ def report(frame_count: int | None = None) -> None:
         f"  acquires={int(counters['activation_pool_acquires'])} "
         f"reuses={int(counters['activation_pool_reuses'])} "
         f"allocations={int(counters['activation_pool_allocations'])} "
-        f"releases={int(counters['activation_pool_releases'])}"
+        f"releases={int(counters['activation_pool_releases'])} "
+        f"safe_reuses={int(counters['activation_pool_safe_reuses'] or counters['activation_pool_reuses'])} "
+        f"retired={int(counters['activation_pool_retired'])} "
+        f"promoted={int(counters['activation_pool_promoted'])} "
+        f"currently_retired={int(counters['activation_pool_current_retired'])} "
+        f"peak_retired={int(counters['activation_pool_peak_retired'])} "
+        f"peak_retired_bytes={int(counters['activation_pool_peak_retired_bytes'])}"
+    )
+    print(
+        "SCRATCH POOL DEFERRED STATE "
+        f"safe_reuses={int(counters['scratch_pool_safe_reuses'] or counters['scratch_pool_reuses'])} "
+        f"fresh_allocations={int(counters['scratch_pool_fresh_allocations'] or counters['scratch_pool_allocations'])} "
+        f"retired={int(counters['scratch_pool_retired'])} "
+        f"promoted={int(counters['scratch_pool_promoted'])} "
+        f"currently_retired={int(counters['scratch_pool_current_retired'])} "
+        f"peak_retired={int(counters['scratch_pool_peak_retired'])} "
+        f"peak_retired_bytes={int(counters['scratch_pool_peak_retired_bytes'])}"
     )
     for reason in ("activation_reuse", "activation_release", "activation_eviction"):
         record = sync_timings.get(reason, {"calls": 0, "wall_seconds": 0.0})

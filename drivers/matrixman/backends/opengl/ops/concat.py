@@ -468,7 +468,7 @@ def _render_stack(args, kwargs) -> "MatrixManTensor":
     rank = len(tensors[0].shape)
     normalized_dim = dim + rank + 1 if dim < 0 else dim
     if len(tensors) != 2:
-        raise RuntimeError("gm45 stack currently supports only the two-input YOLO meshgrid case")
+        raise RuntimeError("gm45 stack currently supports only two input tensors")
     if rank != 2 or normalized_dim != 2:
         raise RuntimeError("gm45 stack currently supports only 2D inputs stacked along final dim")
 

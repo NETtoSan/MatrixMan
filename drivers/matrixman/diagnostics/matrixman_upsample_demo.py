@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic YOLO-subset nearest upsample tests for the MatrixMan backend."""
+"""Deterministic nearest-neighbor upsample tests for the MatrixMan backend."""
 
 from __future__ import annotations
 
@@ -39,6 +39,12 @@ def main() -> None:
     report_upsample("Known-value nearest 2x upsample", known, known_y, known_expected)
     print("  known output:")
     print(known_y.cpu()[0, 0])
+
+    generic_cpu = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3)
+    generic = gm45.to_device(generic_cpu)
+    generic_y = F.interpolate(generic, size=(3, 5), mode="nearest")
+    generic_expected = F.interpolate(generic_cpu, size=(3, 5), mode="nearest")
+    report_upsample("Generic nearest resize 2x3 -> 3x5", generic, generic_y, generic_expected)
 
     x_cpu = torch.randn((1, 256, 2, 2), dtype=torch.float32, generator=generator)
     x = gm45.to_device(x_cpu)

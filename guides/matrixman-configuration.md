@@ -22,6 +22,42 @@ normalized Python values. For example, `"512"` becomes `512`, `"1"` becomes
 `True`, `"false"` becomes `False`, and `"auto"` remains the string `"auto"`
 where that value is supported.
 
+## Discover configuration from Python
+
+The package exposes the complete public configuration schema directly:
+
+```python
+import matrixman
+
+print(matrixman.config)
+matrixman.config.describe()
+matrixman.config.describe("activation_pool")
+print(matrixman.config.options("sync_policy"))
+```
+
+`keys()` returns public snake_case setting names and `items()` returns their
+current values. `metadata(name)` returns the setting's type, accepted values,
+default, current value, environment variable, category, lifecycle sensitivity,
+description, and stability status. `help(name)` is an alias for `describe()`.
+
+For a fresh Python file, no environment variable names are required:
+
+```python
+import matrixman
+
+matrixman.config.describe()
+matrixman.config.sync_policy = "safe"
+matrixman.config.activation_pool = "deferred"
+matrixman.config.scratch_pool = "deferred"
+
+model = matrixman.to_device(model)
+x = matrixman.to_device(x)
+```
+
+The top-level `matrixman.profile` and `matrixman.trace` aliases remain
+supported and are also included in configuration introspection as
+`config.profile` and `config.trace`.
+
 Boolean environment values are case-insensitive after trimming. The accepted
 true spellings are `1`, `true`, `yes`, and `on`; the accepted false spellings
 are the empty string, `0`, `false`, `no`, and `off`. Other boolean values raise
@@ -33,6 +69,17 @@ Normal MatrixMan usage requires no environment variables. The backend selector
 chooses the available device, and the OpenGL correctness-first defaults are
 `tileLimit=256`, `tileSync="per_tile"`, safe bounded scratch pooling, and safe
 activation pooling. Diagnostics and profiling are off.
+
+`MATRIXMAN_ACTIVATION_POOL=safe` preserves the known-correct activation reuse
+behavior. The experimental `deferred` mode holds released activation textures
+until a later existing `glFinish` completion proves them safe; it may increase
+VRAM usage and is not the default.
+
+`MATRIXMAN_SCRATCH_POOL=safe` preserves the existing scratch reuse wait.
+`MATRIXMAN_SCRATCH_POOL=deferred` holds normally poolable scratch textures until
+a later existing completion proves them safe, allocating fresh scratch storage
+when no SAFE match exists. The older `scratchPolicy` debug modes (`fresh` and
+`epoch`) remain independent and retain their existing behavior.
 
 Advanced tiling overrides are available through `MATRIXMAN_TILE_LIMIT` and
 `MATRIXMAN_TILE_SYNC`. Diagnostic controls include `MATRIXMAN_PROFILE` and
@@ -48,18 +95,24 @@ loading or assignment.
 
 ## Python-native configuration
 
-Assignments use camelCase attributes and are type-checked immediately:
+Snake_case attributes are the recommended Python API. The historical camelCase
+attributes remain compatible aliases and are type-checked immediately:
 
 ```python
 from drivers import matrixman
 
+matrixman.profile = "summary"
+matrixman.trace = False
 matrixman.config.backend = "opengl"
-matrixman.config.useDGPU = True
-matrixman.config.tileLimit = "auto"
-matrixman.config.tileSync = "end"
-matrixman.config.convSpatialReuse = True
-matrixman.config.profile = True
-matrixman.config.gpuTiming = True
+matrixman.config.gpu_preference = "integrated"
+matrixman.config.tile_limit = "auto"
+matrixman.config.tile_sync = "end"
+matrixman.config.conv_spatial_reuse = True
+matrixman.config.gpu_timing = True
+
+# Equivalent legacy spellings remain supported:
+# matrixman.config.tileLimit = "auto"
+# matrixman.config.tileSync = "end"
 ```
 
 An explicit Python assignment overrides the corresponding environment-derived
@@ -79,9 +132,10 @@ matrixman.config.reset()                  # discard overrides; restore built-in 
 values = matrixman.config.asDict()        # shallow copy of current values
 ```
 
-`reset()` does not modify `os.environ`. The object has a compact readable
-`repr`, for example:
-`MatrixManConfig(backend='auto', tileLimit=256, resolvedTileLimit=256, ...)`.
+`reset()` does not modify `os.environ`. `config.show()` (or `print(config)`)
+lists the normalized values and whether each came from the default,
+environment, or an explicit Python override. The object also has a compact
+readable `repr`.
 
 ## Configuration reference
 
@@ -140,7 +194,9 @@ The production OpenGL defaults remain `MATRIXMAN_TILE_LIMIT=256` and
 
 | Environment variable | Python attribute | Type | Default | Accepted values | Description | Lifecycle notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `MATRIXMAN_PROFILE` | `config.profile` | `bool` | `False` | boolean spellings above | Enables profiling for the selected backend. | If a backend is active, a Python assignment updates its profiler; set before initialization for complete coverage. |
+| `MATRIXMAN_PROFILE` | `matrixman.profile` (`config.profile`) | `str`/`bool` | `"off"` | `0`, `1`, `summary`, `detail`, `trace` | Controls profiler collection/report verbosity. `1` is normalized to `summary`. | Set before initialization for complete coverage. |
+| `MATRIXMAN_ACTIVATION_POOL` | `config.activationPool` | `str` | `"safe"` | `safe`, `deferred` | Selects immediate safe activation reuse or completion-deferred reuse. | `deferred` prefers fresh textures over adding a reuse synchronization; retired textures are promoted only after an existing genuine completion. |
+| `MATRIXMAN_SCRATCH_POOL` | `config.scratchPool` | `str` | `"safe"` | `safe`, `deferred` | Selects immediate safe scratch reuse or completion-deferred reuse. | Applies to the normal scratch pool; legacy `scratchPolicy` diagnostic modes remain separate. |
 | `MATRIXMAN_CUDA_PROFILE` | `config.cudaProfile` | `bool` | `False` | boolean spellings above | Legacy CUDA profiling flag used by `profiling_enabled(legacy_cuda=True)`. | Applies as the legacy CUDA contribution; `profile` is the canonical selected-backend setting. |
 | `MATRIXMAN_PROFILE_DETAIL` | `config.profileDetail` | `bool` | `False` | boolean spellings above | Enables detailed OpenGL profiler output. | Read by the OpenGL profiler. |
 | `MATRIXMAN_GPU_TIMING` | `config.gpuTiming` | `bool` | `False` | boolean spellings above | Enables deferred OpenGL GPU timer queries when supported. | Read during OpenGL profiler initialization and timing. |
@@ -260,3 +316,14 @@ matrixman.config.convSpatialReuse = True
 matrixman.config.profile = True
 matrixman.config.gpuTiming = True
 ```
+
+## Linear/GEMM parameter operands
+
+OpenGL `mm`, 2D `matmul`, and `addmm` accept the normal inference pattern
+emitted by `torch.nn.Linear`: MatrixMan activations may be combined with
+CPU float32 parameter tensors. CPU weights and biases are explicitly packed
+and uploaded through the persistent parameter cache; multiplication and bias
+arithmetic still execute entirely in OpenGL. A non-contiguous `weight.t()`
+view is uploaded in its logical view order. Arbitrary CPU/MatrixMan mixing is
+not a CPU fallback: unsupported dtypes, ranks, layouts, or shape combinations
+fail explicitly.

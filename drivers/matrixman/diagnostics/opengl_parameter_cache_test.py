@@ -51,14 +51,23 @@ def main() -> int:
         assert resources.cached_parameter_texture(distinct, "weight") is not same
         assert len(uploaded) == 2
 
+        linear_weight = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        transposed_a = linear_weight.t()
+        transposed_b = linear_weight.t()
+        cached_transposed = resources.cached_parameter_texture(transposed_a, "gemm_mat2")
+        assert resources.cached_parameter_texture(transposed_b, "gemm_mat2") is cached_transposed
+        assert len(uploaded) == 3
+        assert tuple(transposed_a.shape) == (3, 4)
+        assert tuple(transposed_a.stride()) == (1, 3)
+
         first.add_(1.0)
         changed = resources.cached_parameter_texture(first, "weight")
-        assert changed is not same and len(uploaded) == 3
+        assert changed is not same and len(uploaded) == 4
         assert same.texture == 0 and deleted
 
         del distinct
         gc.collect()
-        assert resources.persistent_parameter_resources() == 1
+        assert resources.persistent_parameter_resources() == 2
         resources.profiling.record_parameter_upload(
             np.zeros((1,), dtype=np.float32),
             "bias",

@@ -123,6 +123,10 @@ _RESIDENCY_COUNTERS = (
     "scratch_texture_releases", "scratch_texture_evictions",
     "activation_pool_allocations", "activation_pool_reuses",
     "activation_pool_releases", "activation_pool_evictions",
+    "activation_pool_safe_reuses", "activation_pool_fresh_allocations",
+    "activation_pool_retired", "activation_pool_promoted",
+    "scratch_pool_safe_reuses", "scratch_pool_fresh_allocations",
+    "scratch_pool_retired", "scratch_pool_promoted",
     "readback_calls", "readback_bytes",
 )
 

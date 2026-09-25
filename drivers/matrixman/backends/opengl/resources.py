@@ -13,9 +13,9 @@ import torch
 
 from . import gpumatrix as gm
 from . import gpu_stress
-from . import metadata, profiling
+from . import metadata, profiling, sync_policy
 from . import runtime
-from ...config import config
+from ...config import config, trace_log
 from .tensor import _TextureOwner, owner_from_texture
 from .storage import StorageLayout, matrix_red_rgba, numel, pack_linear_rgba, packed_atlas_size
 
@@ -98,18 +98,25 @@ def acquire_scratch_texture(
     rt = runtime.runtime_required()
     key = (int(width), int(height))
     policy = config.scratchPolicy
+    deferred = config.scratchPool == "deferred" and policy == "safe"
+    if deferred:
+        promote_retired_scratch_textures(rt)
     pooled = None if policy == "fresh" else rt.scratch_texture_pool.get(key)
     if profiling.enabled:
         profiling.counters["scratch_pool_acquires"] += 1
     if pooled:
-        if policy == "safe":
+        if policy == "safe" and not deferred:
             _finish_before_pool_reuse("scratch_reuse")
         texture = pooled.pop()
         if profiling.enabled:
             profiling.counters["scratch_texture_reuses"] += 1
             profiling.counters["scratch_pool_reuses"] += 1
+            if deferred:
+                profiling.counters["scratch_pool_safe_reuses"] += 1
             if policy == "epoch":
                 profiling.counters["scratch_cross_epoch_reuses"] += 1
+        if deferred:
+            _scratch_trace(f"acquire -> safe reuse texture #{texture}")
         _scratch_checkout(rt, texture, key, source="reuse", operation=operation, tile=tile)
         _record_scratch_pool_stats(rt)
         return texture
@@ -118,7 +125,11 @@ def acquire_scratch_texture(
         profiling.counters["scratch_pool_allocations"] += 1
         if policy == "fresh":
             profiling.counters["scratch_fresh_allocations"] += 1
+        if deferred:
+            profiling.counters["scratch_pool_fresh_allocations"] += 1
     texture = create_rgba32f_texture(width, height)
+    if deferred:
+        _scratch_trace(f"acquire -> no safe match; allocate texture #{texture}")
     _scratch_checkout(rt, texture, key, source="fresh", operation=operation, tile=tile)
     _record_scratch_pool_stats(rt)
     return texture
@@ -134,6 +145,26 @@ def release_scratch_texture(owner) -> None:
     rt = runtime.runtime_required()
     key = (owner.layout.texture_width, owner.layout.texture_height)
     policy = config.scratchPolicy
+    deferred = config.scratchPool == "deferred" and policy == "safe"
+    if deferred:
+        retired_generation = int(getattr(rt, "completion_generation", 0))
+        texture_bytes = int(owner.layout.texture_width) * int(owner.layout.texture_height) * 4 * 4
+        if not hasattr(rt, "retired_deferred_scratch_textures"):
+            rt.retired_deferred_scratch_textures = []
+            rt.retired_deferred_scratch_bytes = 0
+        rt.retired_deferred_scratch_textures.append(
+            (key, int(texture), retired_generation, texture_bytes)
+        )
+        rt.retired_deferred_scratch_bytes += texture_bytes
+        if profiling.enabled:
+            profiling.counters["scratch_texture_releases"] += 1
+            profiling.counters["scratch_pool_releases"] += 1
+            profiling.counters["scratch_pool_retired"] += 1
+        _scratch_trace(
+            f"release -> retired texture #{texture} generation={retired_generation}"
+        )
+        _record_scratch_pool_stats(rt)
+        return
     if policy in {"fresh", "epoch"}:
         record = rt.scratch_texture_records.get(int(texture)) if _scratch_debug_enabled() else None
         if record is not None and record["state"] != "retired":
@@ -185,6 +216,10 @@ def _scratch_debug_enabled() -> bool:
     return config.scratchPolicy != "safe"
 
 
+def _scratch_trace(message: str) -> None:
+    trace_log(f"scratch.{message}")
+
+
 def _record_scratch_pool_stats(rt) -> None:
     if not profiling.enabled:
         return
@@ -195,6 +230,43 @@ def _record_scratch_pool_stats(rt) -> None:
         bytes_total += len(textures) * int(key[0]) * int(key[1]) * 4 * 4
     profiling.counters["scratch_pool_current"] = count
     profiling.counters["scratch_pool_bytes"] = bytes_total
+    retired = getattr(rt, "retired_deferred_scratch_textures", [])
+    retired_bytes = int(getattr(rt, "retired_deferred_scratch_bytes", 0))
+    profiling.counters["scratch_pool_current_retired"] = len(retired)
+    profiling.counters["scratch_pool_current_retired_bytes"] = retired_bytes
+    profiling.counters["scratch_pool_peak_retired"] = max(
+        int(profiling.counters["scratch_pool_peak_retired"]), len(retired)
+    )
+    profiling.counters["scratch_pool_peak_retired_bytes"] = max(
+        int(profiling.counters["scratch_pool_peak_retired_bytes"]), retired_bytes
+    )
+
+
+def promote_retired_scratch_textures(rt=None) -> int:
+    """Promote deferred scratch only after a later genuine completion."""
+    rt = rt or runtime.runtime_required()
+    current_generation = int(getattr(rt, "completion_generation", 0))
+    retired = getattr(rt, "retired_deferred_scratch_textures", [])
+    if not retired:
+        return 0
+    remaining = []
+    promoted = 0
+    for key, texture, retired_generation, texture_bytes in retired:
+        if current_generation <= int(retired_generation):
+            remaining.append((key, texture, retired_generation, texture_bytes))
+            continue
+        rt.scratch_texture_pool.setdefault(key, []).append(texture)
+        promoted += 1
+        _scratch_trace(
+            f"promote -> texture #{texture} generation {retired_generation} "
+            f"-> safe after completion generation {current_generation}"
+        )
+    rt.retired_deferred_scratch_textures = remaining
+    rt.retired_deferred_scratch_bytes = sum(int(item[3]) for item in remaining)
+    if profiling.enabled:
+        profiling.counters["scratch_pool_promoted"] += promoted
+    _record_scratch_pool_stats(rt)
+    return promoted
 
 
 def _scratch_site() -> str:
@@ -390,8 +462,10 @@ def _finish_before_pool_reuse(resource_kind: str) -> None:
     every operator or Conv.  This is synchronization only; it does not add a
     readback or a CPU arithmetic path.
     """
-    with profiling.stage("pool_reuse_synchronization"):
-        profiling.sync_finish(resource_kind)
+    category = f"{resource_kind}_sync"
+    if sync_policy.current().should_sync(category):
+        with profiling.stage("pool_reuse_synchronization"):
+            profiling.sync_finish(resource_kind)
     if profiling.enabled:
         counter_name = {
             "activation_reuse": "activation_pool_reuse_sync_calls",
@@ -406,6 +480,8 @@ def _finish_before_pool_reuse(resource_kind: str) -> None:
 def _record_activation_pool_stats(rt) -> None:
     current_count = len(rt.activation_texture_pool_order)
     current_bytes = int(rt.activation_texture_pool_bytes)
+    retired = getattr(rt, "retired_activation_textures", [])
+    retired_bytes = int(getattr(rt, "retired_activation_bytes", 0))
     rt.activation_texture_pool_peak_count = max(
         int(rt.activation_texture_pool_peak_count), current_count
     )
@@ -417,6 +493,49 @@ def _record_activation_pool_stats(rt) -> None:
         profiling.counters["activation_pool_current_bytes"] = current_bytes
         profiling.counters["activation_pool_peak_textures"] = rt.activation_texture_pool_peak_count
         profiling.counters["activation_pool_peak_bytes"] = rt.activation_texture_pool_peak_bytes
+        profiling.counters["activation_pool_current_retired"] = len(retired)
+        profiling.counters["activation_pool_current_retired_bytes"] = retired_bytes
+        profiling.counters["activation_pool_peak_retired"] = max(
+            int(profiling.counters["activation_pool_peak_retired"]),
+            len(retired),
+        )
+        profiling.counters["activation_pool_peak_retired_bytes"] = max(
+            int(profiling.counters["activation_pool_peak_retired_bytes"]),
+            retired_bytes,
+        )
+
+
+def _activation_trace(message: str) -> None:
+    trace_log(f"activation.{message}")
+
+
+def promote_retired_activation_textures(rt=None) -> int:
+    """Promote retired activations after an already-required completion."""
+    rt = rt or runtime.runtime_required()
+    current_generation = int(getattr(rt, "completion_generation", 0))
+    retired = getattr(rt, "retired_activation_textures", [])
+    if not retired:
+        return 0
+    remaining = []
+    promoted = 0
+    for key, texture, retired_generation, texture_bytes in retired:
+        if current_generation <= int(retired_generation):
+            remaining.append((key, texture, retired_generation, texture_bytes))
+            continue
+        rt.activation_texture_pool.setdefault(key, []).append(texture)
+        rt.activation_texture_pool_order.append((key, texture))
+        rt.activation_texture_pool_bytes += int(texture_bytes)
+        promoted += 1
+        _activation_trace(
+            f"promote -> texture #{texture} generation {retired_generation} "
+            f"-> safe after completion generation {current_generation}"
+        )
+    rt.retired_activation_textures = remaining
+    rt.retired_activation_bytes = sum(int(item[3]) for item in remaining)
+    if profiling.enabled:
+        profiling.counters["activation_pool_promoted"] += promoted
+    _record_activation_pool_stats(rt)
+    return promoted
 
 
 def acquire_activation_texture(shape: tuple[int, ...]):
@@ -428,23 +547,32 @@ def acquire_activation_texture(shape: tuple[int, ...]):
     with profiling.stage("activation_pool_key_construction"):
         key = _activation_pool_key(rt, width, height)
     with profiling.stage("activation_pool_acquire_lookup"):
+        if config.activationPool == "deferred":
+            promote_retired_activation_textures(rt)
         pooled = rt.activation_texture_pool.get(key)
     if profiling.enabled:
         profiling.counters["activation_pool_acquires"] += 1
     if pooled:
         with profiling.stage("activation_pool_resource_retrieval"):
-            _finish_before_pool_reuse("activation_reuse")
+            if config.activationPool == "safe":
+                _finish_before_pool_reuse("activation_reuse")
             texture = pooled.pop()
             rt.activation_texture_pool_order.remove((key, texture))
             rt.activation_texture_pool_bytes -= _activation_texture_bytes(key)
         if profiling.enabled:
             profiling.counters["scratch_texture_reuses"] += 1
             profiling.counters["activation_pool_reuses"] += 1
+            profiling.counters["activation_pool_safe_reuses"] += 1
+        if config.activationPool == "deferred":
+            _activation_trace(f"acquire -> safe reuse texture #{texture}")
     else:
         texture = create_rgba32f_texture(width, height)
         if profiling.enabled:
             profiling.counters["scratch_texture_allocations"] += 1
             profiling.counters["activation_pool_allocations"] += 1
+            profiling.counters["activation_pool_fresh_allocations"] += 1
+        if config.activationPool == "deferred":
+            _activation_trace(f"acquire -> no safe match; allocate texture #{texture}")
     _record_activation_pool_stats(rt)
     return owner_from_texture(
         texture,
@@ -466,6 +594,23 @@ def release_activation_texture(owner) -> None:
             # Never issue a delete through a different OpenGL context.
             return
         texture_bytes = _activation_texture_bytes(key)
+        if config.activationPool == "deferred":
+            retired_generation = int(getattr(rt, "completion_generation", 0))
+            if not hasattr(rt, "retired_activation_textures"):
+                rt.retired_activation_textures = []
+                rt.retired_activation_bytes = 0
+            rt.retired_activation_textures.append(
+                (key, int(texture), retired_generation, texture_bytes)
+            )
+            rt.retired_activation_bytes += texture_bytes
+            if profiling.enabled:
+                profiling.counters["activation_pool_releases"] += 1
+                profiling.counters["activation_pool_retired"] += 1
+            _activation_trace(
+                f"release -> retired texture #{texture} generation={retired_generation}"
+            )
+            _record_activation_pool_stats(rt)
+            return
         if (
             len(rt.activation_texture_pool_order) >= runtime._MAX_ACTIVATION_TEXTURES
             or rt.activation_texture_pool_bytes + texture_bytes > runtime._MAX_ACTIVATION_POOL_BYTES
@@ -490,6 +635,17 @@ def release_activation_texture(owner) -> None:
 def clear_activation_pool(rt=None) -> None:
     """Delete all pooled activation textures while their context is active."""
     rt = rt or runtime.runtime_required()
+    retired = getattr(rt, "retired_activation_textures", [])
+    if retired:
+        # Retired textures may still be referenced by queued GL work.  Use the
+        # existing explicit completion boundary before deleting them.
+        profiling.sync_finish("backend_synchronize")
+        retired = getattr(rt, "retired_activation_textures", [])
+    for _key, texture, _generation, _size in retired:
+        texture_id = ctypes.c_uint(texture)
+        gm.glDeleteTextures(1, ctypes.byref(texture_id))
+    rt.retired_activation_textures = []
+    rt.retired_activation_bytes = 0
     for textures in rt.activation_texture_pool.values():
         for texture in textures:
             texture_id = ctypes.c_uint(texture)
@@ -510,10 +666,19 @@ def activation_pool_stats() -> dict[str, int | float]:
     reuses = int(profiling.counters["activation_pool_reuses"])
     attempts = allocations + reuses
     return {
+        "acquires": int(profiling.counters["activation_pool_acquires"]),
+        "safe_reuses": int(profiling.counters["activation_pool_safe_reuses"] or reuses),
+        "fresh_allocations": int(profiling.counters["activation_pool_fresh_allocations"] or allocations),
+        "retired": int(profiling.counters["activation_pool_retired"]),
+        "promoted": int(profiling.counters["activation_pool_promoted"]),
         "current_pooled_textures": len(rt.activation_texture_pool_order),
         "peak_pooled_textures": int(rt.activation_texture_pool_peak_count),
         "current_pooled_bytes": int(rt.activation_texture_pool_bytes),
+        "currently_retired": len(getattr(rt, "retired_activation_textures", [])),
+        "currently_retired_bytes": int(getattr(rt, "retired_activation_bytes", 0)),
         "peak_pooled_bytes": int(rt.activation_texture_pool_peak_bytes),
+        "peak_retired": int(profiling.counters["activation_pool_peak_retired"]),
+        "peak_retired_bytes": int(profiling.counters["activation_pool_peak_retired_bytes"]),
         "allocation_avoidance_rate": reuses / attempts if attempts else 0.0,
     }
 
@@ -573,17 +738,21 @@ def upload_raw_packed_array(
 
 def parameter_cache_key(tensor: torch.Tensor, parameter_kind: str) -> tuple:
     """Build the existing identity/version-sensitive parameter cache key."""
+    source = tensor
+    while getattr(source, "_base", None) is not None:
+        source = source._base
     storage = tensor.untyped_storage()
     storage_identity = int(storage._cdata)
     return (
         parameter_kind,
         "opengl",
         str(tensor.device),
-        id(tensor),
+        id(source),
         storage_identity,
         int(tensor.data_ptr()),
         int(tensor.storage_offset()),
         tuple(int(size) for size in tensor.shape),
+        tuple(int(stride) for stride in tensor.stride()),
         str(tensor.dtype),
         int(tensor._version),
     )
@@ -598,6 +767,9 @@ def cached_parameter_texture(
 ):
     """Return the persistent texture for an eligible Conv2D parameter."""
     rt = runtime.runtime_required()
+    source = tensor
+    while getattr(source, "_base", None) is not None:
+        source = source._base
     role = parameter_role or parameter_kind
     with profiling.stage("parameter_cache_key_construction"):
         key = parameter_cache_key(tensor, parameter_kind)
@@ -616,7 +788,7 @@ def cached_parameter_texture(
         _record_parameter_resource_count(rt)
     with profiling.stage("parameter_cache_dict_lookup"):
         entry = rt.parameter_cache.get(key)
-    if entry is not None and entry.source_ref() is tensor and entry.owner.texture:
+    if entry is not None and entry.source_ref() is source and entry.owner.texture:
         if profiling.enabled:
             profiling.counters["parameter_cache_hits"] += 1
         profiling.record_parameter_cache_event(operation, role, tensor.shape, "hit")
@@ -625,6 +797,9 @@ def cached_parameter_texture(
     if profiling.enabled:
         profiling.counters["parameter_cache_misses"] += 1
     profiling.record_parameter_cache_event(operation, role, tensor.shape, "miss")
+    # Preserve the tensor's logical order, including non-contiguous transpose
+    # views such as nn.Linear.weight.t().  pack_linear_rgba materializes only
+    # the parameter representation; arithmetic remains entirely on the GPU.
     array = tensor.detach().numpy().astype(np.float32, copy=False)
     can_cache = len(rt.parameter_cache) < runtime._MAX_PARAMETER_CACHE_ENTRIES
     owner = upload_raw_packed_array(
@@ -638,7 +813,7 @@ def cached_parameter_texture(
         if profiling.enabled:
             profiling.counters["parameter_cache_bypasses"] += 1
         return owner
-    source_ref = weakref.ref(tensor, lambda reference: _parameter_source_gone(reference, key))
+    source_ref = weakref.ref(source, lambda reference: _parameter_source_gone(reference, key))
     rt.parameter_cache[key] = ParameterCacheEntry(owner, source_ref)
     rt.parameter_cache_current[base_key] = key
     _record_parameter_resource_count(rt)

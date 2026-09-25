@@ -45,6 +45,8 @@ per-terminal settings are recommended.
 | `MATRIXMAN_PROFILE` | shared profiling | Enable selected-backend profiling | off | `1` |
 | `MATRIXMAN_CUDA_PROFILE` | CUDA legacy profiling | CUDA-only fallback profiling switch | off | `1` |
 | `MATRIXMAN_TRACE` | shared tracing | High-level operation trace | off | `1` |
+| `MATRIXMAN_ACTIVATION_POOL` | OpenGL activation pool | `safe` reuse or experimental `deferred` reuse | `safe` | `deferred` |
+| `MATRIXMAN_SCRATCH_POOL` | OpenGL scratch pool | `safe` reuse or experimental `deferred` reuse | `safe` | `deferred` |
 | `MATRIXMAN_DEBUG` | OpenGL diagnostics | OpenGL low-level debug output | off | `1` |
 | `MATRIXMAN_PROFILE_DETAIL` | OpenGL profiling | Detailed profiler report | off | `1` |
 | `MATRIXMAN_GPU_TIMING` | OpenGL profiling | Deferred GPU timer queries | off | `1` |

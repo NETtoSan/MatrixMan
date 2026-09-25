@@ -226,3 +226,130 @@ def _render_silu_inplace(args) -> "MatrixManTensor":
     input_tensor._shape = shape
     input_tensor._storage_offset = 0
     return input_tensor
+
+
+def _relu_program(params: tuple) -> tuple[int, int]:
+    rt = operation_context.gl_runtime()
+    if params not in rt.relu_programs:
+        diagnostics.trace(f"gm45.compile -> ReLU GLSL fragment shader params={params}")
+        program = gm.make_program(_relu_shader_source(params))
+        rt.relu_programs[params] = program
+        rt.relu_uniforms[params] = gm.glGetUniformLocation(program, b"input_tex")
+    return rt.relu_programs[params], rt.relu_uniforms[params]
+
+
+def _relu_shader_source(params: tuple) -> bytes:
+    numel, input_offset, input_tex_w, input_tex_h, out_tex_w = params
+    source = """
+#version 120
+uniform sampler2D input_tex;
+
+float pick_component(vec4 value, int component)
+{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}
+
+float read_packed(int linear_index)
+{
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / __INPUT_TEX_W__) * __INPUT_TEX_W__;
+    int y = texel / __INPUT_TEX_W__;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(__INPUT_TEX_W__), float(__INPUT_TEX_H__));
+    return pick_component(texture2D(input_tex, uv), component);
+}
+
+float relu_at(int linear_index)
+{
+    if (linear_index >= __NUMEL__) return 0.0;
+    return max(read_packed(linear_index + __INPUT_OFFSET__), 0.0);
+}
+
+void main()
+{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * __OUT_TEX_W__ + tex_x) * 4;
+    gl_FragColor = vec4(
+        relu_at(base),
+        relu_at(base + 1),
+        relu_at(base + 2),
+        relu_at(base + 3)
+    );
+}
+"""
+    replacements = {
+        "__NUMEL__": numel,
+        "__INPUT_OFFSET__": input_offset,
+        "__INPUT_TEX_W__": input_tex_w,
+        "__INPUT_TEX_H__": input_tex_h,
+        "__OUT_TEX_W__": out_tex_w,
+    }
+    for name, value in replacements.items():
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _render_relu(input_tensor: "MatrixManTensor", *, inplace: bool) -> "MatrixManTensor":
+    operation = "relu_" if inplace else "relu"
+    if not isinstance(input_tensor, MatrixManTensor):
+        raise RuntimeError(f"gm45 {operation} requires a MatrixManTensor input")
+    if input_tensor.dtype != torch.float32:
+        raise RuntimeError(f"gm45 {operation} supports only float32")
+    if input_tensor._owner.layout.kind != "packed_rgba":
+        raise RuntimeError(f"gm45 {operation} requires packed_rgba tensor storage")
+    operation_context.require_contiguous(input_tensor, operation)
+
+    shape = tuple(int(v) for v in input_tensor.shape)
+    out_owner = operation_context.output_texture(shape)
+    params = (
+        numel(shape),
+        input_tensor._storage_offset,
+        input_tensor._owner.layout.texture_width,
+        input_tensor._owner.layout.texture_height,
+        out_owner.layout.texture_width,
+    )
+    program, input_loc = _relu_program(params)
+    diagnostics.trace(
+        f"gm45.kernel -> ReLU{' in-place' if inplace else ''} shader:\n"
+        f"  input texture #{input_tensor._owner.texture} shape={list(shape)} "
+        f"offset={input_tensor._storage_offset}\n"
+        f"  -> output texture #{out_owner.texture} shape={list(shape)} offset=0"
+    )
+
+    operation_context.attach_output(out_owner)
+    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
+    if status != gm.GL_FRAMEBUFFER_COMPLETE:
+        raise RuntimeError(f"gm45 ReLU framebuffer incomplete: 0x{status:04x}")
+    gm.glUseProgram(program)
+    gm.glActiveTexture(gm.GL_TEXTURE0)
+    gm.glBindTexture(gm.GL_TEXTURE_2D, input_tensor._owner.texture)
+    gm.glUniform1i(input_loc, 0)
+    with profiling.gpu_timer("ReLU"):
+        operation_context.draw_fullscreen_quad()
+    diagnostics.trace(
+        f"gm45.opengl -> submitted ReLU{' in-place' if inplace else ''} fullscreen quad, "
+        f"output texture #{out_owner.texture}"
+    )
+    err = gm.glGetError()
+    if err:
+        raise RuntimeError(f"gm45 OpenGL error after {operation}: 0x{err:04x}")
+
+    if inplace:
+        input_tensor._owner = out_owner
+        input_tensor._shape = shape
+        input_tensor._storage_offset = 0
+        return input_tensor
+    return MatrixManTensor._from_owner(out_owner, shape)
+
+
+def _render_relu_inplace(args) -> "MatrixManTensor":
+    return _render_relu(args[0], inplace=True)
+
+
+def _render_relu_functional(args) -> "MatrixManTensor":
+    return _render_relu(args[0], inplace=False)

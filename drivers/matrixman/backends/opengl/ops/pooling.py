@@ -17,7 +17,11 @@ def _maxpool_program(params: tuple) -> tuple[int, int]:
     return rt.maxpool_programs[params], rt.maxpool_uniforms[params]
 
 def _maxpool_shader_source(params: tuple) -> bytes:
-    channels, in_h, in_w, out_h, out_w, input_offset, input_tex_w, input_tex_h, out_tex_w = params
+    (
+        channels, in_h, in_w, out_h, out_w, kernel_h, kernel_w,
+        stride_h, stride_w, pad_h, pad_w, input_offset,
+        input_tex_w, input_tex_h, out_tex_w,
+    ) = params
     source = """
 #version 120
 uniform sampler2D input_tex;
@@ -49,11 +53,11 @@ float pool_at(int out_index)
     int c = tmp0 / OUT_H;
     float best = -3.402823e+38;
 
-    for (int ky = 0; ky < 5; ++ky) {
-        int iy = oy + ky - 2;
+    for (int ky = 0; ky < KERNEL_H; ++ky) {
+        int iy = oy * STRIDE_H + ky - PAD_H;
         if (iy >= 0 && iy < IN_H) {
-            for (int kx = 0; kx < 5; ++kx) {
-                int ix = ox + kx - 2;
+            for (int kx = 0; kx < KERNEL_W; ++kx) {
+                int ix = ox * STRIDE_W + kx - PAD_W;
                 if (ix >= 0 && ix < IN_W) {
                     int source_index = INPUT_OFFSET + ((c * IN_H) + iy) * IN_W + ix;
                     best = max(best, read_packed(source_index));
@@ -79,6 +83,12 @@ void main()
 """
     replacements = {
         "OUT_NUMEL": channels * out_h * out_w,
+        "KERNEL_H": kernel_h,
+        "KERNEL_W": kernel_w,
+        "STRIDE_H": stride_h,
+        "STRIDE_W": stride_w,
+        "PAD_H": pad_h,
+        "PAD_W": pad_w,
         "INPUT_OFFSET": input_offset,
         "INPUT_TEX_W": input_tex_w,
         "INPUT_TEX_H": input_tex_h,
@@ -95,7 +105,7 @@ void main()
 def _render_max_pool2d_with_indices(args) -> tuple["MatrixManTensor", torch.Tensor]:
     input_tensor = args[0]
     kernel_size = _as_pair(args[1], "kernel_size")
-    stride = _as_pair(args[2], "stride")
+    stride = kernel_size if len(args) <= 2 or args[2] is None else _as_pair(args[2], "stride")
     padding = _as_pair(args[3], "padding")
     dilation = _as_pair(args[4], "dilation") if len(args) > 4 else (1, 1)
     ceil_mode = bool(args[5]) if len(args) > 5 else False
@@ -109,8 +119,12 @@ def _render_max_pool2d_with_indices(args) -> tuple["MatrixManTensor", torch.Tens
     operation_context.require_contiguous(input_tensor, "max_pool2d")
     if len(input_tensor.shape) != 4 or int(input_tensor.shape[0]) != 1:
         raise RuntimeError("gm45 max_pool2d supports only batch-1 NCHW 4D tensors")
-    if kernel_size != (5, 5) or stride != (1, 1) or padding != (2, 2):
-        raise RuntimeError("gm45 max_pool2d currently supports only kernel=5, stride=1, padding=2")
+    if any(value <= 0 for value in kernel_size):
+        raise RuntimeError("gm45 max_pool2d requires positive kernel dimensions")
+    if any(value <= 0 for value in stride):
+        raise RuntimeError("gm45 max_pool2d requires positive stride dimensions")
+    if any(value < 0 for value in padding):
+        raise RuntimeError("gm45 max_pool2d requires non-negative padding")
     if dilation != (1, 1):
         raise RuntimeError("gm45 max_pool2d currently supports dilation=(1,1) only")
     if ceil_mode:
@@ -119,6 +133,11 @@ def _render_max_pool2d_with_indices(args) -> tuple["MatrixManTensor", torch.Tens
     _, channels, in_h, in_w = (int(v) for v in input_tensor.shape)
     out_h = (in_h + 2 * padding[0] - kernel_size[0]) // stride[0] + 1
     out_w = (in_w + 2 * padding[1] - kernel_size[1]) // stride[1] + 1
+    if out_h <= 0 or out_w <= 0:
+        raise RuntimeError(
+            f"gm45 max_pool2d kernel={kernel_size} stride={stride} "
+            f"padding={padding} produces a non-positive output shape"
+        )
     out_shape = (1, channels, out_h, out_w)
     out_owner = operation_context.output_texture(out_shape)
     params = (
@@ -127,6 +146,12 @@ def _render_max_pool2d_with_indices(args) -> tuple["MatrixManTensor", torch.Tens
         in_w,
         out_h,
         out_w,
+        kernel_size[0],
+        kernel_size[1],
+        stride[0],
+        stride[1],
+        padding[0],
+        padding[1],
         input_tensor._storage_offset,
         input_tensor._owner.layout.texture_width,
         input_tensor._owner.layout.texture_height,
@@ -139,9 +164,9 @@ def _render_max_pool2d_with_indices(args) -> tuple["MatrixManTensor", torch.Tens
         "gm45.kernel -> max_pool2d values shader:\n"
         f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)} "
         f"offset={input_tensor._storage_offset}\n"
-        "  kernel=[5,5] stride=[1,1] padding=[2,2]\n"
+        f"  kernel={list(kernel_size)} stride={list(stride)} padding={list(padding)}\n"
         f"  -> output texture #{out_owner.texture} shape={list(out_shape)} offset=0\n"
-        "  indices: CPU empty int64 placeholder; YOLO MaxPool2d(return_indices=False) does not consume it"
+        "  indices: CPU empty int64 placeholder; values-only callers do not consume indices"
     )
 
     operation_context.attach_output(out_owner)

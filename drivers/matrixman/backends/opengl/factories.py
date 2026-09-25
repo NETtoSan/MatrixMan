@@ -174,11 +174,12 @@ void main()
 
 
 def _arange_length(start: float, end: float, step: float) -> int:
-    if step <= 0.0:
-        raise RuntimeError("gm45 arange currently supports only positive step")
-    if end <= start:
+    if step == 0.0:
+        raise RuntimeError("gm45 arange requires a nonzero step")
+    if (step > 0.0 and end <= start) or (step < 0.0 and end >= start):
         return 0
-    return max(0, int(math.ceil((end - start) / step)))
+    distance = (end - start) if step > 0.0 else (start - end)
+    return max(0, int(math.ceil(distance / abs(step))))
 
 
 def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None, out=None) -> MatrixManTensor:

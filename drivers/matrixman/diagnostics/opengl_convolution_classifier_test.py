@@ -58,6 +58,18 @@ def main() -> int:
     assert dense.out_channels_per_group == 32
     assert convolution._convolution_trace_name(dense) == "Conv2D"
 
+    generic = _classify(3, 64, 1, kernel=(7, 7), stride=(2, 2), padding=(3, 3))
+    assert generic.path == "dense"
+    assert generic.kernel == (7, 7)
+    assert generic.stride == (2, 2)
+    assert generic.padding == (3, 3)
+    rectangular = _classify(3, 4, 1, kernel=(3, 5), padding=(1, 2))
+    assert rectangular.kernel == (3, 5)
+    _assert_rejected(cin=3, cout=4, groups=1, kernel=(0, 3))
+    _assert_rejected(cin=3, cout=4, groups=1, kernel=(-1, 3))
+    _assert_rejected(cin=3, cout=4, groups=1, kernel=(5, 5), padding=(-1, 2))
+    _assert_rejected(cin=3, cout=4, groups=2, kernel=(5, 5), weight_cin=2)
+
     _assert_rejected(cin=10, cout=16, groups=4)
     _assert_rejected(cin=16, cout=10, groups=4)
     _assert_rejected(cin=8, cout=10, groups=8)

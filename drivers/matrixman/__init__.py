@@ -36,6 +36,8 @@ class _MatrixManModule(types.ModuleType):
     """Make public configuration assignments update central configuration."""
 
     def __getattribute__(self, name):
+        if name == "profile":
+            return _config_module.profile_mode()
         if name == "profiling":
             return _config_module.profiling_enabled(legacy_cuda=True)
         if name == "trace":
@@ -43,6 +45,9 @@ class _MatrixManModule(types.ModuleType):
         return super().__getattribute__(name)
 
     def __setattr__(self, name, value):
+        if name == "profile":
+            _config_module.config._set("profile", value)
+            return
         if name == "profiling":
             _config_module.set_profiling(value)
             return
@@ -68,6 +73,7 @@ __all__ = [
     "set_profiling",
     "set_tracing",
     "trace",
+    "profile",
     "debug_enabled",
     "init",
     "install_tensor_method",
