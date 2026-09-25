@@ -29,7 +29,11 @@ from drivers.matrixman.backend import get_backend
 # to override environment variables and MatrixMan defaults.
 MATRIXMAN_SHOW_CONFIG_HELP = False
 
-matrixman.trace = True
+matrixman.prefer("opengl")
+
+#matrixman.trace = True
+#matrixman.config.convDiag = True
+#matrixman.profile = True
 
 
 # matrixman.config.describe()
@@ -40,7 +44,7 @@ matrixman.trace = True
 # matrixman.config.sync_policy = "safe"
 # matrixman.config.activation_pool = "deferred"
 # matrixman.config.scratch_pool = "deferred"
-# matrixman.config.tile_limit = 256
+matrixman.config.tile_limit = "auto"
 #
 # Known useful GM45 combination (example only; not enabled):
 # matrixman.config.sync_policy = "safe"

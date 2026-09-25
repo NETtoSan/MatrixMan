@@ -11,7 +11,8 @@ import torch
 import torchvision.models as models
 from drivers import matrixman
 
-matrixman.profile = "summary"
+matrixman.prefer("opengl")
+matrixman.profile = False #"summary"
 matrixman.trace = False
 
 matrixman.config.sync_policy = "safe"

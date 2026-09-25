@@ -270,6 +270,13 @@ class MatrixManTensor(torch.Tensor):
         self._storage_offset = int(storage_offset)
         self._logical_strides = tuple(logical_strides or contiguous_strides(self._shape))
 
+    def requires_grad_(self, requires_grad=True):
+        if requires_grad:
+            from .native import register_hooks
+
+            register_hooks()
+        return torch.Tensor.requires_grad_(self, requires_grad)
+
     @staticmethod
     def _from_owner(owner, shape, storage_offset=0, logical_strides=None):
         profiling = _frontend_profiling()

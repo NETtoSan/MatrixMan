@@ -5,28 +5,50 @@ from torchvision import datasets, transforms
 from drivers import matrixman
 
 
-class MNISTMLP(nn.Module):
-    def __init__(self):
+class MNISTCNN(nn.Module):
+    def __init__(self, image_shape=(1, 28, 28), num_classes=10):
         super().__init__()
 
-        self.net = nn.Sequential(
+        channels, _, _ = (int(value) for value in image_shape)
+        self.features = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Dropout2d(0.10),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Dropout2d(0.15),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(28 * 28, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.20),
+            nn.Linear(64, num_classes),
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.classifier(self.pool(self.features(x)))
 
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
 
-MODEL_PATH = "mnist_mlp.pth"
+MODEL_PATH = "./demo/models/mnist_cnn.pth"
 SAMPLE_INDEX = 1
 
 # Keep correctness-first defaults.
@@ -47,10 +69,10 @@ state_dict = torch.load(
     map_location="cpu",
 )
 
-cpu_model = MNISTMLP().eval()
+cpu_model = MNISTCNN(image_shape=(1, 28, 28)).eval()
 cpu_model.load_state_dict(state_dict)
 
-mm_model = MNISTMLP().eval()
+mm_model = MNISTCNN(image_shape=(1, 28, 28)).eval()
 mm_model.load_state_dict(state_dict)
 
 

@@ -39,20 +39,66 @@ def show_train_status(epoch, total_epochs, batch, total_batches, loss, accuracy=
 
 
 class MNISTMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, image_shape=(1, 28, 28), num_classes=10):
         super().__init__()
 
+        channels, height, width = (int(value) for value in image_shape)
         self.net = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(28 * 28, 256),
+            nn.Linear(channels * height * width, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 10),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
         return self.net(x)
+
+
+class MNISTCNN(nn.Module):
+    """Deeper MNIST classifier with spatial dimensions derived at runtime."""
+
+    def __init__(self, image_shape=(1, 28, 28), num_classes=10):
+        super().__init__()
+
+        channels, height, width = (int(value) for value in image_shape)
+        if channels <= 0 or height <= 0 or width <= 0:
+            raise ValueError(f"image_shape must contain positive dimensions, got {image_shape}")
+
+        self.image_shape = (channels, height, width)
+        self.features = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Dropout2d(0.10),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Dropout2d(0.15),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.20),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.pool(self.features(x)))
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,7 +131,11 @@ test_loader = DataLoader(
     shuffle=False,
 )
 
+image_shape = tuple(int(value) for value in train_dataset[0][0].shape)
+#model = MNISTCNN(image_shape=image_shape, num_classes=10).to(device)
+
 model = MNISTMLP().to(device)
+
 
 criterion = nn.CrossEntropyLoss()
 
@@ -94,7 +144,7 @@ optimizer = optim.Adam(
     lr=1e-3,
 )
 
-epochs = 5
+epochs = 50
 
 for epoch in range(epochs):
     model.train()
@@ -161,7 +211,7 @@ for epoch in range(epochs):
 
 torch.save(
     model.state_dict(),
-    "mnist_mlp.pth",
+    "./demo/models/mnist_cnn.pth",
 )
 
-print("Saved mnist_mlp.pth")
+print("Saved mnist_cnn.pth")
