@@ -23,6 +23,18 @@ def _run(model, value, prepared: bool):
 
 
 def main() -> int:
+    torch.manual_seed(17)
+    standalone = torch.nn.Conv2d(3, 4, 3, stride=1, padding=1, bias=True).eval()
+    standalone_value = torch.randn(1, 3, 16, 16)
+    with torch.no_grad():
+        standalone_reference = standalone(standalone_value)
+    standalone_result, _ = _run(standalone, standalone_value, True)
+    if not torch.allclose(standalone_result, standalone_reference, rtol=1e-4, atol=1e-5):
+        standalone_error = float((standalone_result - standalone_reference).abs().max())
+        raise AssertionError(
+            f"standalone prepared Conv readback mismatch: {standalone_error}"
+        )
+
     torch.manual_seed(7)
     model = torch.nn.Sequential(
         torch.nn.Conv2d(3, 4, 3, padding=1, bias=False),

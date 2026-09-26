@@ -113,6 +113,10 @@ sdl.SDL_CreateWindow.restype = ctypes.c_void_p
 sdl.SDL_DestroyWindow.argtypes = [ctypes.c_void_p]
 sdl.SDL_GL_CreateContext.argtypes = [ctypes.c_void_p]
 sdl.SDL_GL_CreateContext.restype = ctypes.c_void_p
+sdl.SDL_GL_MakeCurrent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+sdl.SDL_GL_MakeCurrent.restype = ctypes.c_int
+sdl.SDL_GL_GetCurrentContext.argtypes = []
+sdl.SDL_GL_GetCurrentContext.restype = ctypes.c_void_p
 sdl.SDL_GL_DeleteContext.argtypes = [ctypes.c_void_p]
 sdl.SDL_GL_GetProcAddress.argtypes = [ctypes.c_char_p]
 sdl.SDL_GL_GetProcAddress.restype = ctypes.c_void_p
@@ -305,24 +309,88 @@ def shader_with_size(template: str, n: int) -> bytes:
 
 
 def compile_shader(kind: int, source: bytes) -> int:
+    kind_name = {
+        GL_VERTEX_SHADER: "vertex",
+        GL_FRAGMENT_SHADER: "fragment",
+    }.get(kind, f"0x{kind:04x}")
+
+    def gl_error() -> int:
+        return int(glGetError())
+
+    def context_details() -> str:
+        try:
+            current = sdl.SDL_GL_GetCurrentContext()
+        except Exception as exc:
+            return f"current_context=<query failed: {exc}>"
+        try:
+            from . import runtime
+
+            expected = getattr(runtime._runtime, "context", None)
+        except Exception:
+            expected = None
+        values = {
+            "current_context": repr(current),
+            "expected_context": repr(expected),
+            "GL_VENDOR": glGetString(0x1F00),
+            "GL_RENDERER": glGetString(0x1F01),
+            "GL_VERSION": glGetString(0x1F02),
+            "GLSL_VERSION": glGetString(0x8B8C),
+        }
+        return " ".join(
+            f"{key}={value.decode('utf-8', 'replace') if isinstance(value, bytes) else value}"
+            for key, value in values.items()
+        )
+
+    source_text = source.decode("utf-8", "replace")
+    numbered_source = "\n".join(
+        f"{line_number:04d}: {line}" for line_number, line in enumerate(source_text.splitlines(), 1)
+    )
+    before_create = gl_error()
     shader = glCreateShader(kind)
+    after_create = gl_error()
+    if not shader:
+        raise RuntimeError(
+            f"OpenGL {kind_name} shader creation failed: id=0 "
+            f"gl_error_before=0x{before_create:04x} gl_error_after_create=0x{after_create:04x} "
+            f"{context_details()}\nsource:\n{numbered_source}"
+        )
     source_p = ctypes.c_char_p(source)
     length = ctypes.c_int(len(source))
     glShaderSource(shader, 1, ctypes.byref(source_p), ctypes.byref(length))
+    after_source = gl_error()
     glCompileShader(shader)
+    after_compile = gl_error()
 
     status = ctypes.c_int()
     glGetShaderiv(shader, GL_COMPILE_STATUS, ctypes.byref(status))
+    after_status = gl_error()
     if status.value != GL_TRUE:
         log_len = ctypes.c_int()
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, ctypes.byref(log_len))
+        after_log_length = gl_error()
         log = ctypes.create_string_buffer(max(log_len.value, 1))
-        glGetShaderInfoLog(shader, len(log), None, log)
-        raise RuntimeError(log.value.decode(errors="replace"))
+        written = ctypes.c_int()
+        glGetShaderInfoLog(shader, len(log), ctypes.byref(written), log)
+        after_info_log = gl_error()
+        info_log = log.value.decode('utf-8', 'replace') or '<empty>'
+        raise RuntimeError(
+            f"OpenGL {kind_name} shader compilation failed\n"
+            f"shader_id={int(shader)} compile_status={status.value} "
+            f"info_log_length={log_len.value} info_log_bytes_written={written.value}\n"
+            f"gl_error_before_create=0x{before_create:04x} "
+            f"gl_error_after_create=0x{after_create:04x} "
+            f"gl_error_after_source=0x{after_source:04x} "
+            f"gl_error_after_compile=0x{after_compile:04x} "
+            f"gl_error_after_status=0x{after_status:04x} "
+            f"gl_error_after_log_length=0x{after_log_length:04x} "
+            f"gl_error_after_info_log=0x{after_info_log:04x}\n"
+            f"info_log={info_log!r}\n"
+            f"{context_details()}\nsource:\n{numbered_source}"
+        )
     return shader
 
 
-def make_program(fragment_source: bytes) -> int:
+def _make_program_unguarded(fragment_source: bytes) -> int:
     vertex = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER)
     fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source)
     program = glCreateProgram()
@@ -341,6 +409,28 @@ def make_program(fragment_source: bytes) -> int:
         glGetProgramInfoLog(program, len(log), None, log)
         raise RuntimeError(log.value.decode(errors="replace"))
     return program
+
+
+def make_program(fragment_source: bytes) -> int:
+    """Compile/link a program while owning MatrixMan's shared GL context.
+
+    Most dispatch paths already hold this guard, and the runtime lock/context
+    manager is re-entrant.  Keeping the guard here also covers preparation,
+    cache misses, and other direct program creation paths that can execute
+    outside the dispatch wrapper.
+    """
+    try:
+        from . import runtime
+    except ImportError:
+        # Preserve the low-level helper's historical usability during the
+        # earliest part of runtime initialization, before runtime._runtime is
+        # installed and able to provide a context guard.
+        return _make_program_unguarded(fragment_source)
+
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _make_program_unguarded(fragment_source)
+    return _make_program_unguarded(fragment_source)
 
 
 def matrix_texture(matrix: np.ndarray) -> int:

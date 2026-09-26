@@ -1124,7 +1124,7 @@ def report(frame_count: int | None = None) -> None:
             ), 1
         ):
             _runtime_line(rank, group)
-    names = ("convolution.default", "native_batch_norm.default", "silu_.default", "relu_.default", "relu.default", "add.Tensor", "add_.Tensor", "mean.dim", "mm.default", "matmul.default", "addmm.default", "mul.Tensor", "div.Tensor", "sigmoid.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default")
+    names = ("convolution.default", "native_batch_norm.default", "silu_.default", "relu_.default", "relu.default", "add.Tensor", "add_.Tensor", "mean.dim", "sum.default", "sum.dim_IntList", "ones_like.default", "mm.default", "matmul.default", "addmm.default", "mul.Tensor", "div.Tensor", "sigmoid.default", "cat.default", "max_pool2d_with_indices.default", "upsample_nearest2d.default", "_softmax.default")
     for name in names:
         record = ops.get(name)
         if record:

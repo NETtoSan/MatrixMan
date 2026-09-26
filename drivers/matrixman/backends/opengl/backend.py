@@ -89,7 +89,7 @@ def shutdown() -> None:
     runtime.shutdown()
 
 
-def set_trace(enabled: bool = True) -> None:
+def set_trace(enabled: bool | str = True) -> None:
     diagnostics.set_trace(enabled)
 
 

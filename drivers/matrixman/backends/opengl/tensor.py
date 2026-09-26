@@ -28,10 +28,11 @@ live_textures = weakref.WeakSet()
 class _TextureOwner:
     """Own one GL texture and delete it while the active runtime is alive."""
 
-    def __init__(self, texture, layout, pool_key=None):
+    def __init__(self, texture, layout, pool_key=None, dtype=torch.float32):
         self.texture = texture
         self.layout = layout
         self._pool_key = pool_key
+        self.dtype = dtype
         live_textures.add(self)
 
     @property
@@ -56,9 +57,9 @@ class _TextureOwner:
                 self.texture = 0
 
 
-def owner_from_texture(texture, layout, pool_key=None):
+def owner_from_texture(texture, layout, pool_key=None, dtype=torch.float32):
     """Construct the tensor-owned wrapper for an already allocated texture."""
-    return _TextureOwner(texture, layout, pool_key)
+    return _TextureOwner(texture, layout, pool_key, dtype)
 
 
 def _validate_cpu_input(tensor: torch.Tensor) -> np.ndarray:
@@ -66,8 +67,8 @@ def _validate_cpu_input(tensor: torch.Tensor) -> np.ndarray:
 
     if tensor.device.type != "cpu":
         raise RuntimeError("gm45 transfer only supports source tensors on CPU")
-    if tensor.dtype != torch.float32:
-        raise RuntimeError("gm45 only supports torch.float32")
+    if tensor.dtype not in {torch.float32, torch.int64}:
+        raise RuntimeError("gm45 upload supports torch.float32 and torch.int64")
     shape = tuple(int(v) for v in tensor.shape)
     metadata.validate_supported_shape(shape)
     if not tensor.is_contiguous():
@@ -75,11 +76,16 @@ def _validate_cpu_input(tensor: torch.Tensor) -> np.ndarray:
     return tensor.detach().numpy().astype(np.float32, copy=False)
 
 
+@runtime.gl_execution_context()
 def texture_from_cpu(tensor: torch.Tensor) -> _TextureOwner:
     from . import diagnostics, resources
 
     array = _validate_cpu_input(tensor)
-    owner = resources.upload_array_to_texture(array)
+    owner = resources.upload_array_to_texture(array, dtype=tensor.dtype)
+    if tensor.dtype == torch.int64:
+        # Metadata-only validation aid for integer index tensors.  The values
+        # remain encoded in the GPU texture; this is not an arithmetic mirror.
+        owner._integer_values = tensor.detach().clone()
     if owner.layout.kind == "packed_rgba":
         layout_text = (
             f"packed RGBA atlas {owner.layout.texture_width}x{owner.layout.texture_height}; "
@@ -91,6 +97,15 @@ def texture_from_cpu(tensor: torch.Tensor) -> _TextureOwner:
         "gm45.upload:\n"
         f"  torch shape {list(tensor.shape)} float32\n"
         f"  -> texture #{owner.texture} {layout_text}"
+    )
+    diagnostics.residency_event(
+        "UPLOAD cpu->opengl",
+        value={
+            "kind": "MatrixManTensor", "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype), "device": "matrixman:0",
+            "texture": owner.texture, "storage": owner.layout.kind,
+            "storage_offset": 0,
+        },
     )
     return owner
 
@@ -104,8 +119,8 @@ def tensor(data: torch.Tensor | np.ndarray | list[list[float]], *, device=None) 
         raise RuntimeError("gm45.tensor only creates tensors on the gm45 device")
     if not isinstance(data, torch.Tensor):
         data = torch.tensor(data, dtype=torch.float32)
-    if data.dtype != torch.float32:
-        data = data.to(dtype=torch.float32)
+    if data.dtype not in {torch.float32, torch.int64}:
+        raise RuntimeError("gm45 tensor supports torch.float32 and torch.int64")
     if not data.is_contiguous():
         data = data.contiguous()
     owner = texture_from_cpu(data)
@@ -127,6 +142,7 @@ def to_gm45(data: torch.Tensor) -> "MatrixManTensor":
     return tensor(data)
 
 
+@runtime.gl_execution_context()
 def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset: int = 0,
                     logical_strides: tuple[int, ...] | None = None) -> torch.Tensor:
     """Synchronize and reconstruct a CPU tensor from packed GL storage."""
@@ -144,6 +160,16 @@ def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset
         f"{owner.layout.texture_width}x{owner.layout.texture_height} offset={storage_offset} "
         f"strides={list(logical_strides)}\n"
         f"  -> torch shape {list(shape)}"
+    )
+    diagnostics.residency_event(
+        "READBACK opengl->cpu",
+        value={
+            "kind": "MatrixManTensor", "shape": list(shape),
+            "dtype": str(getattr(owner, "dtype", torch.float32)),
+            "device": "matrixman:0", "texture": owner.texture,
+            "storage": owner.layout.kind, "storage_offset": storage_offset,
+            "logical_strides": list(logical_strides),
+        },
     )
     sync_started = time.perf_counter()
     with profiling.stage("readback_synchronization_wait"):
@@ -191,3 +217,20 @@ def readback_tensor(owner: _TextureOwner, shape: tuple[int, ...], storage_offset
         profiling.counters["readback_bytes"] += owner.layout.texture_width * owner.layout.texture_height * 4 * 4
         profiling.counters["readback_total_seconds"] += time.perf_counter() - readback_started
     return result
+
+
+@runtime.gl_execution_context()
+def raw_texture(owner: _TextureOwner) -> np.ndarray:
+    """Read the complete physical packed RGBA32F texture."""
+    from . import resources
+
+    if owner.layout.kind != "packed_rgba":
+        raise RuntimeError(
+            "gm45 raw texture inspection requires packed_rgba storage; "
+            f"got {owner.layout.kind!r}"
+        )
+    rt = runtime.runtime_required()
+    with profiling.stage("raw_texture_readback"):
+        profiling.sync_finish("final_output_readback")
+        values = resources.read_texture_pixels(owner, rt.fbo)
+    return np.asarray(values, dtype=np.float32).copy()

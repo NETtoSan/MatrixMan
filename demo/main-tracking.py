@@ -31,7 +31,7 @@ MATRIXMAN_SHOW_CONFIG_HELP = False
 
 matrixman.prefer("opengl")
 
-#matrixman.trace = True
+matrixman.trace = True
 #matrixman.config.convDiag = True
 #matrixman.profile = True
 

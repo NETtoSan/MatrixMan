@@ -1894,8 +1894,8 @@ def _pending_descriptor(input_tensor, weight_tensor, bias_tensor, out_owner,
     }
 
 
-def materialize_pending(tensor, *, override_parameters=None):
-    """Render a deferred convolution into its already reserved output owner."""
+def _materialize_pending_unguarded(tensor, *, override_parameters=None):
+    """Render deferred convolution work assuming the shared GL context is current."""
     descriptor = getattr(tensor, "_pending_convolution", None)
     if descriptor is None:
         return tensor
@@ -1925,6 +1925,20 @@ def materialize_pending(tensor, *, override_parameters=None):
     tensor._logical_strides = result._logical_strides
     del tensor._pending_convolution
     return tensor
+
+
+def materialize_pending(tensor, *, override_parameters=None):
+    """Render deferred convolution work while owning the shared GL context."""
+    from . import runtime
+
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _materialize_pending_unguarded(
+                tensor, override_parameters=override_parameters
+            )
+    return _materialize_pending_unguarded(
+        tensor, override_parameters=override_parameters
+    )
 
 
 def _parameter_version(value) -> int:
@@ -2002,12 +2016,45 @@ def _render_convolution_direct(input_tensor, weight_tensor, bias_tensor, out_own
     b._trace(f"gm45.kernel -> {descriptor.path} convolution shader:\n" f"  input texture #{input_tensor._owner.texture} shape={list(input_tensor.shape)}\n" f"  weight texture #{weight_owner.texture} shape={list(weight_tensor.shape)}\n" f"  bias texture #{bias_owner.texture if bias_tensor is not None else 'none'}\n" f"  -> output texture #{out_owner.texture} shape={list(out_shape)}")
     with profiling.conv_stage("viewport_state_setup"):
         gm.glViewport(0, 0, out_owner.layout.texture_width, out_owner.layout.texture_height)
+    fbo_error_before_bind = int(gm.glGetError())
     with profiling.conv_stage("fbo_output_binding"):
         gm.glBindFramebuffer(gm.GL_FRAMEBUFFER, rt.fbo.value)
+        fbo_error_after_bind = int(gm.glGetError())
         gm.glFramebufferTexture2D(gm.GL_FRAMEBUFFER, gm.GL_COLOR_ATTACHMENT0, gm.GL_TEXTURE_2D, out_owner.texture, 0)
-    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
+        fbo_error_after_attachment = int(gm.glGetError())
+    status = int(gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER))
+    fbo_error_after_status = int(gm.glGetError())
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
-        raise RuntimeError(f"gm45 convolution framebuffer incomplete: 0x{status:04x}")
+        try:
+            current_context = gm.sdl.SDL_GL_GetCurrentContext()
+        except Exception as exc:
+            current_context = f"<query failed: {exc}>"
+        try:
+            from . import runtime
+            expected_context = getattr(runtime._runtime, "context", None)
+        except Exception:
+            expected_context = None
+
+        def _gl_text(value):
+            return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+        renderer = _gl_text(gm.glGetString(0x1F01))
+        version = _gl_text(gm.glGetString(0x1F02))
+        glsl_version = _gl_text(gm.glGetString(0x8B8C))
+        raise RuntimeError(
+            "gm45 convolution framebuffer incomplete: "
+            f"status=0x{status:04x} expected=0x{gm.GL_FRAMEBUFFER_COMPLETE:04x} "
+            f"gl_error_before_bind=0x{fbo_error_before_bind:04x} "
+            f"gl_error_after_bind=0x{fbo_error_after_bind:04x} "
+            f"gl_error_after_attachment=0x{fbo_error_after_attachment:04x} "
+            f"gl_error_after_status=0x{fbo_error_after_status:04x} "
+            f"current_context={current_context!r} expected_context={expected_context!r} "
+            f"fbo={rt.fbo.value} bound_fbo={rt.fbo.value} output_texture={out_owner.texture} "
+            f"texture_target=0x{gm.GL_TEXTURE_2D:04x} attachment=0x{gm.GL_COLOR_ATTACHMENT0:04x} "
+            f"texture_size={out_owner.layout.texture_width}x{out_owner.layout.texture_height} "
+            f"internal_format=RGBA32F renderer={renderer!r} GL_VERSION={version!r} "
+            f"GLSL_VERSION={glsl_version!r}"
+        )
     with profiling.conv_stage("glUseProgram"):
         gm.glUseProgram(program)
     with profiling.conv_stage("input_texture_binding"):
@@ -2151,8 +2198,8 @@ def execute(args):
     )
 
 
-def execute_prepared(args):
-    """Execute a prepared Conv2D without deferred prepared-execution routing."""
+def _execute_prepared_unguarded(args):
+    """Execute a prepared Conv2D assuming the shared GL context is current."""
     b = _backend()
     (input_tensor, weight_tensor, bias_tensor,
      stride, padding, out_shape, out_owner, dimensions, conv_descriptor) = _validate_convolution(args, b)
@@ -2163,3 +2210,13 @@ def execute_prepared(args):
         allow_spatial_reuse=False,
         conv_descriptor=conv_descriptor,
     )
+
+
+def execute_prepared(args):
+    """Execute prepared Conv2D while owning MatrixMan's shared GL context."""
+    from . import runtime
+
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _execute_prepared_unguarded(args)
+    return _execute_prepared_unguarded(args)

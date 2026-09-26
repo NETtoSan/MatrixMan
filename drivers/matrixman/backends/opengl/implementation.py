@@ -19,6 +19,7 @@ from . import runtime as _runtime_module
 from . import profiling as _profiling
 from .ops import activation as _activation
 from .ops import arithmetic as _arithmetic
+from .ops import broadcast as _broadcast
 from .ops import concat as _concat
 from .ops import matmul as _matmul
 from .ops import normalization as _normalization
@@ -140,6 +141,7 @@ _cat_dim1_3d_program = _concat._cat_dim1_3d_program
 _cat_dim1_3d_shader_source = _concat._cat_dim1_3d_shader_source
 _render_stack = _concat._render_stack
 _render_fill_scalar = _concat._render_fill_scalar
+_render_expand = _broadcast.render_expand
 _render_cat = _concat._render_cat
 _render_cat_dim0_2d = _concat._render_cat_dim0_2d
 _render_cat_lastdim_3d = _concat._render_cat_lastdim_3d

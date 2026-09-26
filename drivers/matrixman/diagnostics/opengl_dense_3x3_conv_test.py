@@ -68,6 +68,7 @@ def _run_live_comparison(iterations=10):
     matrixman.init()
     try:
         cases = [
+            ((1, 3, 16, 16), 4, 1, 1),
             ((1, 16, 160, 160), 16, 1, 1),
             ((1, 12, 80, 80), 12, 2, 1),
             ((1, 24, 40, 40), 24, 1, 0),
@@ -135,6 +136,7 @@ def _run_live_comparison(iterations=10):
 
 
 def main() -> int:
+    _check_case((1, 3, 16, 16), 4, 1, 1, with_bias=True)
     _check_case((1, 16, 160, 160), 16, 1, 1, with_bias=True)
     _check_case((1, 12, 80, 80), 12, 2, 1, with_bias=False)
     _check_case((1, 24, 40, 40), 24, 1, 0, with_bias=True)

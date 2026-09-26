@@ -15,9 +15,9 @@ from . import gpumatrix as gm
 from . import gpu_stress
 from . import metadata, profiling, sync_policy
 from . import runtime
-from ...config import config, trace_log
+from ...config import config, detailed_trace_log
 from .tensor import _TextureOwner, owner_from_texture
-from .storage import StorageLayout, matrix_red_rgba, numel, pack_linear_rgba, packed_atlas_size
+from .storage import StorageLayout, numel, pack_linear_rgba, packed_atlas_size
 
 
 @dataclass
@@ -217,7 +217,7 @@ def _scratch_debug_enabled() -> bool:
 
 
 def _scratch_trace(message: str) -> None:
-    trace_log(f"scratch.{message}")
+    detailed_trace_log(f"scratch.{message}")
 
 
 def _record_scratch_pool_stats(rt) -> None:
@@ -506,7 +506,7 @@ def _record_activation_pool_stats(rt) -> None:
 
 
 def _activation_trace(message: str) -> None:
-    trace_log(f"activation.{message}")
+    detailed_trace_log(f"activation.{message}")
 
 
 def promote_retired_activation_textures(rt=None) -> int:
@@ -703,16 +703,17 @@ def read_texture_pixels(owner, fbo):
     return pixels
 
 
-def upload_array_to_texture(array: np.ndarray):
-    """Pack a CPU tensor array and create its RGBA32F texture owner."""
+def upload_array_to_texture(array: np.ndarray, *, dtype=torch.float32):
+    """Pack a normal CPU tensor into canonical packed RGBA storage.
+
+    The legacy ``matrix2d_red`` layout is reserved for explicit internal
+    square-matrix operations; tensor shape alone must not select it.
+    """
     shape = tuple(int(v) for v in array.shape)
     metadata.validate_supported_shape(shape)
-    if len(shape) == 2 and shape[0] == shape[1]:
-        data, layout = matrix_red_rgba(array)
-    else:
-        data, layout = pack_linear_rgba(array)
+    data, layout = pack_linear_rgba(array)
     texture = create_rgba32f_texture(layout.texture_width, layout.texture_height, data)
-    return owner_from_texture(texture, layout)
+    return owner_from_texture(texture, layout, dtype=dtype)
 
 
 def upload_raw_packed_array(

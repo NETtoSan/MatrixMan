@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import ctypes
+import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from . import gpumatrix as gm, glstate
 from . import adapter
 from . import sync_policy
-from ...config import config
+from ...config import config, trace_detailed
 
 
 @dataclass
@@ -24,17 +27,25 @@ class _GlRuntime:
     batchnorm_programs: dict[tuple, int]
     silu_programs: dict[tuple, int]
     relu_programs: dict[tuple, int]
+    threshold_backward_programs: dict[tuple, int]
     packed_add_programs: dict[tuple, int]
     packed_sub_programs: dict[tuple, int]
     packed_strided_add_programs: dict[tuple, int]
     packed_scalar_div_programs: dict[tuple, int]
+    packed_scalar_mul_programs: dict[tuple, int]
+    packed_sqrt_programs: dict[tuple, int]
     packed_broadcast_mul_programs: dict[tuple, int]
+    packed_mul_programs: dict[tuple, int]
+    packed_lerp_programs: dict[tuple, int]
+    packed_addcmul_programs: dict[tuple, int]
+    packed_addcdiv_programs: dict[tuple, int]
     packed_matmul_programs: dict[tuple, int]
     packed_sigmoid_programs: dict[tuple, int]
     mean_programs: dict[tuple, int]
     scalar_add_programs: dict[tuple, int]
     stack_programs: dict[tuple, int]
     fill_programs: dict[tuple, int]
+    broadcast_programs: dict[tuple, int]
     cat_programs: dict[tuple, int]
     cat_dim0_2d_programs: dict[tuple, int]
     cat_lastdim_programs: dict[tuple, int]
@@ -43,6 +54,10 @@ class _GlRuntime:
     upsample_programs: dict[tuple, int]
     arange_programs: dict[tuple, int]
     softmax_programs: dict[tuple, int]
+    logsoftmax_programs: dict[tuple, int]
+    logsoftmax_backward_programs: dict[tuple, int]
+    nll_programs: dict[tuple, int]
+    nll_backward_programs: dict[tuple, int]
     postprocess_programs: dict[tuple, int]
     conv_spatial_programs: dict[tuple, int]
     add_uniforms: dict[int, tuple[int, int]]
@@ -53,11 +68,18 @@ class _GlRuntime:
     batchnorm_uniforms: dict[tuple, tuple[int, int, int, int, int]]
     silu_uniforms: dict[tuple, int]
     relu_uniforms: dict[tuple, int]
+    threshold_backward_uniforms: dict[tuple, tuple[int, int]]
     packed_add_uniforms: dict[tuple, tuple[int, int]]
     packed_sub_uniforms: dict[tuple, tuple[int, int]]
     packed_strided_add_uniforms: dict[tuple, tuple[int, int]]
     packed_scalar_div_uniforms: dict[tuple, int]
+    packed_scalar_mul_uniforms: dict[tuple, int]
+    packed_sqrt_uniforms: dict[tuple, int]
     packed_broadcast_mul_uniforms: dict[tuple, tuple[int, int]]
+    packed_mul_uniforms: dict[tuple, tuple[int, int]]
+    packed_lerp_uniforms: dict[tuple, tuple[int, int]]
+    packed_addcmul_uniforms: dict[tuple, tuple[int, int, int]]
+    packed_addcdiv_uniforms: dict[tuple, tuple[int, int, int]]
     packed_matmul_uniforms: dict[tuple, tuple[int, int]]
     packed_matmul_bias_uniforms: dict[tuple, int]
     packed_sigmoid_uniforms: dict[tuple, int]
@@ -65,6 +87,7 @@ class _GlRuntime:
     scalar_add_uniforms: dict[tuple, int]
     stack_uniforms: dict[tuple, tuple[int, ...]]
     fill_uniforms: dict[tuple, tuple]
+    broadcast_uniforms: dict[tuple, tuple]
     cat_uniforms: dict[tuple, tuple[int, ...]]
     cat_dim0_2d_uniforms: dict[tuple, tuple[int, ...]]
     cat_lastdim_uniforms: dict[tuple, tuple[int, ...]]
@@ -73,6 +96,10 @@ class _GlRuntime:
     upsample_uniforms: dict[tuple, int]
     arange_uniforms: dict[tuple, tuple]
     softmax_uniforms: dict[tuple, int]
+    logsoftmax_uniforms: dict[tuple, int]
+    logsoftmax_backward_uniforms: dict[tuple, tuple[int, int]]
+    nll_uniforms: dict[tuple, tuple[int, int]]
+    nll_backward_uniforms: dict[tuple, tuple[int, int, int]]
     postprocess_uniforms: dict[tuple, int]
     conv_spatial_uniforms: dict[tuple, tuple[int, int, int]]
     scratch_texture_pool: dict[tuple[int, int], list[int]]
@@ -92,6 +119,8 @@ class _GlRuntime:
     parameter_cache: dict[tuple, object]
     parameter_cache_current: dict[tuple, tuple]
     fused_parameter_cache: dict[tuple, tuple[object, object]]
+    gl_execution_lock: threading.RLock
+    gl_execution_state: threading.local
 
 
 _runtime: _GlRuntime | None = None
@@ -100,6 +129,75 @@ _MAX_SCRATCH_TEXTURES = 32
 _MAX_ACTIVATION_TEXTURES = 256
 _MAX_ACTIVATION_POOL_BYTES = 64 * 1024 * 1024
 _MAX_PARAMETER_CACHE_ENTRIES = 256
+
+
+@contextmanager
+def gl_execution_context():
+    """Serialize GL access and make the shared SDL context current."""
+    rt = _runtime
+    if rt is None or not rt.window or not rt.context:
+        raise RuntimeError("MatrixMan OpenGL runtime is not initialized")
+    rt.gl_execution_lock.acquire()
+    depth = getattr(rt.gl_execution_state, "depth", 0)
+    outermost = depth == 0
+    try:
+        if outermost:
+            current = gm.sdl.SDL_GL_GetCurrentContext()
+            if current != rt.context:
+                result = gm.sdl.SDL_GL_MakeCurrent(rt.window, rt.context)
+                if result != 0:
+                    error = gm.sdl.SDL_GetError()
+                    detail = error.decode("utf-8", "replace") if error else "unknown SDL error"
+                    raise RuntimeError(
+                        f"MatrixMan could not bind OpenGL context on thread "
+                        f"{threading.current_thread().name}: {detail}"
+                    )
+            _context_log("bind", depth=1, already_current=(current == rt.context))
+        rt.gl_execution_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            rt.gl_execution_state.depth = depth
+            if outermost:
+                result = gm.sdl.SDL_GL_MakeCurrent(rt.window, None)
+                if result != 0:
+                    error = gm.sdl.SDL_GetError()
+                    detail = error.decode("utf-8", "replace") if error else "unknown SDL error"
+                    message = (
+                        f"MatrixMan could not release OpenGL context on thread "
+                        f"{threading.current_thread().name}: {detail}"
+                    )
+                    if sys.exc_info()[0] is None:
+                        raise RuntimeError(message)
+                    _context_log("release failed: " + message, force=True)
+                else:
+                    _context_log("release", depth=0)
+    finally:
+        rt.gl_execution_lock.release()
+
+
+def _context_log(
+    event: str,
+    *,
+    depth: int | None = None,
+    already_current: bool | None = None,
+    force: bool = False,
+) -> None:
+    # Context ownership is routine execution plumbing.  Keep it silent unless
+    # the user explicitly enables the public trace mode; forced failure logs
+    # remain visible even while another exception is being propagated.
+    if not (trace_detailed() or force):
+        return
+    details = [f"thread={threading.current_thread().name}", f"thread_id={threading.get_ident()}"]
+    if depth is not None:
+        details.append(f"depth={depth}")
+    if already_current is not None:
+        details.append(f"already_current={already_current}")
+    if event == "bind":
+        version = _gl_text(gm.glGetString(0x1F02))
+        renderer = _gl_text(gm.glGetString(0x1F01))
+        details.extend((f"GL_VERSION={version}", f"GL_RENDERER={renderer}"))
+    print(f"[MatrixMan/OpenGL] gl_context {event} " + " ".join(details), flush=True)
 
 
 def init() -> None:
@@ -147,23 +245,35 @@ def init() -> None:
     _runtime = _GlRuntime(
         window=window, context=context, fbo=fbo,
         add_programs={}, matmul_programs={}, conv_programs={}, conv_tile_programs={},
-        tile_copy_programs={}, batchnorm_programs={}, silu_programs={}, relu_programs={},
+        tile_copy_programs={}, batchnorm_programs={}, silu_programs={}, relu_programs={}, threshold_backward_programs={},
         packed_add_programs={}, packed_sub_programs={}, packed_strided_add_programs={},
-        packed_scalar_div_programs={}, packed_broadcast_mul_programs={},
+        packed_scalar_div_programs={}, packed_broadcast_mul_programs={}, packed_mul_programs={},
+        packed_scalar_mul_programs={},
+        packed_sqrt_programs={},
+        packed_lerp_programs={},
+        packed_addcmul_programs={},
+        packed_addcdiv_programs={},
         packed_matmul_programs={},
         packed_sigmoid_programs={}, mean_programs={}, scalar_add_programs={}, stack_programs={},
         fill_programs={}, cat_programs={}, cat_dim0_2d_programs={},
+        broadcast_programs={},
         cat_lastdim_programs={}, cat_dim1_3d_programs={}, maxpool_programs={},
-        upsample_programs={}, arange_programs={}, softmax_programs={}, postprocess_programs={}, conv_spatial_programs={},
+        upsample_programs={}, arange_programs={}, softmax_programs={}, logsoftmax_programs={}, logsoftmax_backward_programs={}, nll_programs={}, nll_backward_programs={}, postprocess_programs={}, conv_spatial_programs={},
         add_uniforms={}, matmul_uniforms={}, conv_uniforms={}, conv_tile_uniforms={},
-        tile_copy_uniforms={}, batchnorm_uniforms={}, silu_uniforms={}, relu_uniforms={},
+        tile_copy_uniforms={}, batchnorm_uniforms={}, silu_uniforms={}, relu_uniforms={}, threshold_backward_uniforms={},
         packed_add_uniforms={}, packed_sub_uniforms={}, packed_strided_add_uniforms={},
-        packed_scalar_div_uniforms={}, packed_broadcast_mul_uniforms={},
+        packed_scalar_div_uniforms={}, packed_broadcast_mul_uniforms={}, packed_mul_uniforms={},
+        packed_scalar_mul_uniforms={},
+        packed_sqrt_uniforms={},
+        packed_lerp_uniforms={},
+        packed_addcmul_uniforms={},
+        packed_addcdiv_uniforms={},
         packed_matmul_uniforms={}, packed_matmul_bias_uniforms={},
         packed_sigmoid_uniforms={}, mean_uniforms={}, scalar_add_uniforms={}, stack_uniforms={},
         fill_uniforms={}, cat_uniforms={}, cat_dim0_2d_uniforms={},
+        broadcast_uniforms={},
         cat_lastdim_uniforms={}, cat_dim1_3d_uniforms={}, maxpool_uniforms={},
-        upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={}, postprocess_uniforms={}, conv_spatial_uniforms={},
+        upsample_uniforms={}, arange_uniforms={}, softmax_uniforms={}, logsoftmax_uniforms={}, logsoftmax_backward_uniforms={}, nll_uniforms={}, nll_backward_uniforms={}, postprocess_uniforms={}, conv_spatial_uniforms={},
         scratch_texture_pool={}, scratch_texture_records={}, retired_scratch_textures=[],
         retired_scratch_bytes=0, retired_deferred_scratch_textures=[],
         retired_deferred_scratch_bytes=0,
@@ -173,6 +283,8 @@ def init() -> None:
         activation_texture_pool_peak_count=0,
         activation_texture_pool_peak_bytes=0, parameter_cache={}, parameter_cache_current={},
         fused_parameter_cache={},
+        gl_execution_lock=threading.RLock(),
+        gl_execution_state=threading.local(),
     )
     from . import profiling
     profiling.install_program_cache_profilers(_runtime)
@@ -221,7 +333,7 @@ def _gl_text(value) -> str:
     return str(value)
 
 
-def shutdown() -> None:
+def _shutdown_impl() -> None:
     """Release all GL objects owned by the current runtime."""
     global _runtime, _adapter_preference
     from . import conv_diagnostics, convolution
@@ -264,13 +376,25 @@ def shutdown() -> None:
         + list(_runtime.conv_programs.values()) + list(_runtime.conv_tile_programs.values())
         + list(_runtime.tile_copy_programs.values()) + list(_runtime.batchnorm_programs.values())
         + list(_runtime.silu_programs.values()) + list(_runtime.relu_programs.values())
+        + list(_runtime.threshold_backward_programs.values())
+        + list(_runtime.logsoftmax_programs.values())
+        + list(_runtime.nll_programs.values())
+        + list(_runtime.nll_backward_programs.values())
+        + list(_runtime.logsoftmax_backward_programs.values())
         + list(_runtime.packed_add_programs.values())
         + list(_runtime.packed_sub_programs.values()) + list(_runtime.packed_strided_add_programs.values())
         + list(_runtime.packed_scalar_div_programs.values())
+        + list(_runtime.packed_scalar_mul_programs.values())
+        + list(_runtime.packed_sqrt_programs.values())
         + list(_runtime.packed_broadcast_mul_programs.values())
+        + list(_runtime.packed_mul_programs.values())
+        + list(_runtime.packed_lerp_programs.values())
+        + list(_runtime.packed_addcmul_programs.values())
+        + list(_runtime.packed_addcdiv_programs.values())
         + list(_runtime.packed_sigmoid_programs.values()) + list(_runtime.scalar_add_programs.values())
         + list(_runtime.mean_programs.values())
         + list(_runtime.stack_programs.values()) + list(_runtime.fill_programs.values())
+        + list(_runtime.broadcast_programs.values())
         + list(_runtime.cat_programs.values()) + list(_runtime.cat_dim0_2d_programs.values())
         + list(_runtime.cat_lastdim_programs.values()) + list(_runtime.cat_dim1_3d_programs.values())
         + list(_runtime.maxpool_programs.values()) + list(_runtime.upsample_programs.values())
@@ -280,11 +404,28 @@ def shutdown() -> None:
     ):
         gm.glDeleteProgram(program)
     gm.glDeleteFramebuffers(1, ctypes.byref(_runtime.fbo))
-    gm.sdl.SDL_GL_DeleteContext(_runtime.context)
-    gm.sdl.SDL_DestroyWindow(_runtime.window)
-    gm.sdl.SDL_Quit()
-    _runtime = None
-    _adapter_preference = None
+def shutdown() -> None:
+    """Release runtime GL objects while owning the shared context."""
+    global _runtime, _adapter_preference
+    rt = _runtime
+    if rt is None:
+        return
+    try:
+        with gl_execution_context():
+            _shutdown_impl()
+    finally:
+        # The context manager must unbind while the SDL context and window
+        # still exist.  SDL teardown therefore happens only after its scope
+        # has exited, even when GL cleanup raised an exception.
+        if rt.context:
+            gm.sdl.SDL_GL_DeleteContext(rt.context)
+            rt.context = 0
+        if rt.window:
+            gm.sdl.SDL_DestroyWindow(rt.window)
+            rt.window = 0
+        gm.sdl.SDL_Quit()
+        _runtime = None
+        _adapter_preference = None
     from ... import audit
     audit.summary()
 

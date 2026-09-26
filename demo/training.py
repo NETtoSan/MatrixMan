@@ -1,10 +1,19 @@
+import argparse
 import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+
+from drivers import matrixman
+from drivers.matrixman.tensor import MatrixManTensor, readback_tensor
 
 
 def render_bouncing_ball(width, step):
@@ -101,7 +110,12 @@ class MNISTCNN(nn.Module):
         return self.classifier(self.pool(self.features(x)))
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+parser = argparse.ArgumentParser(description="Train the MatrixMan MNIST model")
+parser.add_argument("--epochs", type=int, default=50)
+parser.add_argument("--train-samples", type=int, default=None)
+parser.add_argument("--test-samples", type=int, default=None)
+parser.add_argument("--batch-size", type=int, default=128)
+args = parser.parse_args()
 
 transform = transforms.ToTensor()
 
@@ -120,21 +134,29 @@ test_dataset = datasets.MNIST(
 )
 
 train_loader = DataLoader(
-    train_dataset,
-    batch_size=128,
+    train_dataset if args.train_samples is None else torch.utils.data.Subset(
+        train_dataset, range(min(args.train_samples, len(train_dataset)))
+    ),
+    batch_size=args.batch_size,
     shuffle=True,
 )
 
 test_loader = DataLoader(
-    test_dataset,
+    test_dataset if args.test_samples is None else torch.utils.data.Subset(
+        test_dataset, range(min(args.test_samples, len(test_dataset)))
+    ),
     batch_size=256,
     shuffle=False,
 )
 
 image_shape = tuple(int(value) for value in train_dataset[0][0].shape)
-#model = MNISTCNN(image_shape=image_shape, num_classes=10).to(device)
+# model = MNISTCNN(image_shape=image_shape, num_classes=10)
 
-model = MNISTMLP().to(device)
+model = MNISTMLP()
+
+matrixman.config.backend = "opengl"
+matrixman.init()
+model = matrixman.prepare(model, backend="opengl", training=True)
 
 
 criterion = nn.CrossEntropyLoss()
@@ -144,74 +166,94 @@ optimizer = optim.Adam(
     lr=1e-3,
 )
 
-epochs = 50
+epochs = args.epochs
 
-for epoch in range(epochs):
-    model.train()
 
-    running_loss = 0.0
-    running_correct = 0
-    running_total = 0
+def _cpu_value(value, reason):
+    if isinstance(value, MatrixManTensor):
+        return readback_tensor(value, audit_reason=reason)
+    return value.detach().cpu()
 
-    total_batches = len(train_loader)
-    for batch_index, (images, labels) in enumerate(train_loader, start=1):
-        images = images.to(device)
-        labels = labels.to(device)
 
-        optimizer.zero_grad()
+def _cpu_state_dict(module):
+    """Read GPU-authoritative parameters for an explicit CPU serialization boundary."""
+    return {
+        name: _cpu_value(value, f"training serialization: {name}").clone()
+        for name, value in module.state_dict().items()
+    }
 
-        outputs = model(images)
+try:
+    for epoch in range(epochs):
+        model.train()
 
-        loss = criterion(outputs, labels)
+        running_loss = 0.0
+        running_correct = 0
+        running_total = 0
 
-        loss.backward()
-        optimizer.step()
+        total_batches = len(train_loader)
+        for batch_index, (images_cpu, labels_cpu) in enumerate(train_loader, start=1):
+            images = matrixman.to_device(images_cpu)
+            labels = matrixman.to_device(labels_cpu)
+            if labels.dtype != torch.int64:
+                raise RuntimeError(f"MatrixMan labels lost int64 dtype: {labels.dtype}")
 
-        running_loss += loss.item()
-        running_correct += (outputs.argmax(dim=1) == labels).sum().item()
-        running_total += labels.size(0)
-        show_train_status(
-            epoch + 1,
-            epochs,
-            batch_index,
-            total_batches,
-            running_loss / batch_index,
-            100.0 * running_correct / running_total if running_total else None,
-        )
-
-    if sys.stdout.isatty():
-        print()
-
-    avg_loss = running_loss / len(train_loader)
-
-    model.eval()
-
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            optimizer.zero_grad()
 
             outputs = model(images)
 
-            predictions = outputs.argmax(dim=1)
+            loss = criterion(outputs, labels)
 
-            total += labels.size(0)
-            correct += (predictions == labels).sum().item()
+            loss.backward()
+            optimizer.step()
 
-    accuracy = 100.0 * correct / total
+            loss_cpu = _cpu_value(loss, "training loss metric")
+            logits_cpu = _cpu_value(outputs, "training logits metric")
+            running_loss += float(loss_cpu.item())
+            running_correct += int((logits_cpu.argmax(dim=1) == labels_cpu).sum().item())
+            running_total += int(labels_cpu.numel())
+            show_train_status(
+                epoch + 1,
+                epochs,
+                batch_index,
+                total_batches,
+                running_loss / batch_index,
+                100.0 * running_correct / running_total if running_total else None,
+            )
 
-    print(
-        f"Epoch {epoch + 1}/{epochs} "
-        f"loss={avg_loss:.4f} "
-        f"accuracy={accuracy:.2f}%"
-    )
+        if sys.stdout.isatty():
+            print()
 
-torch.save(
-    model.state_dict(),
-    "./demo/models/mnist_cnn.pth",
-)
+        avg_loss = running_loss / len(train_loader)
+
+        model.eval()
+
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for images_cpu, labels_cpu in test_loader:
+                images = matrixman.to_device(images_cpu)
+                labels = matrixman.to_device(labels_cpu)
+                if labels.dtype != torch.int64:
+                    raise RuntimeError(f"MatrixMan labels lost int64 dtype: {labels.dtype}")
+
+                outputs = model(images)
+
+                predictions = _cpu_value(outputs, "evaluation logits metric").argmax(dim=1)
+
+                total += int(labels_cpu.numel())
+                correct += int((predictions == labels_cpu).sum().item())
+
+        accuracy = 100.0 * correct / total
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} "
+            f"loss={avg_loss:.4f} "
+            f"accuracy={accuracy:.2f}%"
+        )
+
+    torch.save(_cpu_state_dict(model), "./demo/models/mnist_cnn.pth")
+finally:
+    matrixman.shutdown()
 
 print("Saved mnist_cnn.pth")

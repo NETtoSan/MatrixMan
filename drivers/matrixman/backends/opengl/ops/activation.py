@@ -176,7 +176,7 @@ void main()
         source = source.replace(name, str(value))
     return source.encode("ascii")
 
-def _render_silu_inplace(args) -> "MatrixManTensor":
+def _render_silu_inplace_unguarded(args) -> "MatrixManTensor":
     input_tensor = args[0]
     if not isinstance(input_tensor, MatrixManTensor):
         raise RuntimeError("gm45 silu_ requires a MatrixManTensor input")
@@ -206,9 +206,36 @@ def _render_silu_inplace(args) -> "MatrixManTensor":
     )
 
     operation_context.attach_output(out_owner)
-    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
+    status = int(gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER))
+    framebuffer_error = int(gm.glGetError())
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
-        raise RuntimeError(f"gm45 SiLU framebuffer incomplete: 0x{status:04x}")
+        try:
+            current_context = gm.sdl.SDL_GL_GetCurrentContext()
+        except Exception as exc:
+            current_context = f"<query failed: {exc}>"
+        try:
+            from .. import runtime
+            expected_context = getattr(runtime._runtime, "context", None)
+            fbo = getattr(runtime._runtime, "fbo", None)
+            fbo_id = getattr(fbo, "value", fbo)
+        except Exception:
+            expected_context = None
+            fbo_id = None
+
+        def _gl_text(value):
+            return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+        raise RuntimeError(
+            "gm45 SiLU framebuffer incomplete: "
+            f"status=0x{status:04x} expected=0x{gm.GL_FRAMEBUFFER_COMPLETE:04x} "
+            f"gl_error_after_status=0x{framebuffer_error:04x} "
+            f"current_context={current_context!r} expected_context={expected_context!r} "
+            f"fbo={fbo_id!r} output_texture={out_owner.texture} "
+            f"texture_size={out_owner.layout.texture_width}x{out_owner.layout.texture_height} "
+            f"renderer={_gl_text(gm.glGetString(0x1F01))!r} "
+            f"GL_VERSION={_gl_text(gm.glGetString(0x1F02))!r} "
+            f"GLSL_VERSION={_gl_text(gm.glGetString(0x8B8C))!r}"
+        )
 
     gm.glUseProgram(program)
     gm.glActiveTexture(gm.GL_TEXTURE0)
@@ -226,6 +253,16 @@ def _render_silu_inplace(args) -> "MatrixManTensor":
     input_tensor._shape = shape
     input_tensor._storage_offset = 0
     return input_tensor
+
+
+def _render_silu_inplace(args) -> "MatrixManTensor":
+    """Render SiLU while owning MatrixMan's shared OpenGL context."""
+    from .. import runtime
+
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _render_silu_inplace_unguarded(args)
+    return _render_silu_inplace_unguarded(args)
 
 
 def _relu_program(params: tuple) -> tuple[int, int]:
@@ -353,3 +390,144 @@ def _render_relu_inplace(args) -> "MatrixManTensor":
 
 def _render_relu_functional(args) -> "MatrixManTensor":
     return _render_relu(args[0], inplace=False)
+
+
+def _threshold_backward_program(params: tuple) -> tuple[int, int, int]:
+    rt = operation_context.gl_runtime()
+    if params not in rt.threshold_backward_programs:
+        diagnostics.trace(f"gm45.compile -> threshold backward GLSL fragment shader params={params}")
+        program = gm.make_program(_threshold_backward_shader_source(params))
+        rt.threshold_backward_programs[params] = program
+        rt.threshold_backward_uniforms[params] = (
+            gm.glGetUniformLocation(program, b"grad_tex"),
+            gm.glGetUniformLocation(program, b"self_tex"),
+        )
+    grad_loc, self_loc = rt.threshold_backward_uniforms[params]
+    return rt.threshold_backward_programs[params], grad_loc, self_loc
+
+
+def _threshold_backward_shader_source(params: tuple) -> bytes:
+    (
+        shape, grad_offset, grad_strides, grad_tex_w, grad_tex_h,
+        self_offset, self_strides, self_tex_w, self_tex_h, out_tex_w, threshold,
+    ) = params
+    shape = tuple(int(value) for value in shape)
+    grad_terms = []
+    self_terms = []
+    for axis, size in enumerate(shape):
+        suffix = numel(shape[axis + 1:])
+        coordinate = (
+            f"((out_index / {max(1, suffix)}) - "
+            f"(out_index / {max(1, suffix * size)}) * {size})"
+        )
+        grad_terms.append(f"({coordinate}) * {int(grad_strides[axis])}")
+        self_terms.append(f"({coordinate}) * {int(self_strides[axis])}")
+    grad_index = " + ".join(grad_terms) or "0"
+    self_index = " + ".join(self_terms) or "0"
+    source = """
+#version 120
+uniform sampler2D grad_tex;
+uniform sampler2D self_tex;
+
+float pick_component(vec4 value, int component)
+{
+    if (component == 0) return value.r;
+    if (component == 1) return value.g;
+    if (component == 2) return value.b;
+    return value.a;
+}
+
+float read_packed(sampler2D tex, int linear_index, int tex_width, int tex_height)
+{
+    int texel = linear_index / 4;
+    int component = linear_index - texel * 4;
+    int x = texel - (texel / tex_width) * tex_width;
+    int y = texel / tex_width;
+    vec2 uv = (vec2(float(x), float(y)) + vec2(0.5, 0.5)) /
+              vec2(float(tex_width), float(tex_height));
+    return pick_component(texture2D(tex, uv), component);
+}
+
+float threshold_backward_at(int out_index)
+{
+    if (out_index >= OUT_NUMEL) return 0.0;
+    int grad_index = GRAD_OFFSET + __GRAD_INDEX__;
+    int self_index = SELF_OFFSET + __SELF_INDEX__;
+    float x = read_packed(self_tex, self_index, SELF_TEX_W, SELF_TEX_H);
+    float g = read_packed(grad_tex, grad_index, GRAD_TEX_W, GRAD_TEX_H);
+    return x > THRESHOLD ? g : 0.0;
+}
+
+void main()
+{
+    int tex_x = int(floor(gl_FragCoord.x));
+    int tex_y = int(floor(gl_FragCoord.y));
+    int base = (tex_y * OUT_TEX_W + tex_x) * 4;
+    gl_FragColor = vec4(
+        threshold_backward_at(base),
+        threshold_backward_at(base + 1),
+        threshold_backward_at(base + 2),
+        threshold_backward_at(base + 3)
+    );
+}
+"""
+    replacements = {
+        "OUT_NUMEL": numel(shape),
+        "GRAD_OFFSET": grad_offset,
+        "SELF_OFFSET": self_offset,
+        "GRAD_TEX_W": grad_tex_w,
+        "GRAD_TEX_H": grad_tex_h,
+        "SELF_TEX_W": self_tex_w,
+        "SELF_TEX_H": self_tex_h,
+        "OUT_TEX_W": out_tex_w,
+        "THRESHOLD": kernels.glsl_float(threshold),
+        "__GRAD_INDEX__": grad_index,
+        "__SELF_INDEX__": self_index,
+    }
+    for name, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        source = source.replace(name, str(value))
+    return source.encode("ascii")
+
+
+def _render_threshold_backward(args) -> "MatrixManTensor":
+    if len(args) < 3:
+        raise RuntimeError("gm45 threshold_backward requires grad_output, self, and threshold")
+    grad_output, self_tensor, threshold = args[:3]
+    if not isinstance(grad_output, MatrixManTensor) or not isinstance(self_tensor, MatrixManTensor):
+        raise RuntimeError("gm45 threshold_backward requires MatrixManTensor operands")
+    if grad_output.dtype != torch.float32 or self_tensor.dtype != torch.float32:
+        raise RuntimeError("gm45 threshold_backward supports only float32")
+    if grad_output.shape != self_tensor.shape:
+        raise RuntimeError("gm45 threshold_backward requires equal shapes")
+    if grad_output._owner.layout.kind != "packed_rgba" or self_tensor._owner.layout.kind != "packed_rgba":
+        raise RuntimeError("gm45 threshold_backward requires packed_rgba input storage")
+    if isinstance(threshold, torch.Tensor):
+        if threshold.device.type != "cpu" or threshold.numel() != 1:
+            raise RuntimeError("gm45 threshold_backward threshold must be a numeric scalar")
+        threshold = threshold.item()
+    if not isinstance(threshold, (int, float)):
+        raise RuntimeError("gm45 threshold_backward threshold must be a numeric scalar")
+    shape = tuple(int(value) for value in grad_output.shape)
+    if numel(shape) <= 0:
+        raise RuntimeError("gm45 threshold_backward does not support empty tensors")
+    out_owner = operation_context.output_texture(shape or (1,))
+    params = (
+        shape, grad_output._storage_offset, grad_output._logical_strides,
+        grad_output._owner.layout.texture_width, grad_output._owner.layout.texture_height,
+        self_tensor._storage_offset, self_tensor._logical_strides,
+        self_tensor._owner.layout.texture_width, self_tensor._owner.layout.texture_height,
+        out_owner.layout.texture_width, float(threshold),
+    )
+    program, grad_loc, self_loc = _threshold_backward_program(params)
+    operation_context.attach_output(out_owner)
+    operation_context.framebuffer_complete("gm45 threshold_backward framebuffer incomplete")
+    gm.glUseProgram(program)
+    for unit, tensor, uniform in ((gm.GL_TEXTURE0, grad_output, grad_loc), (gm.GL_TEXTURE1, self_tensor, self_loc)):
+        gm.glActiveTexture(unit)
+        gm.glBindTexture(gm.GL_TEXTURE_2D, tensor._owner.texture)
+        gm.glUniform1i(uniform, unit - gm.GL_TEXTURE0)
+    operation_context.draw_fullscreen_quad()
+    err = gm.glGetError()
+    if err:
+        raise RuntimeError(f"gm45 OpenGL error after threshold_backward: 0x{err:04x}")
+    return MatrixManTensor._from_owner(out_owner, shape)

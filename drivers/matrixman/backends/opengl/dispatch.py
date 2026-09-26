@@ -9,11 +9,12 @@ import torch
 from . import convolution, diagnostics, metadata, profiling
 from . import tensor as tensor_module
 from . import operation_context
-from .ops import activation, arithmetic, concat, matmul, normalization, pooling, reduction, resize, softmax
+from .ops import activation, arithmetic, broadcast, concat, matmul, nll_loss, normalization, pooling, reduction, resize, softmax
 from .storage import numel
 from ...tensor import MatrixManTensor
 
 _render_packed_sub = arithmetic._render_packed_sub
+_render_packed_mul = arithmetic._render_packed_mul
 _render_packed_broadcast_mul = arithmetic._render_packed_broadcast_mul
 _render_packed_scalar_div = arithmetic._render_packed_scalar_div
 _render_packed_sigmoid = activation._render_packed_sigmoid
@@ -21,13 +22,17 @@ _render_batch_norm = normalization._render_batch_norm
 _render_silu_inplace = activation._render_silu_inplace
 _render_relu_inplace = activation._render_relu_inplace
 _render_relu_functional = activation._render_relu_functional
+_render_threshold_backward = activation._render_threshold_backward
 _metadata_split = metadata.metadata_split
 _render_cat = concat._render_cat
 _render_stack = concat._render_stack
 _render_fill_scalar = concat._render_fill_scalar
+_render_ones_like = concat.render_ones_like
+_render_zeros_like = concat.render_zeros_like
 _render_max_pool2d_with_indices = pooling._render_max_pool2d_with_indices
 _render_upsample_nearest2d = resize.render_upsample_nearest2d
 _render_softmax = softmax._render_softmax
+_render_logsoftmax = softmax._render_logsoftmax
 _read_texture = tensor_module.readback_tensor
 _metadata_view = metadata.metadata_view
 _normalize_shape = metadata.normalize_shape
@@ -110,8 +115,13 @@ def _render_add_inplace(left, right, alpha: float) -> MatrixManTensor:
     return left
 
 
+def _render_scalar_add_inplace(tensor, scalar: float, alpha: float) -> MatrixManTensor:
+    result = arithmetic._render_scalar_add(tensor, scalar, alpha, tensor_first=True)
+    return arithmetic._replace_inplace_tensor(tensor, result)
+
+
 @profiling.dispatch_timer
-def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
+def _handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         _trace(f"torch_dispatch -> {func}")
 
@@ -133,9 +143,40 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             alpha = kwargs.get("alpha", args[2] if len(args) > 2 else 1)
             if isinstance(alpha, torch.Tensor):
                 raise RuntimeError("gm45 add_ alpha must be a Python scalar")
-            if len(args) < 2 or not isinstance(args[0], MatrixManTensor) or not isinstance(args[1], MatrixManTensor):
-                raise RuntimeError("gm45 add_ currently requires two MatrixManTensor operands")
+            if len(args) < 2 or not isinstance(args[0], MatrixManTensor):
+                raise RuntimeError("gm45 add_ currently requires a MatrixManTensor self")
+            if _is_scalar_operand(args[1]):
+                return _render_scalar_add_inplace(
+                    args[0], _scalar_value(args[1]), float(alpha)
+                )
+            if not isinstance(args[1], MatrixManTensor):
+                raise RuntimeError("gm45 add_ requires a MatrixManTensor or supported scalar operand")
             return _render_add_inplace(args[0], args[1], float(alpha))
+
+        if func is torch.ops.aten.add_.Scalar:
+            _kernel_log("Add_")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed scalar add kernel with logical in-place wrapper update")
+            if len(args) < 2 or not isinstance(args[0], MatrixManTensor):
+                raise RuntimeError("gm45 add_.Scalar requires a MatrixManTensor self")
+            alpha = kwargs.get("alpha", args[2] if len(args) > 2 else 1)
+            if isinstance(alpha, torch.Tensor):
+                raise RuntimeError("gm45 add_.Scalar alpha must be a Python scalar")
+            if not _is_scalar_operand(args[1]):
+                raise RuntimeError("gm45 add_.Scalar requires a supported scalar operand")
+            return _render_scalar_add_inplace(
+                args[0], _scalar_value(args[1]), float(alpha)
+            )
+
+        if func is torch.ops.aten.lerp_.Scalar:
+            _kernel_log("Lerp_")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed lerp_ kernel with logical in-place wrapper update")
+            if len(args) < 3 or not isinstance(args[0], MatrixManTensor) or not isinstance(args[1], MatrixManTensor):
+                raise RuntimeError("gm45 lerp_ currently requires two MatrixManTensor operands")
+            if isinstance(args[2], torch.Tensor):
+                raise RuntimeError("gm45 lerp_ weight must be a Python scalar")
+            return arithmetic._render_packed_lerp_inplace(args[0], args[1], float(args[2]))
 
         if func is torch.ops.aten.mean.dim:
             _kernel_log("Mean")
@@ -144,23 +185,107 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             _trace("  -> GLSL fragment shader arithmetic: sum(reduced values) / reduction_count")
             return reduction.render_mean_dim(args, kwargs)
 
+        if func is torch.ops.aten.mean.default:
+            _kernel_log("Mean")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL generic packed mean reduction")
+            _trace("  -> GLSL fragment shader arithmetic: sum(all values) / reduction_count")
+            return reduction.render_mean_default(args, kwargs)
+
+        if func is torch.ops.aten.sum.default:
+            _kernel_log("Sum")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL generic packed sum reduction")
+            _trace("  -> GLSL fragment shader arithmetic: sum(reduced values)")
+            return reduction.render_sum_default(args, kwargs)
+
+        if func is torch.ops.aten.sum.dim_IntList:
+            _kernel_log("Sum")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL generic packed sum reduction")
+            _trace("  -> GLSL fragment shader arithmetic: sum(reduced values)")
+            return reduction.render_sum_dim(args, kwargs)
+
+        if func is torch.ops.aten.ones_like.default:
+            _kernel_log("OnesLike")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed ones_like fill kernel")
+            _trace("  -> GLSL fragment shader write: out = 1.0")
+            return _render_ones_like(args, kwargs)
+
+        if func is torch.ops.aten.zeros_like.default:
+            _kernel_log("ZerosLike")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed zeros_like fill kernel")
+            _trace("  -> GLSL fragment shader write: out = 0.0")
+            return _render_zeros_like(args, kwargs)
+
         if func is torch.ops.aten.sub.Tensor:
             _kernel_log("Sub")
             _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL packed sub kernel")
-            _trace("  -> GLSL fragment shader arithmetic: out = left - right")
+            _trace("  -> GLSL fragment shader arithmetic: out = left - alpha * right")
             if len(args) < 2 or not isinstance(args[0], MatrixManTensor) or not isinstance(args[1], MatrixManTensor):
                 raise RuntimeError("gm45 sub currently requires two MatrixManTensor operands")
-            return _render_packed_sub(args[0], args[1])
+            alpha = kwargs.get("alpha", args[2] if len(args) > 2 else 1)
+            if isinstance(alpha, torch.Tensor):
+                raise RuntimeError("gm45 sub alpha must be a Python scalar")
+            return _render_packed_sub(args[0], args[1], float(alpha))
 
         if func is torch.ops.aten.mul.Tensor:
             _kernel_log("Mul")
             _trace("  -> MatrixManTensor.__torch_dispatch__")
-            _trace("  -> MatrixMan/OpenGL packed broadcast mul kernel")
+            _trace("  -> MatrixMan/OpenGL packed elementwise mul kernel")
             _trace("  -> GLSL fragment shader arithmetic: out = lhs * rhs")
             if len(args) < 2 or not isinstance(args[0], MatrixManTensor) or not isinstance(args[1], MatrixManTensor):
                 raise RuntimeError("gm45 mul currently requires two MatrixManTensor operands")
-            return _render_packed_broadcast_mul(args[0], args[1])
+            left, right = args[0], args[1]
+            if left.shape == right.shape:
+                return _render_packed_mul(left, right)
+            return _render_packed_broadcast_mul(left, right)
+
+        if func is torch.ops.aten.mul_.Tensor:
+            _kernel_log("Mul_")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed in-place multiplication kernel")
+            if len(args) < 2 or not isinstance(args[0], MatrixManTensor):
+                raise RuntimeError("gm45 mul_ currently requires a MatrixManTensor self")
+            self_tensor, other = args[0], args[1]
+            if isinstance(other, MatrixManTensor):
+                result = _render_packed_mul(self_tensor, other)
+            elif _is_scalar_operand(other):
+                result = arithmetic._render_packed_scalar_mul(
+                    self_tensor, _scalar_value(other)
+                )
+            else:
+                raise RuntimeError("gm45 mul_ requires a MatrixManTensor or supported scalar tensor operand")
+            return arithmetic._replace_inplace_tensor(self_tensor, result)
+
+        if func is torch.ops.aten.addcmul_.default:
+            _kernel_log("Addcmul_")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL fused packed addcmul_ kernel")
+            if len(args) < 3 or not all(isinstance(args[index], MatrixManTensor) for index in range(3)):
+                raise RuntimeError("gm45 addcmul_ currently requires three MatrixManTensor operands")
+            value = kwargs.get("value", 1)
+            if isinstance(value, torch.Tensor):
+                raise RuntimeError("gm45 addcmul_ value must be a Python scalar")
+            return arithmetic._render_packed_addcmul_inplace(
+                args[0], args[1], args[2], float(value)
+            )
+
+        if func is torch.ops.aten.addcdiv_.default:
+            _kernel_log("Addcdiv_")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL fused packed addcdiv_ kernel")
+            if len(args) < 3 or not all(isinstance(args[index], MatrixManTensor) for index in range(3)):
+                raise RuntimeError("gm45 addcdiv_ currently requires three MatrixManTensor operands")
+            value = kwargs.get("value", 1)
+            if isinstance(value, torch.Tensor):
+                raise RuntimeError("gm45 addcdiv_ value must be a Python scalar")
+            return arithmetic._render_packed_addcdiv_inplace(
+                args[0], args[1], args[2], float(value)
+            )
 
         if func is torch.ops.aten.sigmoid.default:
             _kernel_log("Sigmoid")
@@ -171,7 +296,13 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
                 raise RuntimeError("gm45 sigmoid requires a MatrixManTensor input")
             return _render_packed_sigmoid(args[0])
 
-        if func is torch.ops.aten.div.Tensor:
+        if func is torch.ops.aten.sqrt.default:
+            _kernel_log("Sqrt")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed sqrt kernel")
+            return arithmetic._render_packed_sqrt(args[0])
+
+        if func is torch.ops.aten.div.Tensor or func is torch.ops.aten.div.Scalar:
             _kernel_log("Div")
             _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> MatrixMan/OpenGL packed scalar div kernel")
@@ -242,6 +373,13 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             _trace("  -> MatrixMan/OpenGL ReLU kernel")
             _trace("  -> GLSL fragment shader arithmetic: max(x, 0.0)")
             return _render_relu_functional(args)
+
+        if func is torch.ops.aten.threshold_backward.default:
+            _kernel_log("ThresholdBackward")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL packed threshold backward kernel")
+            _trace("  -> GLSL fragment shader: (self > threshold) ? grad_output : 0.0")
+            return _render_threshold_backward(args)
 
         if func is torch.ops.aten.split.Tensor:
             _trace("  -> MatrixManTensor.__torch_dispatch__")
@@ -316,6 +454,30 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             _trace("  -> GLSL fragment shader arithmetic: stable 16-bin max/exp/sum/normalize")
             return _render_softmax(args)
 
+        if func is torch.ops.aten._log_softmax.default:
+            _kernel_log("LogSoftmax")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL generic numerically stable log-softmax kernel")
+            return _render_logsoftmax(args)
+
+        if func is torch.ops.aten._log_softmax_backward_data.default:
+            _kernel_log("LogSoftmaxBackward")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL stable log-softmax backward reduction kernel")
+            return softmax._render_logsoftmax_backward(args)
+
+        if func is torch.ops.aten.nll_loss_forward.default:
+            _kernel_log("NLLLoss")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL GPU class-index gather and NLL reduction")
+            return nll_loss._render(args)
+
+        if func is torch.ops.aten.nll_loss_backward.default:
+            _kernel_log("NLLLossBackward")
+            _trace("  -> MatrixManTensor.__torch_dispatch__")
+            _trace("  -> MatrixMan/OpenGL GPU indexed NLL gradient kernel")
+            return nll_loss._render_backward(args)
+
         if func is torch.ops.aten._to_copy.default:
             _trace("  -> MatrixManTensor.__torch_dispatch__")
             _trace("  -> explicit GPU-to-CPU transfer requested")
@@ -323,9 +485,12 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             target_dtype = kwargs.get("dtype")
             if target_device is not None and torch.device(target_device).type != "cpu":
                 raise RuntimeError("gm45 only supports transfer from gm45 to CPU")
-            if target_dtype is not None and target_dtype != torch.float32:
-                raise RuntimeError("gm45 only supports float32 CPU readback")
-            return _read_texture(args[0]._owner, args[0]._shape, args[0]._storage_offset, args[0]._logical_strides)
+            if target_dtype is not None and target_dtype not in {torch.float32, torch.int64}:
+                raise RuntimeError("gm45 CPU readback supports float32 and int64 only")
+            result = _read_texture(args[0]._owner, args[0]._shape, args[0]._storage_offset, args[0]._logical_strides)
+            if args[0].dtype == torch.int64:
+                result = result.to(dtype=torch.int64)
+            return result
 
         if func is torch.ops.aten.detach.default:
             return args[0]
@@ -367,7 +532,12 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             return _metadata_call(_metadata_unsqueeze, tensor_arg, int(args[1]))
 
         if func is torch.ops.aten.expand.default:
-            return _metadata_call(_metadata_expand, args, kwargs)
+            _trace("  -> MatrixMan/OpenGL packed broadcast expand kernel")
+            return broadcast.render_expand(args, kwargs)
+
+        if func is torch.ops.aten.t.default:
+            _trace("  -> MatrixMan/OpenGL packed transpose kernel")
+            return broadcast.render_transpose(args)
 
         if func is torch.ops.aten.transpose.int:
             return _metadata_call(_metadata_transpose, args)
@@ -391,6 +561,21 @@ def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
             "Conv2D, eval BatchNorm, SiLU_, max_pool2d values, nearest upsample, "
             "float32 arange, and fixed-bin channel softmax."
         )
+
+
+def handle_torch_dispatch(cls, func, types, args=(), kwargs=None):
+    """Dispatch one operator while owning the shared OpenGL context."""
+    with operation_context.gl_execution_context():
+        # Prepared Conv outputs may need to be rendered before this operator
+        # consumes them.  Keep that materialization inside the same context
+        # scope as the consuming operation; otherwise the explicit context
+        # handoff can leave FBO setup running with no current SDL context.
+        if func not in {
+            torch.ops.aten.native_batch_norm.default,
+            torch.ops.aten.silu_.default,
+        }:
+            materialize_pending_args(args)
+        return _handle_torch_dispatch(cls, func, types, args, kwargs)
 
 
 

@@ -116,6 +116,13 @@ def to_device(data):
     return tensor(data)
 
 
+def raw_texture(data):
+    """Return the physical OpenGL texture backing a MatrixMan tensor."""
+    from .tensor import raw_texture as _raw_texture
+
+    return _raw_texture(data)
+
+
 def prefer(name: str):
     """Set backend preference before first use; reject unsafe live switches."""
     requested = str(name).strip().lower()
@@ -172,7 +179,7 @@ def install_tensor_method() -> None:
     _install_tensor_method()
 
 
-def set_trace(enabled: bool = True) -> None:
+def set_trace(enabled: bool | str = True) -> None:
     _require_opengl_frontend("set_trace").set_trace(enabled)
 
 

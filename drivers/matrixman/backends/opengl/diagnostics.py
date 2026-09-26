@@ -8,7 +8,7 @@ import torch
 
 from ...config import config, set_trace as _set_trace
 from ...config import trace_enabled as _trace_enabled
-from ...config import trace_log
+from ...config import detailed_trace_log, trace_log
 from ...tensor import MatrixManTensor
 
 
@@ -16,7 +16,7 @@ unsupported_counts: Counter[str] = Counter()
 unsupported_examples: dict[str, list[dict]] = defaultdict(list)
 
 
-def set_trace(enabled: bool = True) -> None:
+def set_trace(enabled: bool | str = True) -> None:
     _set_trace(enabled)
 
 
@@ -27,8 +27,23 @@ def debug_enabled() -> bool:
 
 
 def trace(message: str) -> None:
-    #trace_log(f"    {message}")
-    pass
+    detailed_trace_log(f"    {message}")
+
+
+def residency_event(event: str, *, op=None, value=None, args=(), kwargs=None) -> None:
+    """Print metadata-only host/OpenGL residency transitions when requested."""
+    if not config.residencyTrace:
+        return
+    details = []
+    if op is not None:
+        details.append(f"op={op}")
+    if args:
+        details.append(f"args={summarize_dispatch_value(args)}")
+    if kwargs:
+        details.append(f"kwargs={summarize_dispatch_value(kwargs)}")
+    if value is not None:
+        details.append(f"result={summarize_dispatch_value(value)}")
+    print(f"[MatrixMan/Residency] {event} " + " ".join(details))
 
 def kernel_log(message: str) -> None:
 

@@ -5,11 +5,26 @@ from __future__ import annotations
 import time
 import warnings
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 
 
 PRIVATEUSE_DEVICE = torch.device("privateuseone:0")
+
+
+@dataclass(frozen=True)
+class RawTexture:
+    """The physical RGBA32F storage of a MatrixMan/OpenGL tensor."""
+
+    values: object
+    texture_id: int
+    width: int
+    height: int
+    format: str
+    logical_shape: tuple[int, ...]
+    storage_offset: int
+    backend: str = "opengl"
 
 
 def numel(shape: tuple[int, ...]) -> int:
@@ -62,6 +77,12 @@ def readback_tensor(tensor: "MatrixManTensor", *, audit_op: str | None = None, a
     """Explicitly copy a MatrixMan tensor to an ordinary CPU tensor."""
     if not isinstance(tensor, MatrixManTensor):
         raise TypeError("MatrixMan CPU readback requires a MatrixManTensor")
+    if getattr(tensor, "_pending_convolution", None) is not None:
+        # Explicit readback is a real consumption boundary.  Materialize any
+        # deferred OpenGL work before reading the reserved owner texture.
+        from .backends.opengl import convolution
+
+        convolution.materialize_pending(tensor)
     from . import audit
     audit.record(
         "explicit_cpu_transfer" if audit_op else "explicit_readback",
@@ -69,9 +90,9 @@ def readback_tensor(tensor: "MatrixManTensor", *, audit_op: str | None = None, a
         tensor=tensor,
         reason=audit_reason,
     )
-    if tensor.dtype != torch.float32:
+    if tensor.dtype not in {torch.float32, torch.int64}:
         raise NotImplementedError(
-            f"MatrixMan CPU readback supports float32 only, got {tensor.dtype}"
+            f"MatrixMan CPU readback supports float32 and int64 only, got {tensor.dtype}"
         )
 
     shape = tuple(int(value) for value in tensor.shape)
@@ -131,8 +152,39 @@ def readback_tensor(tensor: "MatrixManTensor", *, audit_op: str | None = None, a
         from .backends.opengl.tensor import readback_tensor as opengl_readback
 
         values = opengl_readback(owner, shape, offset, strides)
+        if getattr(owner, "dtype", torch.float32) == torch.int64:
+            values = values.to(dtype=torch.int64)
         return _cpu_layout_from_values(values, shape, strides, offset)
     raise RuntimeError(f"MatrixMan CPU readback cannot handle owner kind {owner.layout.kind!r}")
+
+
+def raw_texture(tensor: "MatrixManTensor") -> RawTexture:
+    """Read the complete physical RGBA32F owner texture without reshaping it."""
+    if not isinstance(tensor, MatrixManTensor):
+        raise TypeError("matrixman.raw_texture() requires a MatrixManTensor")
+    owner = tensor._owner
+    if owner.layout.kind != "packed_rgba":
+        raise RuntimeError(
+            "matrixman.raw_texture() requires canonical packed_rgba OpenGL storage; "
+            f"got {owner.layout.kind!r}"
+        )
+    if getattr(tensor, "_pending_convolution", None) is not None:
+        from .backends.opengl import convolution
+
+        convolution.materialize_pending(tensor)
+        owner = tensor._owner
+    from .backends.opengl.tensor import raw_texture as opengl_raw_texture
+
+    values = opengl_raw_texture(owner)
+    return RawTexture(
+        values=values,
+        texture_id=int(owner.texture),
+        width=int(owner.layout.texture_width),
+        height=int(owner.layout.texture_height),
+        format="RGBA32F",
+        logical_shape=tuple(int(value) for value in tensor.shape),
+        storage_offset=int(tensor._storage_offset),
+    )
 
 
 def infer_view_shape(input_shape, requested_shape) -> tuple[int, ...]:

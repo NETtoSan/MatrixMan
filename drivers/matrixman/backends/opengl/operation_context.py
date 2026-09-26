@@ -18,6 +18,10 @@ def gl_runtime():
     return runtime.runtime_required()
 
 
+def gl_execution_context():
+    return runtime.gl_execution_context()
+
+
 def output_texture(shape):
     """Allocate an empty packed logical output through the shared services."""
     shape = tuple(int(value) for value in shape)

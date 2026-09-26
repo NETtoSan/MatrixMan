@@ -585,6 +585,84 @@ def _render_fill_scalar(args) -> "MatrixManTensor":
     tensor._logical_strides = contiguous_strides(shape)
     return tensor
 
+
+def _render_like_fill(args, kwargs, value: float, operation_name: str) -> "MatrixManTensor":
+    """Create fresh packed storage filled with a scalar.
+
+    The source is used only for logical shape/options.  Its values and storage
+    offset are never read, so this is also suitable for ``zeros_like`` state
+    tensors created by optimizers.
+    """
+    if not args or not isinstance(args[0], MatrixManTensor):
+        raise RuntimeError(f"gm45 {operation_name} requires a MatrixManTensor input")
+    source = args[0]
+    kwargs = kwargs or {}
+
+    if source.dtype != torch.float32:
+        raise RuntimeError(f"gm45 {operation_name} supports only float32 MatrixManTensor inputs")
+    if source._owner.layout.kind != "packed_rgba":
+        raise RuntimeError(f"gm45 {operation_name} supports only packed_rgba input storage")
+
+    dtype = kwargs.get("dtype")
+    if dtype is not None and dtype != torch.float32:
+        raise RuntimeError(f"gm45 {operation_name} supports only float32 dtype, got {dtype}")
+    layout = kwargs.get("layout")
+    if layout is not None and layout != torch.strided:
+        raise RuntimeError(f"gm45 {operation_name} supports only strided layout, got {layout}")
+    device = kwargs.get("device")
+    if device is not None:
+        device = torch.device(device)
+        if device != source.device:
+            raise RuntimeError(f"gm45 {operation_name} cannot move from {source.device} to {device}")
+    if kwargs.get("pin_memory"):
+        raise RuntimeError(f"gm45 {operation_name} does not support pin_memory")
+    memory_format = kwargs.get("memory_format")
+    if memory_format not in {None, torch.contiguous_format, torch.preserve_format}:
+        raise RuntimeError(
+            f"gm45 {operation_name} supports only contiguous or preserve memory_format"
+        )
+
+    shape = tuple(int(value) for value in source.shape)
+    if numel(shape) <= 0:
+        raise RuntimeError(f"gm45 {operation_name} currently supports only non-empty tensors")
+    allocation_shape = shape if shape else (1,)
+    out_owner = operation_context.output_texture(allocation_shape)
+    params = (numel(shape), out_owner.layout.texture_width, float(value))
+    program = _fill_program(params)
+
+    diagnostics.trace(
+        f"gm45.kernel -> {operation_name} packed fill shader:\n"
+        f"  source shape={list(shape)} offset={source._storage_offset}\n"
+        f"  -> output texture #{out_owner.texture} shape={list(shape)} offset=0\n"
+        "  output is fresh contiguous packed_rgba storage"
+    )
+
+    operation_context.attach_output(out_owner)
+    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
+    if status != gm.GL_FRAMEBUFFER_COMPLETE:
+        raise RuntimeError(f"gm45 {operation_name} framebuffer incomplete: 0x{status:04x}")
+
+    gm.glUseProgram(program)
+    operation_context.draw_fullscreen_quad()
+    diagnostics.trace(
+        f"gm45.opengl -> submitted {operation_name} fullscreen quad, output texture #{out_owner.texture}"
+    )
+
+    err = gm.glGetError()
+    if err:
+        raise RuntimeError(f"gm45 OpenGL error after {operation_name}: 0x{err:04x}")
+    return MatrixManTensor._from_owner(out_owner, shape)
+
+
+def render_ones_like(args, kwargs) -> "MatrixManTensor":
+    """Create a contiguous GPU tensor filled with one."""
+    return _render_like_fill(args, kwargs, 1.0, "ones_like")
+
+
+def render_zeros_like(args, kwargs) -> "MatrixManTensor":
+    """Create a contiguous GPU tensor filled with zero."""
+    return _render_like_fill(args, kwargs, 0.0, "zeros_like")
+
 def _render_cat_dim1_3d(tensors: list["MatrixManTensor"], dim: int) -> "MatrixManTensor":
     if len(tensors) != 2 or dim != 1:
         raise RuntimeError("gm45 3D dim-1 cat currently supports exactly two inputs")

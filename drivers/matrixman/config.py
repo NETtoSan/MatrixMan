@@ -31,6 +31,7 @@ _DEFAULTS = {
     "diagTileHeight": None, "diagTileOrder": "normal",
     "diagConvWorkload": "heavy", "profile": False, "cudaProfile": False,
     "profileDetail": False, "profileDispatch": False, "gpuTiming": False, "trace": False,
+    "residencyTrace": False,
     "debug": False, "gpuPostprocess": False, "auditCpuLeaks": False,
     "unsafeScratchReuse": False, "debugFreshScratch": False, "scratchEpochPool": False,
     "debugClearReusedScratch": False,
@@ -55,7 +56,7 @@ _ENV_FIELDS = {
     "MATRIXMAN_PROFILE": "profile", "MATRIXMAN_CUDA_PROFILE": "cudaProfile",
     "MATRIXMAN_PROFILE_DETAIL": "profileDetail", "MATRIXMAN_PROFILE_DISPATCH": "profileDispatch",
     "MATRIXMAN_GPU_TIMING": "gpuTiming",
-    "MATRIXMAN_TRACE": "trace", "MATRIXMAN_DEBUG": "debug",
+    "MATRIXMAN_TRACE": "trace", "MATRIXMAN_TRACE_RESIDENCY": "residencyTrace", "MATRIXMAN_DEBUG": "debug",
     "MATRIXMAN_DEBUG_UNSAFE_SCRATCH_REUSE": "unsafeScratchReuse",
     "MATRIXMAN_DEBUG_FRESH_SCRATCH": "debugFreshScratch",
     "MATRIXMAN_SCRATCH_EPOCH_POOL": "scratchEpochPool",
@@ -68,7 +69,7 @@ _ENV_FIELDS = {
 }
 _BOOL_FIELDS = {
     "useDGPU", "convSpatialReuse", "preparedExecution", "convDiag", "skipPreConsolidationSync", "diagnosticTiles", "diagnosticRectTiles",
-    "profile", "cudaProfile", "profileDetail", "profileDispatch", "gpuTiming", "trace", "debug", "gpuPostprocess",
+    "profile", "cudaProfile", "profileDetail", "profileDispatch", "gpuTiming", "trace", "residencyTrace", "debug", "gpuPostprocess",
     "auditCpuLeaks", "unsafeScratchReuse", "debugFreshScratch", "scratchEpochPool", "debugClearReusedScratch", "cudaDebug", "cudaDisableAsyncQueue", "cudaDisableAllocPool",
     "cudaDisableSpecializedConv", "cudaLegacyModuleLoad", "tileAutotuneRefresh", "disableAutoPrepare",
 }
@@ -94,6 +95,7 @@ _SNAKE_ALIASES = {
     "profileDetail": "profile_detail",
     "profileDispatch": "profile_dispatch",
     "gpuTiming": "gpu_timing",
+    "residencyTrace": "residency_trace",
     "gpuPostprocess": "gpu_postprocess",
     "auditCpuLeaks": "audit_cpu_leaks",
     "unsafeScratchReuse": "unsafe_scratch_reuse",
@@ -123,7 +125,7 @@ _FIELD_DOCS = {
     "scratchPool": "Scratch texture reuse. Values: safe or deferred.",
     "profile": "Profiler report mode. Values: off, summary, detail, trace.",
     "profileDispatch": "Collect PyTorch-facing dispatch timing. bool.",
-    "trace": "Enables verbose live MatrixMan execution diagnostics. bool.",
+    "trace": "Enables concise live execution diagnostics, or detailed internal diagnostics.",
     "convDiag": "Enables the persistent OpenGL convolution diagnostics window. bool.",
     "gpuTiming": "Enables deferred OpenGL timer queries. bool.",
 }
@@ -135,7 +137,7 @@ _CANONICAL_BY_PUBLIC = {
     "scratch_policy": "scratchPolicy",
 }
 _DISPLAY_FIELDS = (
-    "backend", "profile", "trace", "syncPolicy", "activationPool", "scratchPool",
+    "backend", "profile", "trace", "residencyTrace", "syncPolicy", "activationPool", "scratchPool",
     "tileLimit", "tileSync", "scratchPolicy", "useDGPU", "convDiag",
     "preparedExecution", "convSpatialReuse", "skipPreConsolidationSync",
     "diagnosticTiles", "diagnosticRectTiles", "diagTileWidth", "diagTileHeight",
@@ -162,6 +164,7 @@ _SETTING_DETAILS = {
     "disable_auto_prepare": ("Convolution", "stable", "Disables lazy model preparation."),
     "profile": ("Profiling", "stable", "Controls profiler collection and report verbosity."),
     "trace": ("Profiling", "diagnostic", "Enables verbose live execution diagnostics."),
+    "residency_trace": ("Profiling", "diagnostic", "Prints optional MatrixMan texture residency transitions."),
     "profile_detail": ("Profiling", "diagnostic", "Enables detailed profiler sections."),
     "profile_dispatch": ("Profiling", "diagnostic", "Collects PyTorch-facing dispatch timing."),
     "gpu_timing": ("Profiling", "diagnostic", "Enables deferred OpenGL timer queries."),
@@ -196,6 +199,7 @@ _CATEGORY_ORDER = (
 _SPECIAL_OPTIONS = {
     "backend": _BACKEND_VALUES,
     "profile": ("off", "summary", "detail", "trace"),
+    "trace": (False, True, "detailed"),
     "tile_limit": {"type": "int|string", "values": ("auto",), "range": "positive integer"},
     "tile_sync": _TILE_SYNC_VALUES,
     "sync_policy": _SYNC_POLICY_VALUES,
@@ -247,6 +251,8 @@ def _metadata_type(name: str, field: str, options: Any) -> str:
         return options["type"]
     if name == "profile":
         return "str|bool"
+    if name == "trace":
+        return "bool|str"
     if field in _BOOL_FIELDS:
         return "bool"
     if name == "gpu_preference":
@@ -270,6 +276,17 @@ def _parse_bool(value: Any) -> bool:
 
 
 def _parse_value(field: str, value: Any) -> Any:
+    if field == "trace":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _FALSE:
+            return False
+        if text in _TRUE:
+            return True
+        if text == "detailed":
+            return "detailed"
+        raise ValueError("trace must be one of: false, true, or detailed")
     if field == "profile":
         if isinstance(value, bool):
             return "summary" if value else False
@@ -759,16 +776,27 @@ def set_profiling(enabled: bool) -> bool:
 
 
 def trace_enabled() -> bool:
-    return bool(config.trace)
+    """Whether concise or detailed live tracing is enabled."""
+    return config.trace is True or config.trace == "detailed"
 
 
-def set_trace(enabled: bool = True) -> bool:
+def trace_detailed() -> bool:
+    """Whether detailed internal/storage tracing is enabled."""
+    return config.trace == "detailed"
+
+
+def set_trace(enabled: bool | str = True) -> bool | str:
     config._set("trace", enabled)
-    return bool(config.trace)
+    return config.trace
 
 
 def trace_log(message: str) -> None:
     if trace_enabled():
+        print(message)
+
+
+def detailed_trace_log(message: str) -> None:
+    if trace_detailed():
         print(message)
 
 

@@ -536,9 +536,66 @@ def prepare_opengl(model: nn.Module, *, inplace: bool = False, diagnostics: bool
     return _prepare_model(model, backend="opengl", inplace=inplace, diagnostics=diagnostics)
 
 
-def prepare(model: nn.Module, *, backend: str = "cuda", inplace: bool = False, diagnostics: bool = False):
-    """Explicit experimental inference preparation for CUDA or OpenGL."""
-    backend_name = str(backend).strip().lower()
+def _prepare_training_opengl(model: nn.Module, *, diagnostics: bool = False):
+    """Install GPU-authoritative Parameters for the initial Linear target."""
+    if not isinstance(model, nn.Module):
+        raise TypeError("matrixman.prepare requires a torch.nn.Module")
+    from .backends.opengl.tensor import texture_from_cpu
+    from .tensor import MatrixManTensor
+
+    linear_modules = []
+    for module_path, module in model.named_modules(remove_duplicate=False):
+        if isinstance(module, nn.Linear):
+            linear_modules.append((module_path or "<root>", module))
+        elif any(parameter.requires_grad for parameter in module.parameters(recurse=False)):
+            raise NotImplementedError(
+                "matrixman training preparation currently supports only nn.Linear parameters; "
+                f"unsupported module: {module_path or '<root>'} ({type(module).__name__})"
+            )
+    if not linear_modules:
+        raise NotImplementedError("matrixman training preparation found no nn.Linear module")
+
+    converted = set()
+    for module_path, module in linear_modules:
+        for name, parameter in list(module._parameters.items()):
+            if parameter is None or id(parameter) in converted:
+                continue
+            if parameter.dtype != torch.float32 or parameter.device.type != "cpu":
+                raise RuntimeError(
+                    f"matrixman training only supports CPU float32 source parameters, got "
+                    f"{module_path}.{name}: dtype={parameter.dtype} device={parameter.device}"
+                )
+            owner = texture_from_cpu(parameter.detach().contiguous())
+            gpu_tensor = MatrixManTensor._from_owner(owner, tuple(int(v) for v in parameter.shape))
+            gpu_tensor.requires_grad_(bool(parameter.requires_grad))
+            module._parameters[name] = nn.Parameter(
+                gpu_tensor, requires_grad=bool(parameter.requires_grad)
+            )
+            converted.add(id(parameter))
+
+    setattr(model, "_matrixman_training_prepared", True)
+    if diagnostics:
+        print("MatrixMan training preparation: GPU-authoritative Linear parameters installed")
+    return model
+
+
+def prepare(model: nn.Module, *, backend: str | None = None, inplace: bool = False,
+            diagnostics: bool = False, training: bool = False):
+    """Prepare an inference model or the initial OpenGL training path."""
+    if training:
+        if backend is None:
+            from .backend import active_backend, get_backend
+            selected = active_backend()
+            backend_name = selected.name if selected is not None else (
+                config.backend if config.backend != "auto" else get_backend().name
+            )
+        else:
+            backend_name = str(backend).strip().lower()
+        if backend_name != "opengl":
+            raise NotImplementedError("matrixman training preparation currently requires backend='opengl'")
+        return _prepare_training_opengl(model, diagnostics=diagnostics)
+
+    backend_name = str(backend or "cuda").strip().lower()
     if backend_name not in {"cuda", "opengl"}:
         raise ValueError("matrixman.prepare supports backend='cuda' or backend='opengl'")
     return _prepare_model(model, backend=backend_name, inplace=inplace, diagnostics=diagnostics)

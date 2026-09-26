@@ -48,7 +48,7 @@ def _validate_factory_options(op_name: str, dtype, layout, device, pin_memory) -
         raise RuntimeError(f"gm45 {op_name} got unsupported device {device}")
 
 
-def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, memory_format=None):
+def _empty_gm45_unguarded(size, *, dtype=None, layout=None, device=None, pin_memory=False, memory_format=None):
     del memory_format
     shape = tuple(int(v) for v in size)
     known_bookkeeping = dtype == torch.uint8 and numel(shape) == 0
@@ -95,7 +95,21 @@ def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, 
     return MatrixManTensor._from_owner(owner, shape)
 
 
-def new_full_gm45(
+def empty_gm45(size, *, dtype=None, layout=None, device=None, pin_memory=False, memory_format=None):
+    """Allocate an OpenGL-backed tensor while owning the shared context."""
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _empty_gm45_unguarded(
+                size, dtype=dtype, layout=layout, device=device,
+                pin_memory=pin_memory, memory_format=memory_format,
+            )
+    return _empty_gm45_unguarded(
+        size, dtype=dtype, layout=layout, device=device,
+        pin_memory=pin_memory, memory_format=memory_format,
+    )
+
+
+def _new_full_gm45_unguarded(
     source,
     size,
     fill_value,
@@ -114,7 +128,7 @@ def new_full_gm45(
     _validate_factory_options(
         "new_full", resolved_dtype, resolved_layout, resolved_device, bool(pin_memory)
     )
-    result = empty_gm45(
+    result = _empty_gm45_unguarded(
         size,
         dtype=resolved_dtype,
         layout=resolved_layout,
@@ -126,6 +140,29 @@ def new_full_gm45(
     from .ops.concat import _render_fill_scalar
 
     return _render_fill_scalar((result, fill_value))
+
+
+def new_full_gm45(
+    source,
+    size,
+    fill_value,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    """Allocate and fill an OpenGL tensor while owning the shared context."""
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _new_full_gm45_unguarded(
+                source, size, fill_value, dtype=dtype, layout=layout,
+                device=device, pin_memory=pin_memory,
+            )
+    return _new_full_gm45_unguarded(
+        source, size, fill_value, dtype=dtype, layout=layout,
+        device=device, pin_memory=pin_memory,
+    )
 
 
 def arange_program(params: tuple) -> int:
@@ -182,7 +219,7 @@ def _arange_length(start: float, end: float, step: float) -> int:
     return max(0, int(math.ceil(distance / abs(step))))
 
 
-def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None, out=None) -> MatrixManTensor:
+def _render_arange_unguarded(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None, out=None) -> MatrixManTensor:
     _validate_factory_options("arange", dtype, layout, device, bool(pin_memory))
     start_f, end_f, step_f = float(start), float(end), float(step)
     length = _arange_length(start_f, end_f, step_f)
@@ -212,9 +249,31 @@ def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin
         f"  -> output texture #{out_owner.texture} shape={list(shape)} offset=0"
     )
     render.attach_output(rt, out_owner)
-    status = gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER)
+    status = int(gm.glCheckFramebufferStatus(gm.GL_FRAMEBUFFER))
+    framebuffer_error = int(gm.glGetError())
     if status != gm.GL_FRAMEBUFFER_COMPLETE:
-        raise RuntimeError(f"gm45 arange framebuffer incomplete: 0x{status:04x}")
+        try:
+            current_context = gm.sdl.SDL_GL_GetCurrentContext()
+        except Exception as exc:
+            current_context = f"<query failed: {exc}>"
+        expected_context = getattr(runtime._runtime, "context", None)
+        fbo = getattr(runtime._runtime, "fbo", None)
+        fbo_id = getattr(fbo, "value", fbo)
+
+        def _gl_text(value):
+            return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+        raise RuntimeError(
+            "gm45 arange framebuffer incomplete: "
+            f"status=0x{status:04x} expected=0x{gm.GL_FRAMEBUFFER_COMPLETE:04x} "
+            f"gl_error_after_status=0x{framebuffer_error:04x} "
+            f"current_context={current_context!r} expected_context={expected_context!r} "
+            f"fbo={fbo_id!r} output_texture={out_owner.texture} "
+            f"texture_size={out_owner.layout.texture_width}x{out_owner.layout.texture_height} "
+            f"renderer={_gl_text(gm.glGetString(0x1F01))!r} "
+            f"GL_VERSION={_gl_text(gm.glGetString(0x1F02))!r} "
+            f"GLSL_VERSION={_gl_text(gm.glGetString(0x8B8C))!r}"
+        )
     gm.glUseProgram(program)
     render.draw_fullscreen_quad()
     diagnostics.trace(f"gm45.opengl -> submitted arange fullscreen quad, output texture #{out_owner.texture}")
@@ -224,6 +283,20 @@ def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin
     if out is not None:
         return out
     return MatrixManTensor._from_owner(out_owner, shape)
+
+
+def render_arange(start, end, step, *, dtype=None, layout=None, device=None, pin_memory=None, out=None) -> MatrixManTensor:
+    """Render arange while owning MatrixMan's shared OpenGL context."""
+    if runtime.is_active():
+        with runtime.gl_execution_context():
+            return _render_arange_unguarded(
+                start, end, step, dtype=dtype, layout=layout,
+                device=device, pin_memory=pin_memory, out=out,
+            )
+    return _render_arange_unguarded(
+        start, end, step, dtype=dtype, layout=layout,
+        device=device, pin_memory=pin_memory, out=out,
+    )
 
 
 def arange_default(end, **kwargs):

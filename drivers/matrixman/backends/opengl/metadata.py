@@ -24,8 +24,6 @@ def validate_supported_shape(shape: tuple[int, ...]) -> None:
         raise RuntimeError("gm45 supports only 1D, 2D, 3D, and 4D NCHW tensors")
     if any(size <= 0 for size in shape):
         raise RuntimeError("gm45 does not support empty dimensions")
-    if len(shape) == 4 and shape[0] != 1:
-        raise RuntimeError("gm45 4D support is NCHW with batch size 1 only")
 
 
 def is_contiguous_logical(tensor) -> bool:

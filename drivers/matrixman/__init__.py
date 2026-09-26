@@ -14,6 +14,7 @@ from .backend import (
     profile_enabled,
     profile_report,
     profile_reset,
+    raw_texture,
     randn,
     reset_unsupported_report,
     set_trace,
@@ -23,7 +24,7 @@ from .backend import (
     to_gm45,
     unsupported_report,
 )
-from .tensor import Gm45Tensor, MatrixManTensor, is_gm45_tensor, is_matrixman_tensor
+from .tensor import RawTexture, Gm45Tensor, MatrixManTensor, is_gm45_tensor, is_matrixman_tensor
 from .preparation import auto_prepare, prepare, prepare_cuda, prepare_opengl
 from .selector import select_backend
 
@@ -41,7 +42,7 @@ class _MatrixManModule(types.ModuleType):
         if name == "profiling":
             return _config_module.profiling_enabled(legacy_cuda=True)
         if name == "trace":
-            return _config_module.trace_enabled()
+            return _config_module.config.trace
         return super().__getattribute__(name)
 
     def __setattr__(self, name, value):
@@ -61,6 +62,7 @@ sys.modules[__name__].__class__ = _MatrixManModule
 
 __all__ = [
     "MatrixManTensor",
+    "RawTexture",
     "Gm45Tensor",
     "gpu_postprocess_detection",
     "prefer",
@@ -88,6 +90,7 @@ __all__ = [
     "shutdown",
     "tensor",
     "to_device",
+    "raw_texture",
     "to_gm45",
     "unsupported_report",
 ]
